@@ -6,11 +6,14 @@ from pathlib import Path
 class ConvertVideoArgs:
     input_folder: Path
     force: bool
-    min_title_length: int
-    file_filter: str
-    temp_folder: Path
+    filename_filter: str
     log_level: str
-    log_file: Path
     database_folder: Path
-    subcommand_name: str = None
+    yaml: bool
+    log: bool
+    command: str
     timeout: int = None
+    temp_folder: Path = None
+    output_folder: Path = None
+    min_title_length: int = None
+    validate_status: str = None
