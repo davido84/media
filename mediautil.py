@@ -4,7 +4,10 @@ from pathlib import Path
 from timeit import default_timer
 from datetime import timedelta
 import math
-import logging
+import click
+import subprocess
+import shutil
+import threading
 
 
 class Timer:
@@ -30,20 +33,14 @@ def gigabytes(num_gb: int) -> int:
     return num_gb*1000*1000*1000
 
 
-def log_list(message: str, source_list: list, logger: logging.Logger, log_level=logging.INFO):
-    logger.info(f'{message} {len(source_list)} item(s)')
-    for item in source_list:
-        logger.log(log_level, f'{item!s}')
-
-
 def gigabyte_string(n: int) -> str:
-    one_kb = 1024  # type: int
+    one_kb = 1024
     if n >= one_kb ** 3:
-        return '{:.2f} gb'.format(n * float(one_kb ** -3))
+        return '{:.2f}Gb'.format(n * float(one_kb ** -3))
     elif n >= one_kb ** 2:
-        return '{:.2f} mb'.format(n * float(one_kb ** -2))
+        return '{:.2f}Mb'.format(n * float(one_kb ** -2))
     else:
-        return '{:.2f} kb'.format(n * float(one_kb ** -1))
+        return '{:.2f}Kb'.format(n * float(one_kb ** -1))
 
 
 def set_priority(pid=None, priority=1):
@@ -60,3 +57,31 @@ def set_priority(pid=None, priority=1):
 
     p = psutil.Process(pid if pid is not None else os.getpid())
     p.nice(priority_classes[priority])
+
+
+def run_makemkvcon(args: list[str], timeout: int = 10*60) -> str:
+    proc = subprocess.Popen([shutil.which('makemkvcon64.exe')],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT)
+
+    output: list[str] = []
+
+    def timeout_handler():
+        proc.kill()
+        raise subprocess.TimeoutExpired
+
+    timer = threading.Timer(timeout, timeout_handler)
+    try:
+        while True:
+            line = str(proc.stdout.readline())
+            output.append(line)
+            print(line)
+            if not line and proc.poll() is not None:
+                break
+    finally:
+        timer.cancel()
+
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, '')
+
+    return ''.join(output)
