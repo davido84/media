@@ -5,7 +5,6 @@ from timeit import default_timer
 from datetime import timedelta
 import math
 import logging
-from pprint import pformat
 
 
 class Timer:
