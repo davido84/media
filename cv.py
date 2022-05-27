@@ -2,12 +2,13 @@ from settings import VideoManager
 import sys
 import logging
 import os
-from mediautil import Timer
 import scan_video
 import validate_video
 import transcode_mkv
 import extract_mkv
 import click
+from pathlib import Path
+from mediautil import media_command
 
 pass_vm = click.make_pass_decorator(VideoManager)
 
@@ -16,14 +17,9 @@ pass_vm = click.make_pass_decorator(VideoManager)
 @click.option(
     '--data-folder',
     envvar='CV_DATA_FOLDER',
-    default='.data',
+    default='d:/movies',
     metavar='PATH',
     help='Changes the data folder')
-@click.option(
-    '--log/--no-log',
-    envvar='CV_LOG',
-    default=True,
-    help='Output log file')
 @click.option(
     '--force/--no-force', '-f',
     envvar='CV_FORCE',
@@ -36,20 +32,32 @@ pass_vm = click.make_pass_decorator(VideoManager)
 )
 @click.version_option("1.0")
 @click.pass_context
-def cli(ctx, data_folder: str, log: bool, force: bool, filename_filter: str) -> int:
+def cli(ctx, data_folder: str, force: bool, filename_filter: str) -> int:
     """Video Manager"""
-    ctx.obj = VideoManager(data_folder, log, force, filename_filter)
+    os.makedirs(data_folder, exist_ok=True)
+    root_logger = logging.getLogger()
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s: %(message)s', datefmt='%m/%d %I:%M %p',
+                        stream=sys.stdout)
+    file_formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s', datefmt='%m/%d %I:%M %p')
+    log_file_name = Path(data_folder, 'cv.log')
+    file_handler = logging.FileHandler(encoding='utf-8', filename=f'{log_file_name}', mode='w')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(file_formatter)
+    root_logger.addHandler(file_handler)
+    ctx.obj = VideoManager(data_folder, force, filename_filter)
     return 0
 
 
 @cli.command()
 @click.option('--timeout', '-t', help='Timeout in seconds', type=click.INT, default=4*60)
+@click.argument('input_folder', metavar='INPUT_FOLDER')
 @pass_vm
-def scan(vm: VideoManager, timeout: int):
+def scan(vm: VideoManager, timeout: int, input_folder: str):
     """Rebuild database from ISO/MKV files.
         Files which already exist in the database are skipped unless --force is specified.
     """
-    scan_video.command(vm, timeout)
+    with media_command('SCAN'):
+        scan_video.command(vm, timeout)
 
 
 @cli.command()

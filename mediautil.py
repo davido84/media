@@ -8,25 +8,21 @@ import click
 import subprocess
 import shutil
 import threading
+import logging
+from contextlib import contextmanager
 
 
-class Timer:
-    def __init__(self, verbose=False):
-        self.verbose = verbose
-        self.timer = default_timer
-
-    def __enter__(self):
-        self.start = self.timer()
-        return self
-
-    def __exit__(self, *args):
-        end = self.timer()
-        self.elapsed_secs = (end - self.start)
-        if self.verbose:
-            print(f'Elapsed time: {self.format_delta()}')
-
-    def format_delta(self) -> str:
-        return str(timedelta(seconds=math.floor(self.elapsed_secs)))
+@contextmanager
+def media_command(name: str) -> None:
+    logging.info(f'Starting {name}')
+    start = default_timer()
+    try:
+        yield
+    finally:
+        end = default_timer()
+        elapsed_secs = (end - start)
+        logging.info(f'Elapsed time: {str(timedelta(seconds=math.floor(elapsed_secs)))}')
+        logging.info('Finished.')
 
 
 def gigabytes(num_gb: int) -> int:
@@ -59,8 +55,10 @@ def set_priority(pid=None, priority=1):
     p.nice(priority_classes[priority])
 
 
-def run_makemkvcon(args: list[str], timeout: int = 10*60) -> str:
-    proc = subprocess.Popen([shutil.which('makemkvcon64.exe')],
+def run_makemkvcon(input_file: Path, args: list[str], timeout: int = 30*60) -> str:
+    final_args = [shutil.which('makemkvcon64.exe'), '--noscan']
+    final_args.extend(args)
+    proc = subprocess.Popen(final_args,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT)
 

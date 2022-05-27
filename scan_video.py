@@ -1,20 +1,23 @@
 from settings import VideoManager
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pprint import pformat
+from mediautil import gigabyte_string
 
 logger = logging.getLogger('SCAN')
 
 
 @dataclass
 class Result:
+    num_successful: int = 0
     num_corrupt: int = 0
     num_timeouts: int = 0
-    num_successful: int = 0
+    max_title_size: int = field(repr=False, default=0)
 
 
-def command(settings: VideoManager, timeout: int) -> Result:
+def command(settings: VideoManager, timeout: int) -> int:
+    logging.info(f'Timeout={timeout}')
     result = Result()
-    return result
-
-    # logger.debug('About to start')
-    # logger.info(f'Starting {__name__}')
+    logger.info('%s', pformat(result))
+    logger.info(f'Max title size: {gigabyte_string(result.max_title_size)}')
+    return 0

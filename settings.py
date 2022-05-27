@@ -1,6 +1,7 @@
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+import os
 
 
 @dataclass(kw_only=True)
@@ -21,9 +22,8 @@ class ConvertVideoArgs:
 
 
 class VideoManager:
-    def __init__(self, data_folder: str, log: bool, force: bool, input_filter: str):
+    def __init__(self, data_folder: str, force: bool, input_filter: str):
         self.data_folder: Path = Path(data_folder)
-        self.log: bool = log
         self.force: bool = force
         self.input_filter: str = input_filter
         self.log_level = logging.DEBUG
