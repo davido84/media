@@ -9,6 +9,7 @@ import subprocess
 import shutil
 import threading
 import logging
+from dataclasses import dataclass, field
 from contextlib import contextmanager
 
 
@@ -55,31 +56,41 @@ def set_priority(pid=None, priority=1):
     p.nice(priority_classes[priority])
 
 
-def run_makemkvcon(input_file: Path, args: list[str], timeout: int = 30*60) -> str:
-    final_args = [shutil.which('makemkvcon64.exe'), '--noscan']
+@dataclass
+class RunMkvResult:
+    return_code: int = 0
+    timed_out: bool = False
+    stdout: list[str] = field(default_factory=list[str], repr=False)
+
+
+def run_makemkvcon(message: str, args: list[str], timeout: int = 60*20) -> RunMkvResult:
+    result = RunMkvResult()
+
+    final_args = [shutil.which('makemkvcon64.exe'),
+                  '--noscan', '-r', '--cache=1024', '--progress=-same']
+
     final_args.extend(args)
     proc = subprocess.Popen(final_args,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT)
 
-    output: list[str] = []
-
     def timeout_handler():
+        nonlocal result
+        result.timed_out = True
         proc.kill()
-        raise subprocess.TimeoutExpired
 
     timer = threading.Timer(timeout, timeout_handler)
     try:
+        timer.start()
         while True:
-            line = str(proc.stdout.readline())
-            output.append(line)
-            print(line)
+            line = proc.stdout.readline().decode('utf-8').strip()
+            if line:
+                result.stdout.append(line)
             if not line and proc.poll() is not None:
                 break
     finally:
         timer.cancel()
 
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, '')
+    result.return_code = proc.returncode
 
-    return ''.join(output)
+    return result
