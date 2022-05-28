@@ -16,8 +16,9 @@ pass_vm = click.make_pass_decorator(VideoManager)
 @click.group(no_args_is_help=True)
 @click.option(
     '--data-folder',
+    '-a',
     envvar='CV_DATA_FOLDER',
-    default='d:/movies',
+    default=None,
     metavar='PATH',
     help='Changes the data folder')
 @click.option(
@@ -57,7 +58,7 @@ def scan(vm: VideoManager, timeout: int, input_folder: str):
         Files which already exist in the database are skipped unless --force is specified.
     """
     with media_command('SCAN'):
-        scan_video.command(vm, timeout)
+        scan_video.command(vm, timeout, Path(input_folder))
 
 
 @cli.command()

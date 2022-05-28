@@ -11,6 +11,14 @@ import threading
 import logging
 from dataclasses import dataclass, field
 from contextlib import contextmanager
+from settings import VideoManager
+import fnmatch
+import re
+
+
+def scan_for_video_files(settings: VideoManager, input_folder: Path) -> list[Path]:
+    return [F for F in input_folder.rglob('*.iso') if
+            settings.input_filter is None or fnmatch.fnmatch(str(F), settings.input_filter)]
 
 
 @contextmanager
@@ -63,11 +71,11 @@ class RunMkvResult:
     stdout: list[str] = field(default_factory=list[str], repr=False)
 
 
-def run_makemkvcon(message: str, args: list[str], timeout: int = 60*20) -> RunMkvResult:
+def run_makemkvcon(args: list[str], timeout: int = 60*20) -> RunMkvResult:
     result = RunMkvResult()
 
     final_args = [shutil.which('makemkvcon64.exe'),
-                  '--noscan', '-r', '--cache=1024', '--progress=-same']
+                  '--noscan', '--minlength=3*60', '-r', '--cache=1024', '--progress=-same']
 
     final_args.extend(args)
     proc = subprocess.Popen(final_args,

@@ -2,8 +2,9 @@ from settings import VideoManager
 import logging
 from dataclasses import dataclass, field
 from pprint import pformat
-from mediautil import gigabyte_string, run_makemkvcon
-import subprocess
+from mediautil import gigabyte_string, run_makemkvcon, scan_for_video_files
+from pathlib import Path
+from discinfo import DiscInfo, parse_disc
 
 logger = logging.getLogger('SCAN')
 
@@ -13,13 +14,33 @@ class Result:
     num_successful: int = 0
     num_corrupt: int = 0
     num_timeouts: int = 0
+    num_called_process_errors: int = 0
     max_title_size: int = field(repr=False, default=0)
 
 
-def command(settings: VideoManager, timeout: int) -> int:
+def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
     logging.info(f'Timeout={timeout}')
-    run_makemkvcon('The message', ['mkv', f'iso:e:/movies/test-g.iso', '0', 'e:/movies'])
+    # run_result = run_makemkvcon('The message', ['mkv', f'iso:e:/movies/test-g.iso', '0', 'e:/movies'])
     result = Result()
+    all_files = scan_for_video_files(settings, input_folder)
+    for iso_file in all_files:
+        logging.info(f'{iso_file!s}')
+        mkv_result = run_makemkvcon([f'--minlength={settings.minimum_title_len}',
+                                     'info', f'iso:{iso_file!s}'], timeout)
+        if mkv_result.timed_out:
+            logging.warning('TIMEOUT')
+            result.num_timeouts += 1
+            continue
+        elif mkv_result.return_code != 0:
+            logging.error('CALLED_PROCESS_ERROR')
+            result.num_called_process_errors += 1
+            continue
+
+        disc_info = parse_disc(mkv_result.stdout)
+        if disc_info.is_corrupt:
+            logging.warning('Possibly corrupt.')
+            result.num_corrupt += 1
+
     logger.info('%s', pformat(result))
     logger.info(f'Max title size: {gigabyte_string(result.max_title_size)}')
     return 0
