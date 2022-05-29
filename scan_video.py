@@ -1,10 +1,14 @@
+import pyaml
+
 from settings import VideoManager
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pprint import pformat
 from mediautil import gigabyte_string, run_makemkvcon, scan_for_video_files
 from pathlib import Path
 from discinfo import DiscInfo, parse_disc
+import yaml
+import pickle
 
 logger = logging.getLogger('SCAN')
 
@@ -12,6 +16,7 @@ logger = logging.getLogger('SCAN')
 @dataclass
 class Result:
     num_successful: int = 0
+    num_errors: int = 0
     num_corrupt: int = 0
     num_timeouts: int = 0
     num_called_process_errors: int = 0
@@ -23,6 +28,7 @@ def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
     # run_result = run_makemkvcon('The message', ['mkv', f'iso:e:/movies/test-g.iso', '0', 'e:/movies'])
     result = Result()
     all_files = scan_for_video_files(settings, input_folder)
+    info_dict: dict[str, DiscInfo] = {}
     for iso_file in all_files:
         logging.info(f'{iso_file!s}')
         mkv_result = run_makemkvcon([f'--minlength={settings.minimum_title_len}',
@@ -36,10 +42,27 @@ def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
             result.num_called_process_errors += 1
             continue
 
-        disc_info = parse_disc(mkv_result.stdout)
+        disc_info: DiscInfo = parse_disc(mkv_result.stdout)
+
+        if disc_info.title_count == 0:
+            logging.error('Title count == o')
+            result.num_errors += 1
+            continue
+
         if disc_info.is_corrupt:
             logging.warning('Possibly corrupt.')
             result.num_corrupt += 1
+
+        info_dict[str(iso_file)] = disc_info
+
+    if settings.data_folder is not None:
+        yaml_dict = {}
+        for key, value in info_dict.items():
+            yaml_dict[key] = asdict(value)
+
+        Path(settings.data_folder, 'discs.yaml').write_text(pyaml.dump(yaml_dict))
+        with Path(settings.data_folder, 'discs.pkl').open('wb') as pickle_file:
+            pickle.dump(info_dict, pickle_file)
 
     logger.info('%s', pformat(result))
     logger.info(f'Max title size: {gigabyte_string(result.max_title_size)}')

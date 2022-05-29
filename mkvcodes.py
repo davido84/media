@@ -1,9 +1,4 @@
-from enum import IntEnum
-from dataclasses import dataclass
+info: int = 1
 
-
-@dataclass
-class MkvInfo:
-    code: int
-    message_code: int
-    value: str
+disc_type_dvd: int = 6206
+disc_type_bd: int = 6209
