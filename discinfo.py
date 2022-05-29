@@ -2,8 +2,7 @@ from dataclasses import dataclass, field
 import mkvcodes
 import re
 from mediautil import gigabyte_string
-from collections import defaultdict
-from typing import DefaultDict
+
 
 @dataclass
 class DiscInfo:

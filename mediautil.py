@@ -11,14 +11,6 @@ import threading
 import logging
 from dataclasses import dataclass, field
 from contextlib import contextmanager
-from settings import VideoManager
-import fnmatch
-import re
-
-
-def scan_for_video_files(settings: VideoManager, input_folder: Path) -> list[Path]:
-    return [F for F in input_folder.rglob('*.iso') if
-            settings.input_filter is None or fnmatch.fnmatch(str(F), settings.input_filter)]
 
 
 @contextmanager

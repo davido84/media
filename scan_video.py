@@ -4,7 +4,7 @@ from settings import VideoManager
 import logging
 from dataclasses import dataclass, field, asdict
 from pprint import pformat
-from mediautil import gigabyte_string, run_makemkvcon, scan_for_video_files, gigabytes
+from mediautil import gigabyte_string, run_makemkvcon, gigabytes
 from pathlib import Path
 from discinfo import DiscInfo, parse_disc
 import pickle
@@ -24,18 +24,9 @@ class Result:
 
 
 def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
-    # logging.info(f'Timeout={timeout}')
-    # run_result = run_makemkvcon('The message', ['mkv', f'iso:e:/movies/test-g.iso', '0', 'e:/movies'])
     result = Result()
-    all_files = scan_for_video_files(settings, input_folder)
-
-    info_dict: dict[str, DiscInfo] = {}
-    pkl_name = 'discs.pkl'
-    try:
-        with Path(settings.data_folder, pkl_name).open('rb') as file:
-            info_dict = pickle.load(file)
-    except (IOError, TypeError):
-        pass
+    all_files = settings.scan_for_video_files(input_folder)
+    info_dict: dict[str, DiscInfo] = settings.info_dict()
 
     for iso_file in all_files:
         if not settings.force and str(iso_file) in info_dict:
@@ -80,8 +71,7 @@ def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
             yaml_dict[key] = asdict(value)
 
         Path(settings.data_folder, 'discs.yaml').write_text(pyaml.dump(yaml_dict))
-        with Path(settings.data_folder, pkl_name).open('wb') as pickle_file:
-            pickle.dump(info_dict, pickle_file)
+        settings.save_info_dict(info_dict)
 
     logger.info('%s', pformat(result))
     logger.info(f'Max title size: {gigabyte_string(result.max_title_size)}')
