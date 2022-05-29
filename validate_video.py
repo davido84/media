@@ -18,7 +18,7 @@ class Result:
     successful: int = 0
     errors: int = 0
     timeouts: int = 0
-    called_process_errors: int = 0
+    validator_failed_errors: int = 0
     total_mkv_bytes: int = 0
     total_mkv_bytes_human: str = ''
 
@@ -49,7 +49,7 @@ def command(vm: VideoManager, temp_folder: str):
             except subprocess.CalledProcessError:
                 click.secho(f'FAILED', fg='bright_red')
                 logging.error(f'{iso_file!s}, {output_file!s}: FAILED validation.')
-                result.called_process_errors += 1
+                result.validator_failed_errors += 1
 
             finally:
                 output_file.unlink(missing_ok=True)
