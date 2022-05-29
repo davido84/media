@@ -11,6 +11,9 @@ import threading
 import logging
 from dataclasses import dataclass, field
 from contextlib import contextmanager
+from progressbar.bar import ProgressBar
+import progressbar
+import re
 
 
 @contextmanager
@@ -63,7 +66,8 @@ class RunMkvResult:
     stdout: list[str] = field(default_factory=list[str], repr=False)
 
 
-def run_makemkvcon(args: list[str], timeout: int = 60*20) -> RunMkvResult:
+def run_makemkvcon(title: str,
+                   args: list[str], timeout: int = 60*20, show_progress: bool = True) -> RunMkvResult:
     result = RunMkvResult()
 
     final_args = [shutil.which('makemkvcon64.exe'),
@@ -80,15 +84,37 @@ def run_makemkvcon(args: list[str], timeout: int = 60*20) -> RunMkvResult:
         proc.kill()
 
     timer = threading.Timer(timeout, timeout_handler)
+    progress_start_re = re.compile(r'PRGT:\d+,\d+,"([^"+])"')
+    progress_value_re = re.compile(r'PRGV:(\d+),\d+,\d+')
+
+    widgets = [
+        ' [', progressbar.Percentage(), '] ',
+        progressbar.Bar(),
+        ' (', progressbar.ETA(), ') ',
+        # ' (', progressbar.FormatCustomText, ') '
+    ]
+
+    progress = progressbar.ProgressBar(widgets=widgets, max_value=65536, prefix=title) if show_progress else None
+
     try:
         timer.start()
         while True:
             line = proc.stdout.readline().decode('utf-8').strip()
             if line:
-                result.stdout.append(line)
+                if match := progress_start_re.match(line):
+                    if progress is not None:
+                        progress.finish()
+                        progress.start(max_value=65536, init=True)
+                elif match := progress_value_re.match(line):
+                    if progress is not None:
+                        progress.update(int(match.group(1)))
+                else:
+                    result.stdout.append(line)
             if not line and proc.poll() is not None:
                 break
     finally:
+        if progress is not None:
+            progress.finish()
         timer.cancel()
 
     result.return_code = proc.returncode

@@ -35,8 +35,8 @@ def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
 
         is_dvd = iso_file.stat().st_size < gigabytes(9)
         click.secho(str(iso_file)+'...', nl=False, fg=('bright_magenta' if is_dvd else 'bright_blue'))
-        mkv_result = run_makemkvcon([f'--minlength={settings.minimum_title_len}',
-                                     'info', f'iso:{iso_file!s}'], timeout)
+        mkv_result = run_makemkvcon(iso_file.name, [f'--minlength={settings.minimum_title_len}',
+                                                    'info', f'iso:{iso_file!s}'], timeout)
         if mkv_result.timed_out:
             click.secho('TIMEOUT', fg='red')
             logging.warning(f'{iso_file!s: }TIMEOUT')

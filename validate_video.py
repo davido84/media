@@ -27,6 +27,7 @@ def command(vm: VideoManager, temp_folder: str):
         click.secho(str(iso_file), fg='cyan')
         for title in dict_info.titles:
             output_file = Path(temp_folder, dict_info.titles[title][mkvcodes.output_file])
-            click.secho(f'  {output_file}')
-            run_makemkvcon(['mkv', f'iso:{iso_file}', f'{title}', temp_folder], timeout=60*30)
+            # click.secho(f'  {output_file}')
+            run_makemkvcon(f'{output_file!s}',
+                ['mkv', f'iso:{iso_file}', f'{title}', temp_folder], timeout=60*30, show_progress=True)
     logger.info('%s', pformat(result))
