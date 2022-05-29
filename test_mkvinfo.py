@@ -1,24 +1,15 @@
 from unittest import TestCase
 from mkv_test_data import GOOD_ENG_BD, GOOD_ENG_DVD, BAD_ENG_DVD
-from mkvcodes import MkvStatus, DiscType
+from discinfo import parse_disc, DiscInfo
 
 
 class TestDiscInfo(TestCase):
     def setUp(self) -> None:
-        pass
-        # self.good_dvd: DiscInfo = DiscInfo(GOOD_ENG_DVD)
-        # self.bad_dvd: DiscInfo = DiscInfo(BAD_ENG_DVD)
-        # self.good_bd: DiscInfo = DiscInfo(GOOD_ENG_BD)
+        self.good_dvd: DiscInfo = parse_disc(GOOD_ENG_DVD.split())
+        self.bad_dvd: DiscInfo = parse_disc(BAD_ENG_DVD.split())
+        self.good_bd: DiscInfo = parse_disc(GOOD_ENG_BD.split())
 
-    # def test_disc_type(self):
-    #     self.assertEqual(self.good_dvd.disc_type(), DiscType.DVD)
-    #     self.assertEqual(self.bad_dvd.disc_type(), DiscType.DVD)
-    #     self.assertEqual(self.good_bd.disc_type(), DiscType.BD)
-    #
-    # def test_validate(self):
-    #     self.assertEqual(self.good_bd.validate(), DiscInfo.ValidationCode.OK)
-    #     self.assertEqual(self.good_dvd.validate(), DiscInfo.ValidationCode.OK)
-    #     self.assertEqual(self.bad_dvd.validate(), DiscInfo.ValidationCode.POSSIBLE_ERROR)
-
-    def test_titles(self):
-        pass
+    def test_validate(self):
+        self.assertFalse(self.good_bd.is_corrupt)
+        self.assertFalse(self.good_dvd.is_corrupt)
+        self.assertTrue(self.bad_dvd.is_corrupt)
