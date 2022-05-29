@@ -1,10 +1,11 @@
+import click
 import pyaml
-
+import collections
 from settings import VideoManager
 import logging
 from dataclasses import dataclass, field, asdict
 from pprint import pformat
-from mediautil import gigabyte_string, run_makemkvcon, scan_for_video_files
+from mediautil import gigabyte_string, run_makemkvcon, scan_for_video_files, gigabytes
 from pathlib import Path
 from discinfo import DiscInfo, parse_disc
 import yaml
@@ -24,34 +25,41 @@ class Result:
 
 
 def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
-    logging.info(f'Timeout={timeout}')
+    # logging.info(f'Timeout={timeout}')
     # run_result = run_makemkvcon('The message', ['mkv', f'iso:e:/movies/test-g.iso', '0', 'e:/movies'])
     result = Result()
     all_files = scan_for_video_files(settings, input_folder)
     info_dict: dict[str, DiscInfo] = {}
     for iso_file in all_files:
-        logging.info(f'{iso_file!s}')
+        is_dvd = iso_file.stat().st_size < gigabytes(9)
+        click.secho(str(iso_file)+'...', nl=False, fg=('bright_magenta' if is_dvd else 'bright_blue'))
         mkv_result = run_makemkvcon([f'--minlength={settings.minimum_title_len}',
                                      'info', f'iso:{iso_file!s}'], timeout)
         if mkv_result.timed_out:
-            logging.warning('TIMEOUT')
+            click.secho('TIMEOUT', fg='red')
+            logging.warning(f'{iso_file!s: }TIMEOUT')
             result.num_timeouts += 1
             continue
         elif mkv_result.return_code != 0:
-            logging.error('CALLED_PROCESS_ERROR')
+            click.secho('CALLED_PROCESS_ERROR', fg='red')
+            logging.error(f'{iso_file!s}: CALLED_PROCESS_ERROR')
             result.num_called_process_errors += 1
             continue
 
         disc_info: DiscInfo = parse_disc(mkv_result.stdout)
 
         if disc_info.title_count == 0:
+            click.secho('ZERO_TITLE_COUNT', fg='red')
             logging.error('Title count == o')
             result.num_errors += 1
             continue
 
         if disc_info.is_corrupt:
-            logging.warning('Possibly corrupt.')
+            click.secho('POSSIBLE_CORRUPT', fg='bright_yellow')
+            logging.warning(f'{iso_file!s}: Possibly corrupt.')
             result.num_corrupt += 1
+        else:
+            click.secho('OK', fg='bright_green')
 
         info_dict[str(iso_file)] = disc_info
 

@@ -35,16 +35,18 @@ pass_vm = click.make_pass_decorator(VideoManager)
 @click.pass_context
 def cli(ctx, data_folder: str, force: bool, filename_filter: str) -> int:
     """Video Manager"""
-    os.makedirs(data_folder, exist_ok=True)
+    if data_folder is not None:
+        os.makedirs(data_folder, exist_ok=True)
     root_logger = logging.getLogger()
     logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s: %(message)s', datefmt='%m/%d %I:%M %p',
                         stream=sys.stdout)
     file_formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s', datefmt='%m/%d %I:%M %p')
-    log_file_name = Path(data_folder, 'cv.log')
-    file_handler = logging.FileHandler(encoding='utf-8', filename=f'{log_file_name}', mode='w')
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(file_formatter)
-    root_logger.addHandler(file_handler)
+    if data_folder is not None:
+        log_file_name = Path(data_folder, 'cv.log')
+        file_handler = logging.FileHandler(encoding='utf-8', filename=f'{log_file_name}', mode='w')
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(file_formatter)
+        root_logger.addHandler(file_handler)
     ctx.obj = VideoManager(data_folder, force, filename_filter)
     return 0
 
