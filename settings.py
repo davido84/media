@@ -17,7 +17,7 @@ class VideoManager:
 
     def info_dict(self) -> dict[str, DiscInfo]:
         result: dict[str, DiscInfo] = {}
-        if not self.force and self.data_folder is not None:
+        if self.data_folder is not None:
             try:
                 with Path(self.data_folder, self._pkl_name).open('rb') as file:
                     result = pickle.load(file)

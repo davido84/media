@@ -64,12 +64,14 @@ def scan(vm: VideoManager, timeout: int, input_folder: str):
 
 
 @cli.command()
+@click.argument('temp_folder', metavar='TEMP_FOLDER')
 @pass_vm
-def validate(vm: VideoManager):
+def validate(vm: VideoManager, temp_folder: str):
     """Validate disc ISO and MKV files from database.
         Files which are already validated are skipped unless --force is specified
     """
-    validate_video.command(vm)
+    with media_command('VALIDATE'):
+        validate_video.command(vm, temp_folder)
 
 
 @cli.command()

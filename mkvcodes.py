@@ -1,6 +1,7 @@
 info: int = 1
 title_size: int = 11
 segments_map = 26
+output_file = 27
 tree_info = 30
 panel_title = 31
 

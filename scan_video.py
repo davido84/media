@@ -26,7 +26,7 @@ class Result:
 def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
     result = Result()
     all_files = settings.scan_for_video_files(input_folder)
-    info_dict: dict[str, DiscInfo] = settings.info_dict()
+    info_dict: dict[str, DiscInfo] = settings.info_dict() if not settings.force else {}
 
     for iso_file in all_files:
         if not settings.force and str(iso_file) in info_dict:
