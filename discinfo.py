@@ -2,7 +2,8 @@ from dataclasses import dataclass, field
 import mkvcodes
 import re
 from mediautil import gigabyte_string
-
+from collections import defaultdict
+from typing import DefaultDict
 
 @dataclass
 class DiscInfo:
@@ -51,9 +52,8 @@ def parse_disc(mkv_info: list[str]) -> DiscInfo:
             if _filter_code(code):
                 if title_num not in disc_info.titles:
                     disc_info.titles[title_num] = {}
-                title_dict = disc_info.titles[title_num][code] = value
+                disc_info.titles[title_num][code] = value
                 if code == mkvcodes.title_size:
-                    max_title_size = int(value)
                     disc_info.max_title_size = max(disc_info.max_title_size, int(value))
                     disc_info.max_title_size_human = gigabyte_string(disc_info.max_title_size)
 
