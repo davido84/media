@@ -4,7 +4,7 @@ import logging
 from pprint import pformat
 import click
 import mkvcodes
-from mediautil import run_makemkvcon
+from mediautil import run_makemkvcon, gigabyte_string
 from pathlib import Path
 import subprocess
 import shutil
@@ -19,6 +19,8 @@ class Result:
     errors: int = 0
     timeouts: int = 0
     called_process_errors: int = 0
+    total_mkv_bytes: int = 0
+    total_mkv_bytes_human: str = ''
 
 
 def command(vm: VideoManager, temp_folder: str):
@@ -42,11 +44,15 @@ def command(vm: VideoManager, temp_folder: str):
                 subprocess.run([shutil.which('mkvalidator.exe'), '--quiet', '--quick', f'{output_file!s}'],
                                text=True, capture_output=True, check=True)
                 click.secho('OK', fg='bright_green')
+                result.successful += 1
+                result.total_mkv_bytes += output_file.stat().st_size
             except subprocess.CalledProcessError:
                 click.secho(f'FAILED', fg='bright_red')
                 logging.error(f'{iso_file!s}, {output_file!s}: FAILED validation.')
+                result.called_process_errors += 1
 
             finally:
                 output_file.unlink(missing_ok=True)
 
+    result.total_mkv_bytes_human = gigabyte_string(result.total_mkv_bytes)
     logger.info('%s', pformat(result))
