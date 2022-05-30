@@ -1,18 +1,15 @@
 import psutil
 import os
-from pathlib import Path
 from timeit import default_timer
 from datetime import timedelta
 import math
-import click
 import subprocess
 import shutil
 import threading
 import logging
 from dataclasses import dataclass, field
 from contextlib import contextmanager
-from progressbar.bar import ProgressBar
-import progressbar
+from tqdm import tqdm
 import re
 
 
@@ -84,38 +81,45 @@ def run_makemkvcon(title: str,
         proc.kill()
 
     timer = threading.Timer(timeout, timeout_handler)
-    progress_start_re = re.compile(r'PRGT:\d+,\d+,"([^"+])"')
+    progress_total_re = re.compile(r'PRGT:\d+,\d+,"([^"]+)"')
+    progress_current_re = re.compile(r'PRGC:\d+,\d+,"([^"]+)"')
     progress_value_re = re.compile(r'PRGV:(\d+),\d+,\d+')
 
-    widgets = [
-        ' [', progressbar.Percentage(), '] ',
-        progressbar.Bar(),
-        ' (', progressbar.ETA(), ') ',
-        # ' (', progressbar.FormatCustomText, ') '
-    ]
-
-    progress = progressbar.ProgressBar(widgets=widgets, max_value=65536, prefix=title) if show_progress else None
-
+    progress = tqdm(leave=True, ncols=120, colour='cyan', delay=2, bar_format='{l_bar}{bar} | Elapsed: [{elapsed}]')
+    if title:
+        tqdm.write(title)
     try:
         timer.start()
+        last_progress_value: int = 0
+        max_progress: int = 65536
+
         while True:
             line = proc.stdout.readline().decode('utf-8').strip()
             if line:
-                if progress_start_re.match(line):
-                    if progress is not None:
-                        progress.finish()
-                        progress.start(max_value=65536, init=True)
+                if match := progress_total_re.match(line):
+                    progress.reset(total=max_progress)
+                    progress.desc = match.group(1)
+                    last_progress_value = 0
+
+                elif match := progress_current_re.match(line):
+                    progress.reset(total=max_progress)
+                    progress.desc = match.group(1)
+                    last_progress_value = 0
+
                 elif match := progress_value_re.match(line):
-                    if progress is not None:
-                        progress.update(int(match.group(1)))
+                    current_value = int(match.group(1))
+                    assert current_value <= max_progress
+                    update_value = current_value - last_progress_value
+                    progress.update(update_value)
+                    last_progress_value = current_value
+
                 else:
                     result.stdout.append(line)
             if not line and proc.poll() is not None:
                 break
     finally:
-        if progress is not None:
-            progress.finish()
         timer.cancel()
+        progress.close()
 
     result.return_code = proc.returncode
 

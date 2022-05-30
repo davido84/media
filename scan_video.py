@@ -35,12 +35,12 @@ def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
 
         is_dvd = iso_file.stat().st_size < gigabytes(9)
         message = f'{iso_file!s} ({gigabyte_string(iso_file.stat().st_size)}) {count+1} of {len(all_files)} ...'
-        click.secho(message, nl=False, fg=('cyan' if is_dvd else 'bright_blue'))
-        mkv_result = run_makemkvcon(iso_file.name, [f'--minlength={settings.minimum_title_len}',
-                                                    'info', f'iso:{iso_file!s}'], timeout=timeout, show_progress=False)
+        # click.secho(message, nl=False, fg=('cyan' if is_dvd else 'bright_blue'))
+        mkv_result = run_makemkvcon(message, [f'--minlength={settings.minimum_title_len}',
+                                              'info', f'iso:{iso_file!s}'], timeout=timeout)
         if mkv_result.timed_out:
             click.secho('TIMEOUT', fg='red')
-            logging.warning(f'{iso_file!s: }TIMEOUT')
+            logging.warning(f'{iso_file!s: } TIMEOUT')
             result.timeouts += 1
             continue
         elif mkv_result.return_code != 0:
@@ -58,11 +58,11 @@ def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
             continue
 
         if disc_info.possibly_corrupt:
-            click.secho('POSSIBLE_CORRUPT', fg='bright_yellow')
+            click.secho(' POSSIBLE_CORRUPT', fg='bright_yellow')
             logging.warning(f'{iso_file!s}: Possibly corrupt.')
             result.corrupt += 1
         else:
-            click.secho('OK', fg='bright_green')
+            click.secho(' OK', fg='bright_green')
             max_title_size = max(max_title_size, disc_info.max_title_size)
 
         iso_dict[str(iso_file)] = disc_info
