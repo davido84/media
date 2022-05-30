@@ -68,7 +68,9 @@ def run_makemkvcon(title: str,
     result = RunMkvResult()
 
     final_args = [shutil.which('makemkvcon64.exe'),
-                  '--noscan', '--minlength=3*60', '-r', '--cache=1024', '--progress=-same']
+                  '--noscan', '--minlength=3*60', '-r', '--cache=1024']
+    if show_progress:
+        final_args.append('--progress=-same')
 
     final_args.extend(args)
     proc = subprocess.Popen(final_args,
@@ -85,9 +87,11 @@ def run_makemkvcon(title: str,
     progress_current_re = re.compile(r'PRGC:\d+,\d+,"([^"]+)"')
     progress_value_re = re.compile(r'PRGV:(\d+),\d+,\d+')
 
-    progress = tqdm(leave=True, ncols=120, colour='cyan', delay=2, bar_format='{l_bar}{bar} | Elapsed: [{elapsed}]')
-    if title:
+    if show_progress:
+        progress = tqdm(leave=True, ncols=120, colour='cyan', delay=2, bar_format='{l_bar}{bar} | Elapsed: [{elapsed}]')
         tqdm.write(title)
+    else:
+        progress = None
     try:
         timer.start()
         last_progress_value: int = 0
@@ -95,7 +99,7 @@ def run_makemkvcon(title: str,
 
         while True:
             line = proc.stdout.readline().decode('utf-8').strip()
-            if line:
+            if line and progress is not None:
                 if match := progress_total_re.match(line):
                     progress.reset(total=max_progress)
                     progress.desc = match.group(1)
@@ -112,14 +116,16 @@ def run_makemkvcon(title: str,
                     update_value = current_value - last_progress_value
                     progress.update(update_value)
                     last_progress_value = current_value
+                if match:
+                    continue
 
-                else:
-                    result.stdout.append(line)
+            result.stdout.append(line)
             if not line and proc.poll() is not None:
                 break
     finally:
         timer.cancel()
-        progress.close()
+        if progress is not None:
+            progress.close()
 
     result.return_code = proc.returncode
 

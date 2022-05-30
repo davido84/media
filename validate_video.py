@@ -37,7 +37,7 @@ def command(vm: VideoManager, temp_folder: str):
             run_makemkvcon(f'{output_file!s} ({title_count+1} of {len(dict_info.titles)})',
                            ['mkv', f'iso:{iso_file}', f'{title}', temp_folder], timeout=60*30, show_progress=True)
             if not output_file.exists():
-                click.secho('NO_OUTPUT_FILE')
+                click.secho(' NO_OUTPUT_FILE', fg='red')
                 logging.error(f'{iso_file!s}, {output_file!s}: NO_OUTPUT_FILE')
                 result.errors += 1
                 continue
