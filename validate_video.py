@@ -27,12 +27,14 @@ def command(vm: VideoManager, temp_folder: str):
     result = Result()
     info_dict = vm.info_dict()
 
-    for iso_file, dict_info in info_dict.items():
-        click.secho(str(iso_file), fg='cyan')
-        for title in dict_info.titles:
+    for iso_count, (iso_file, dict_info) in enumerate(info_dict.items()):
+        info_dict[iso_file].validated = True
+        message = f'{iso_file!s} ({iso_count+1} of {len(info_dict.items())})'
+        click.secho(message, fg='cyan')
+        for title_count, title in enumerate(dict_info.titles):
             output_file = Path(temp_folder, dict_info.titles[title][mkvcodes.output_file])
             # click.secho(f'  {output_file}')
-            run_makemkvcon(f'{output_file!s}',
+            run_makemkvcon(f'{output_file!s} ({title_count+1} of {len(dict_info.titles)})',
                            ['mkv', f'iso:{iso_file}', f'{title}', temp_folder], timeout=60*30, show_progress=True)
             if not output_file.exists():
                 click.secho('NO_OUTPUT_FILE')
@@ -46,6 +48,7 @@ def command(vm: VideoManager, temp_folder: str):
                 click.secho('OK', fg='bright_green')
                 result.successful += 1
                 result.total_mkv_bytes += output_file.stat().st_size
+                info_dict[iso_file].valid_titles.add(title_count)
             except subprocess.CalledProcessError:
                 click.secho(f'FAILED', fg='bright_red')
                 logging.error(f'{iso_file!s}, {output_file!s}: FAILED validation.')
@@ -53,6 +56,9 @@ def command(vm: VideoManager, temp_folder: str):
 
             finally:
                 output_file.unlink(missing_ok=True)
+
+    vm.save_yaml_dict(info_dict)
+    vm.save_info_dict(info_dict)
 
     result.total_mkv_bytes_human = gigabyte_string(result.total_mkv_bytes)
     logger.info('%s', pformat(result))

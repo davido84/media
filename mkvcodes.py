@@ -1,9 +1,22 @@
 info: int = 1
-title_size: int = 11
-segments_map = 26
-output_file = 27
-tree_info = 30
-panel_title = 31
+lang_name: int = 4
+coded_id: int = 5
+codec_short: int = 6
+codec_long: int = 7
+chapter_count: int = 8
+disc_size_bytes: int = 11
+bitrate: int = 13
+audio_sample_rate: int = 17
+stream_flags: int = 22
+segments_count: int = 25
+segments_map: int = 26
+output_file: int = 27
+tree_info: int = 30
+panel_title: int = 31
+order_weight: int = 33
+mkv_flags: int = 38
+audio_layout_name: int = 40
+output_conversion_type: int = 42
 
 disc_type_dvd: int = 6206
 disc_type_bd: int = 6209

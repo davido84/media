@@ -7,14 +7,15 @@ from mediautil import gigabyte_string
 @dataclass
 class DiscInfo:
     title_count: int = 0
-    max_title_size: int = 0
-    max_title_size_human: str = None
-    is_corrupt: bool = False
+    possibly_corrupt: bool = False
+    validated: bool = False
+    valid_titles: set[int] = field(default_factory=set[int])
     disc_info: dict[int, str | int] = field(default_factory=dict[int, str | int])
     titles: dict[int, dict[int, str | int]] = field(
         default_factory=dict[int, dict[int, str | int]])
     streams: dict[int, dict[int, dict[int, str | int]]] = field(
         default_factory=dict[int, dict[int, dict[int, str | int]]])
+    max_title_size: int = 0
 
 
 def _parse_value(value: str) -> str | int:
@@ -23,6 +24,18 @@ def _parse_value(value: str) -> str | int:
 
 def _filter_code(code: int) -> bool:
     return code not in (mkvcodes.panel_title,
+                        mkvcodes.bitrate,
+                        mkvcodes.audio_layout_name,
+                        mkvcodes.codec_long,
+                        mkvcodes.stream_flags,
+                        mkvcodes.output_conversion_type,
+                        mkvcodes.segments_count,
+                        mkvcodes.mkv_flags,
+                        mkvcodes.lang_name,
+                        mkvcodes.order_weight,
+                        mkvcodes.chapter_count,
+                        mkvcodes.codec_short,
+                        mkvcodes.audio_sample_rate,
                         mkvcodes.segments_map,
                         mkvcodes.tree_info)
 
@@ -36,7 +49,7 @@ def parse_disc(mkv_info: list[str]) -> DiscInfo:
         if match := re.match(r'TCOUNT:(\d+)', line):
             disc_info.title_count = int(match.group(1))
         elif line.startswith('MSG:4004'):
-            disc_info.is_corrupt = True
+            disc_info.possibly_corrupt = True
         elif match := re.match(fr'CINFO:(\d+),(\d+),{value_re}', line):
             code = int(match.group(1))
             if _filter_code(code):
@@ -52,7 +65,7 @@ def parse_disc(mkv_info: list[str]) -> DiscInfo:
                 if title_num not in disc_info.titles:
                     disc_info.titles[title_num] = {}
                 disc_info.titles[title_num][code] = value
-                if code == mkvcodes.title_size:
+                if code == mkvcodes.disc_size_bytes:
                     disc_info.max_title_size = max(disc_info.max_title_size, int(value))
                     disc_info.max_title_size_human = gigabyte_string(disc_info.max_title_size)
 

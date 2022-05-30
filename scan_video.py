@@ -20,21 +20,22 @@ class Result:
     corrupt: int = 0
     timeouts: int = 0
     called_process_errors: int = 0
-    max_title_size: int = field(repr=False, default=0)
 
 
 def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
     result = Result()
     all_files = settings.scan_for_video_files(input_folder)
     info_dict: dict[str, DiscInfo] = settings.info_dict() if not settings.force else {}
+    max_title_size: int = 0
 
-    for iso_file in all_files:
+    for count, iso_file in enumerate(all_files):
         if not settings.force and str(iso_file) in info_dict:
             result.skipped += 1
             continue
 
         is_dvd = iso_file.stat().st_size < gigabytes(9)
-        click.secho(str(iso_file)+'...', nl=False, fg=('bright_magenta' if is_dvd else 'bright_blue'))
+        message = f'{iso_file!s} ({gigabyte_string(iso_file.stat().st_size)}) {count+1} of {len(all_files)} ...'
+        click.secho(message, nl=False, fg=('cyan' if is_dvd else 'bright_blue'))
         mkv_result = run_makemkvcon(iso_file.name, [f'--minlength={settings.minimum_title_len}',
                                                     'info', f'iso:{iso_file!s}'], timeout=timeout, show_progress=False)
         if mkv_result.timed_out:
@@ -56,23 +57,19 @@ def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
             result.errors += 1
             continue
 
-        if disc_info.is_corrupt:
+        if disc_info.possibly_corrupt:
             click.secho('POSSIBLE_CORRUPT', fg='bright_yellow')
             logging.warning(f'{iso_file!s}: Possibly corrupt.')
             result.corrupt += 1
         else:
             click.secho('OK', fg='bright_green')
+            max_title_size = max(max_title_size, disc_info.max_title_size)
 
         info_dict[str(iso_file)] = disc_info
 
-    if settings.data_folder is not None:
-        yaml_dict = {}
-        for key, value in info_dict.items():
-            yaml_dict[key] = asdict(value)
-
-        Path(settings.data_folder, 'discs.yaml').write_text(pyaml.dump(yaml_dict))
-        settings.save_info_dict(info_dict)
+    settings.save_yaml_dict(info_dict)
+    settings.save_info_dict(info_dict)
 
     logger.info('%s', pformat(result))
-    logger.info(f'Max title size: {gigabyte_string(result.max_title_size)}')
+    logger.info(f'Max title size: {gigabyte_string(max_title_size)}')
     return 0
