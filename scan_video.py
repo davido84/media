@@ -6,7 +6,7 @@ from dataclasses import dataclass, field, asdict
 from pprint import pformat
 from mediautil import gigabyte_string, run_makemkvcon, gigabytes
 from pathlib import Path
-from discinfo import DiscInfo, parse_disc
+from isodisc import IsoDisc, parse_disc
 import pickle
 
 logger = logging.getLogger('SCAN')
@@ -25,11 +25,11 @@ class Result:
 def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
     result = Result()
     all_files = settings.scan_for_video_files(input_folder)
-    info_dict: dict[str, DiscInfo] = settings.info_dict() if not settings.force else {}
+    iso_dict: dict[str, IsoDisc] = settings.iso_dict() if not settings.force else {}
     max_title_size: int = 0
 
     for count, iso_file in enumerate(all_files):
-        if not settings.force and str(iso_file) in info_dict:
+        if not settings.force and str(iso_file) in iso_dict:
             result.skipped += 1
             continue
 
@@ -49,7 +49,7 @@ def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
             result.called_process_errors += 1
             continue
 
-        disc_info: DiscInfo = parse_disc(mkv_result.stdout)
+        disc_info: IsoDisc = parse_disc(mkv_result.stdout)
 
         if disc_info.title_count == 0:
             click.secho('ZERO_TITLE_COUNT', fg='red')
@@ -65,10 +65,10 @@ def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
             click.secho('OK', fg='bright_green')
             max_title_size = max(max_title_size, disc_info.max_title_size)
 
-        info_dict[str(iso_file)] = disc_info
+        iso_dict[str(iso_file)] = disc_info
 
-    settings.save_yaml_dict(info_dict)
-    settings.save_info_dict(info_dict)
+    settings.save_yaml_dict(iso_dict)
+    settings.save_iso_dict(iso_dict)
 
     logger.info('%s', pformat(result))
     logger.info(f'Max title size: {gigabyte_string(max_title_size)}')

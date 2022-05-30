@@ -5,7 +5,7 @@ from mediautil import gigabyte_string
 
 
 @dataclass
-class DiscInfo:
+class IsoDisc:
     title_count: int = 0
     possibly_corrupt: bool = False
     validated: bool = False
@@ -40,8 +40,8 @@ def _filter_code(code: int) -> bool:
                         mkvcodes.tree_info)
 
 
-def parse_disc(mkv_info: list[str]) -> DiscInfo:
-    disc_info = DiscInfo()
+def parse_disc(mkv_info: list[str]) -> IsoDisc:
+    disc_info = IsoDisc()
 
     value_re = r'"([^"]+)"'
 

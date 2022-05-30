@@ -25,11 +25,11 @@ class Result:
 
 def command(vm: VideoManager, temp_folder: str):
     result = Result()
-    info_dict = vm.info_dict()
+    iso_dict = vm.iso_dict()
 
-    for iso_count, (iso_file, dict_info) in enumerate(info_dict.items()):
-        info_dict[iso_file].validated = True
-        message = f'{iso_file!s} ({iso_count+1} of {len(info_dict.items())})'
+    for iso_count, (iso_file, dict_info) in enumerate(iso_dict.items()):
+        iso_dict[iso_file].validated = True
+        message = f'{iso_file!s} ({iso_count+1} of {len(iso_dict.items())})'
         click.secho(message, fg='cyan')
         for title_count, title in enumerate(dict_info.titles):
             output_file = Path(temp_folder, dict_info.titles[title][mkvcodes.output_file])
@@ -48,7 +48,7 @@ def command(vm: VideoManager, temp_folder: str):
                 click.secho('OK', fg='bright_green')
                 result.successful += 1
                 result.total_mkv_bytes += output_file.stat().st_size
-                info_dict[iso_file].valid_titles.add(title_count)
+                iso_dict[iso_file].valid_titles.add(title_count)
             except subprocess.CalledProcessError:
                 click.secho(f'FAILED', fg='bright_red')
                 logging.error(f'{iso_file!s}, {output_file!s}: FAILED validation.')
@@ -57,8 +57,8 @@ def command(vm: VideoManager, temp_folder: str):
             finally:
                 output_file.unlink(missing_ok=True)
 
-    vm.save_yaml_dict(info_dict)
-    vm.save_info_dict(info_dict)
+    vm.save_yaml_dict(iso_dict)
+    vm.save_iso_dict(iso_dict)
 
     result.total_mkv_bytes_human = gigabyte_string(result.total_mkv_bytes)
     logger.info('%s', pformat(result))

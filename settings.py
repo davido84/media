@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from discinfo import DiscInfo
+from isodisc import IsoDisc
 import pickle
 import fnmatch
 import pyaml
@@ -18,8 +18,8 @@ class VideoManager:
         self.log_level = logging.DEBUG
         self.minimum_title_len = 60*3
 
-    def info_dict(self) -> dict[str, DiscInfo]:
-        result: dict[str, DiscInfo] = {}
+    def iso_dict(self) -> dict[str, IsoDisc]:
+        result: dict[str, IsoDisc] = {}
         if self.data_folder is not None:
             try:
                 with Path(self.data_folder, self._pkl_name).open('rb') as file:
@@ -29,12 +29,12 @@ class VideoManager:
 
         return result
 
-    def save_info_dict(self, info_dict: dict[str, DiscInfo]) -> None:
+    def save_iso_dict(self, info_dict: dict[str, IsoDisc]) -> None:
         if self.data_folder is not None:
             with Path(self.data_folder, self._pkl_name).open('wb') as file:
                 pickle.dump(info_dict, file)
 
-    def save_yaml_dict(self, info_dict: dict[str, DiscInfo]) -> None:
+    def save_yaml_dict(self, info_dict: dict[str, IsoDisc]) -> None:
         if self.data_folder is not None:
             yaml_dict = {}
             for key, value in info_dict.items():

@@ -36,11 +36,11 @@ def gigabytes(num_gb: int) -> int:
 def gigabyte_string(n: int) -> str:
     one_kb = 1024
     if n >= one_kb ** 3:
-        return '{:.2f}Gb'.format(n * float(one_kb ** -3))
+        return '{:.2f} Gb'.format(n * float(one_kb ** -3))
     elif n >= one_kb ** 2:
-        return '{:.2f}Mb'.format(n * float(one_kb ** -2))
+        return '{:.2f} Mb'.format(n * float(one_kb ** -2))
     else:
-        return '{:.2f}Kb'.format(n * float(one_kb ** -1))
+        return '{:.2f} Kb'.format(n * float(one_kb ** -1))
 
 
 def set_priority(pid=None, priority=1):
@@ -101,7 +101,7 @@ def run_makemkvcon(title: str,
         while True:
             line = proc.stdout.readline().decode('utf-8').strip()
             if line:
-                if match := progress_start_re.match(line):
+                if progress_start_re.match(line):
                     if progress is not None:
                         progress.finish()
                         progress.start(max_value=65536, init=True)
