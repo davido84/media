@@ -8,6 +8,7 @@ from mediautil import run_makemkvcon, gigabyte_string
 from pathlib import Path
 import subprocess
 import shutil
+import threading
 
 logger = logging.getLogger('VALIDATE')
 
@@ -15,7 +16,7 @@ logger = logging.getLogger('VALIDATE')
 @dataclass
 class Result:
     skipped: int = 0
-    successful: int = 0
+    added: int = 0
     errors: int = 0
     timeouts: int = 0
     validator_failed_errors: int = 0
@@ -27,7 +28,25 @@ def command(vm: VideoManager, temp_folder: str):
     result = Result()
     iso_dict = vm.iso_dict()
 
+    timeout: bool = False
+
+    def timeout_handler():
+        nonlocal timeout
+        timeout = True
+
+    timer = threading.Timer(vm.timeout_in_hours*60*60, timeout_handler) if vm.timeout_in_hours is not None else None
+    if timer is not None:
+        timer.start()
+
     for iso_count, (iso_file, dict_info) in enumerate(iso_dict.items()):
+        if timeout:
+            click.secho('Finished with TIMEOUT', fg='bright_yellow')
+            break
+
+        if not vm.force and iso_dict[iso_file].validated:
+            result.skipped += 1
+            continue  # Already processed
+
         iso_dict[iso_file].validated = True
         message = f'{iso_file!s} ({iso_count+1} of {len(iso_dict.items())})'
         click.secho(message, fg='cyan')
@@ -46,7 +65,7 @@ def command(vm: VideoManager, temp_folder: str):
                 subprocess.run([shutil.which('mkvalidator.exe'), '--quiet', '--quick', f'{output_file!s}'],
                                text=True, capture_output=True, check=True)
                 click.secho('OK', fg='bright_green')
-                result.successful += 1
+                result.added += 1
                 result.total_mkv_bytes += output_file.stat().st_size
                 iso_dict[iso_file].valid_titles.add(title_count)
             except subprocess.CalledProcessError:
@@ -62,3 +81,5 @@ def command(vm: VideoManager, temp_folder: str):
 
     result.total_mkv_bytes_human = gigabyte_string(result.total_mkv_bytes)
     logger.info('%s', pformat(result))
+    if timer is not None and timer.is_alive():
+        timer.cancel()

@@ -29,11 +29,15 @@ pass_vm = click.make_pass_decorator(VideoManager)
 @click.option(
     '--filename-filter', '-r',
     metavar='FILENAME FILTER',
-    help='Filename filter. Example: "*d1*.*'
-)
+    help='Filename filter. Example: "*d1*.*')
+@click.option(
+    '--timeout',
+    metavar='TIMEOUT in HOURS',
+    help='Stop after N hours',
+    default=None)
 @click.version_option("1.0")
 @click.pass_context
-def cli(ctx, data_folder: str, force: bool, filename_filter: str) -> int:
+def cli(ctx, data_folder: str, force: bool, filename_filter: str, timeout: float | None) -> int:
     """Video Manager"""
     if data_folder is not None:
         os.makedirs(data_folder, exist_ok=True)
@@ -47,7 +51,7 @@ def cli(ctx, data_folder: str, force: bool, filename_filter: str) -> int:
         file_handler.setLevel(logging.INFO)
         file_handler.setFormatter(file_formatter)
         root_logger.addHandler(file_handler)
-    ctx.obj = VideoManager(data_folder, force, filename_filter)
+    ctx.obj = VideoManager(data_folder, force, filename_filter, timeout)
     return 0
 
 

@@ -1,5 +1,4 @@
 import click
-import pyaml
 from settings import VideoManager
 import logging
 from dataclasses import dataclass, field, asdict
@@ -7,7 +6,6 @@ from pprint import pformat
 from mediautil import gigabyte_string, run_makemkvcon, gigabytes
 from pathlib import Path
 from isodisc import IsoDisc, parse_disc
-import pickle
 
 logger = logging.getLogger('SCAN')
 
@@ -15,7 +13,7 @@ logger = logging.getLogger('SCAN')
 @dataclass
 class Result:
     skipped: int = 0
-    successful: int = 0
+    new: int = 0
     errors: int = 0
     corrupt: int = 0
     timeouts: int = 0
@@ -66,6 +64,7 @@ def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
             max_title_size = max(max_title_size, disc_info.max_title_size)
 
         iso_dict[str(iso_file)] = disc_info
+        result.new += 1
 
     settings.save_yaml_dict(iso_dict)
     settings.save_iso_dict(iso_dict)

@@ -11,12 +11,13 @@ class VideoManager:
     _pkl_name = 'discs.pkl'
     _yaml_name = 'discs.yaml'
 
-    def __init__(self, data_folder: str | None, force: bool, input_filter: str):
+    def __init__(self, data_folder: str | None, force: bool, input_filter: str, timeout_in_hours: float | None):
         self.data_folder: Path = data_folder if data_folder is None else Path(data_folder)
         self.force: bool = force
         self.input_filter: str = input_filter
         self.log_level = logging.DEBUG
         self.minimum_title_len = 60*3
+        self.timeout_in_hours = timeout_in_hours
 
     def iso_dict(self) -> dict[str, IsoDisc]:
         result: dict[str, IsoDisc] = {}
