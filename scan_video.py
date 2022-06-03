@@ -1,7 +1,7 @@
 import click
 from settings import VideoManager
 import logging
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from pprint import pformat
 from mediautil import gigabyte_string, run_makemkvcon, gigabytes
 from pathlib import Path

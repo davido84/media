@@ -66,9 +66,11 @@ class RunMkvResult:
 def run_makemkvcon(title: str,
                    args: list[str], timeout: int = 60*20, show_progress: bool = True) -> RunMkvResult:
     result = RunMkvResult()
+    minlength: int = 3*60
+    cache: int = 1024
 
     final_args = [shutil.which('makemkvcon64.exe'),
-                  '--noscan', '--minlength=3*60', '-r', '--cache=1024']
+                  '--noscan', f'--minlength={minlength}', '-r', f'--cache={cache}']
     if show_progress:
         final_args.append('--progress=-same')
 
