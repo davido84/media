@@ -51,7 +51,7 @@ def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
 
         if disc_info.title_count == 0:
             click.secho('ZERO_TITLE_COUNT', fg='red')
-            logging.error('Title count == o')
+            logging.error(f'{iso_file!s}: Title count == o')
             result.errors += 1
             continue
 
