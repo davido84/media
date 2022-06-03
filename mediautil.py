@@ -69,8 +69,7 @@ def run_makemkvcon(title: str,
     minlength: int = 3*60
     cache: int = 1024
 
-    final_args = [shutil.which('makemkvcon64.exe'),
-                  '--noscan', f'--minlength={minlength}', '-r', f'--cache={cache}']
+    final_args = [shutil.which('makemkvcon64.exe'), '--noscan', '-r', f'--cache={cache}']
     if show_progress:
         final_args.append('--progress=-same')
 
