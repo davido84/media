@@ -54,6 +54,9 @@ def command(vm: VideoManager, temp_folder: str):
             result.skipped += 1
             continue  # Already processed
 
+        if not iso_dict[iso_file].problematic:
+            continue  # Assume non-problematic iso's will not have problems converting
+
         message = f'{iso_file!s} ({iso_count+1} of {len(iso_dict.items())})'
         click.secho(message, fg='cyan')
         for title_count, title in enumerate(dict_info.titles):
@@ -77,6 +80,9 @@ def command(vm: VideoManager, temp_folder: str):
                 result.total_mkv_bytes += output_file.stat().st_size
                 iso_dict[iso_file].valid_titles.add(title_count)
                 result.total_titles_validated += 1
+                iso_dict[iso_file].validated = True
+                vm.save_yaml_dict(iso_dict)
+                vm.save_iso_dict(iso_dict)
 
             except subprocess.CalledProcessError:
                 click.secho(f'FAILED', fg='bright_red')
@@ -85,8 +91,6 @@ def command(vm: VideoManager, temp_folder: str):
 
             finally:
                 output_file.unlink(missing_ok=True)
-
-        iso_dict[iso_file].validated = True
 
     vm.save_yaml_dict(iso_dict)
     vm.save_iso_dict(iso_dict)

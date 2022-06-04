@@ -10,6 +10,6 @@ class TestDiscInfo(TestCase):
         self.good_bd: IsoDisc = parse_disc(GOOD_ENG_BD.split())
 
     def test_validate(self):
-        self.assertFalse(self.good_bd.possibly_corrupt)
-        self.assertFalse(self.good_dvd.possibly_corrupt)
-        self.assertTrue(self.bad_dvd.possibly_corrupt)
+        self.assertFalse(self.good_bd.problematic)
+        self.assertFalse(self.good_dvd.problematic)
+        self.assertTrue(self.bad_dvd.problematic)

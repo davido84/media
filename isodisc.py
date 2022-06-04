@@ -7,7 +7,7 @@ from mediautil import gigabyte_string
 @dataclass
 class IsoDisc:
     title_count: int = 0
-    possibly_corrupt: bool = False
+    problematic: bool = False
     validated: bool = False
     valid_titles: set[int] = field(default_factory=set[int])
     disc_info: dict[int, str | int] = field(default_factory=dict[int, str | int])
@@ -49,7 +49,7 @@ def parse_disc(mkv_info: list[str]) -> IsoDisc:
         if match := re.match(r'TCOUNT:(\d+)', line):
             disc_info.title_count = int(match.group(1))
         elif line.startswith('MSG:4004'):
-            disc_info.possibly_corrupt = True
+            disc_info.problematic = True
         elif match := re.match(fr'CINFO:(\d+),(\d+),{value_re}', line):
             code = int(match.group(1))
             if _filter_code(code):

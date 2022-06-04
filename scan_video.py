@@ -15,7 +15,7 @@ class Result:
     skipped: int = 0
     new: int = 0
     errors: int = 0
-    corrupt: int = 0
+    problematic: int = 0
     timeouts: int = 0
     called_process_errors: int = 0
 
@@ -37,12 +37,12 @@ def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
         mkv_result = run_makemkvcon(message, [f'--minlength={settings.minimum_title_len}',
                                               'info', f'iso:{iso_file!s}'], timeout=timeout, show_progress=False)
         if mkv_result.timed_out:
-            click.secho('TIMEOUT', fg='red')
+            click.secho('Timeout', fg='red')
             logging.warning(f'{iso_file!s: } TIMEOUT')
             result.timeouts += 1
             continue
         elif mkv_result.return_code != 0:
-            click.secho('CALLED_PROCESS_ERROR', fg='red')
+            click.secho('Called process error.', fg='red')
             logging.error(f'{iso_file!s}: CALLED_PROCESS_ERROR')
             result.called_process_errors += 1
             continue
@@ -50,18 +50,20 @@ def command(settings: VideoManager, timeout: int, input_folder: Path) -> int:
         disc_info: IsoDisc = parse_disc(mkv_result.stdout)
 
         if disc_info.title_count == 0:
-            click.secho('ZERO_TITLE_COUNT', fg='red')
-            logging.error(f'{iso_file!s}: Title count == o')
+            click.secho('Zero title count.', fg='red')
+            logging.error(f'{iso_file!s}: ZERO_TITLE_COUNT')
             result.errors += 1
             continue
 
-        if disc_info.possibly_corrupt:
-            click.secho(' POSSIBLE_CORRUPT', fg='bright_yellow')
-            logging.warning(f'{iso_file!s}: Possibly corrupt.')
-            result.corrupt += 1
+        if disc_info.problematic:
+            click.secho(' Problematic.', fg='bright_yellow')
+            logging.warning(f'{iso_file!s}: PROBLEMATIC')
+            # Only record max title size for problematic titles, since only
+            # those will need to be validated.
+            max_title_size = max(max_title_size, disc_info.max_title_size)
+            result.problematic += 1
         else:
             click.secho(' OK', fg='bright_green')
-            max_title_size = max(max_title_size, disc_info.max_title_size)
 
         iso_dict[str(iso_file)] = disc_info
         result.new += 1
