@@ -25,7 +25,11 @@ class Result:
     total_mkv_bytes_human: str = ''
 
 
-def command(vm: VideoManager, temp_folder: str):
+def command(vm: VideoManager, temp_folder: str) -> None:
+    if not temp_folder or not Path(temp_folder).exists():
+        click.secho('Temp folder does not exist', fg='bright_red')
+        return
+
     result = Result()
     iso_dict = vm.iso_dict()
 
