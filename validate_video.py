@@ -84,9 +84,6 @@ def command(vm: VideoManager, temp_folder: str) -> None:
                 result.total_mkv_bytes += output_file.stat().st_size
                 iso_dict[iso_file].valid_titles.add(title_count)
                 result.total_titles_validated += 1
-                iso_dict[iso_file].validated = True
-                vm.save_yaml_dict(iso_dict)
-                vm.save_iso_dict(iso_dict)
 
             except subprocess.CalledProcessError:
                 click.secho(f'FAILED', fg='bright_red')
@@ -96,8 +93,9 @@ def command(vm: VideoManager, temp_folder: str) -> None:
             finally:
                 output_file.unlink(missing_ok=True)
 
-    vm.save_yaml_dict(iso_dict)
-    vm.save_iso_dict(iso_dict)
+        iso_dict[iso_file].validated = True
+        vm.save_yaml_dict(iso_dict)
+        vm.save_iso_dict(iso_dict)
 
     result.total_mkv_bytes_human = gigabyte_string(result.total_mkv_bytes)
     logger.info('%s', pformat(result))
