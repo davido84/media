@@ -99,7 +99,7 @@ def run_makemkvcon(title: str,
         max_progress: int = 65536
 
         while True:
-            line = proc.stdout.readline().decode('utf-8').strip()
+            line = proc.stdout.readline().decode('utf-8', errors='replace').strip()
             if line and progress is not None:
                 if match := progress_total_re.match(line):
                     progress.reset(total=max_progress)
