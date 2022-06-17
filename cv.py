@@ -47,7 +47,7 @@ def cli(ctx, data_folder: str, force: bool, filename_filter: str, timeout: float
     file_formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s', datefmt='%m/%d %I:%M %p')
     if data_folder is not None:
         log_file_name = Path(data_folder, 'cv.log')
-        file_handler = logging.FileHandler(encoding='utf-8', filename=f'{log_file_name}', mode='w')
+        file_handler = logging.FileHandler(encoding='utf-8', filename=f'{log_file_name}', mode='a')
         file_handler.setLevel(logging.INFO)
         file_handler.setFormatter(file_formatter)
         root_logger.addHandler(file_handler)

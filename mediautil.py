@@ -15,6 +15,7 @@ import re
 
 @contextmanager
 def media_command(name: str) -> None:
+    logging.info(f'------------------------------------')
     logging.info(f'Starting {name}')
     start = default_timer()
     try:
@@ -99,7 +100,12 @@ def run_makemkvcon(title: str,
         max_progress: int = 65536
 
         while True:
-            line = proc.stdout.readline().decode('utf-8', errors='replace').strip()
+            try:
+                line = proc.stdout.readline().decode('utf-8').strip()
+            except UnicodeDecodeError:
+                logging.warning('UnicodeDecodeError')
+                continue
+
             if line and progress is not None:
                 if match := progress_total_re.match(line):
                     progress.reset(total=max_progress)
