@@ -3,7 +3,7 @@ import logging
 from fix_titles import fix_titles
 
 logging.basicConfig(level=logging.DEBUG,
-                    format='%(asctime)s %(name)-12s %(levelname)-8s %(message)s',
+                    format='%(levelname)-8s %(message)s',
                     datefmt='%m-%d %H:%M',
                     filename='d:/cm.log',
                     filemode='w')
@@ -34,13 +34,13 @@ logging.getLogger().addHandler(console)
 
 def main():
     parser = argparse.ArgumentParser(description='Convert Music Files')
-    parser.add_argument('-i', '--input', type=str, help='Input folder or file')
+    parser.add_argument('-i', '--input', type=str, help='Input folder or file', default='e:/music')
     parser.add_argument('-d', '--dry-run', action='store_true', default=False, help='Dry run')
     subparsers = parser.add_subparsers(title='Commands', description='Convert music commands')
+
     parser_fix_titles = subparsers.add_parser('fix-titles', help='Fix music filenames', aliases=['ft'])
     parser_fix_titles.set_defaults(func=fix_titles)
 
-    parser_validate_titles = subparsers.add_parser('validate', help='Validate music filenames')
     args = parser.parse_args()
     args.func(args)
 
