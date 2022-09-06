@@ -17,8 +17,8 @@ def fix(file: Path) -> None | Path:
             disc = int(match.group('disc'))
             track = int(match.group('track'))
             title = match.group('title')
-            new_stem = unicodedata.normalize('NFKD', f'{disc:02d}-{track:02d} {title}'[:_MAX_TITLE_LEN-1]).strip()
-            new_filename = file.with_stem(new_stem)
+            new_stem = unicodedata.normalize('NFKD', f'{disc:02d}-{track:02d} {title}'[:_MAX_TITLE_LEN-1])
+            new_filename = file.with_stem(new_stem.replace('_', ' ').strip())
             assert(_RE_VALID_FILENAME.match(new_filename.stem))
             return new_filename
 
