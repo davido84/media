@@ -1,6 +1,7 @@
 import argparse
 import logging
 from fix_titles import fix_titles
+from rm_dup import rm_dup
 
 logging.basicConfig(level=logging.DEBUG,
                     format='%(levelname)-8s %(message)s',
@@ -40,6 +41,9 @@ def main():
 
     parser_fix_titles = subparsers.add_parser('fix-titles', help='Fix music filenames', aliases=['ft'])
     parser_fix_titles.set_defaults(func=fix_titles)
+
+    parser_remove_duplicates = subparsers.add_parser('rm-dup', help='Remove duplicates', aliases=['rd'])
+    parser_remove_duplicates.set_defaults(func=rm_dup)
 
     args = parser.parse_args()
     args.func(args)

@@ -25,14 +25,14 @@ def fix_titles(args):
                 renamed_files += 1
         else:
             print(f'Unmatched: {file}')
-            unmatched_files += 1
+            unmatched_files.append(file)
 
-    logging.info('Finished.')
     if unmatched_files:
         logging.warning('Unmatched files')
         for file in unmatched_files:
             logging.warning(f'{file}')
 
+    logging.info('Finished.')
     logging.info(f'Validated: {validated_files:,}')
     logging.info(f'Matched: {matched_files:,}')
     logging.info(f'Unmatched: {len(unmatched_files):,}')
