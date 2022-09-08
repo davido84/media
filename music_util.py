@@ -4,6 +4,7 @@ import unicodedata
 
 def normalize(s):
     new_form = unicodedata.normalize('NFKD', s)
+    assert '\\' not in new_form
     return u''.join([c for c in new_form if not unicodedata.combining(c)])
 
 
