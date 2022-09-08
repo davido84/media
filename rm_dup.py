@@ -2,6 +2,15 @@ import music_util
 import logging
 from pathlib import Path
 import media_util
+import subprocess
+
+
+def _sha(file: Path) -> str:
+    output = subprocess.run([
+        'ffmpeg', '-loglevel', 'error', '-i', str(file), '-map', '0', '-f', 'hash', '-hash', 'md5', '-'],
+                            capture_output=True, check=True)
+    
+    return output.stdout.decode().strip()
 
 
 def rm_dup(args):
@@ -15,10 +24,9 @@ def rm_dup(args):
         album_file_dict: dict[int, Path] = {}
         for music_file in music_util.music_files(album):
             file_size = music_file.stat().st_size
-            if file_size in album_file_dict:
+            if file_size in album_file_dict and _sha(music_file) == _sha(album_file_dict[file_size]):
                 file_1 = music_file
                 file_2 = album_file_dict[file_size]
-                file_to_delete = file_1
 
                 if '$' in file_1.stem and '$' not in file_2.stem:
                     file_to_delete = file_1
@@ -30,7 +38,7 @@ def rm_dup(args):
                     file_to_delete = file_1
                 else:
                     logging.error(
-                        f'Could not determine duplicate file which should be deleted:\n{file_1}\n{file_2}')
+                        f'Could not determine duplicate file which should be deleted:\n{file_1} -- {file_2}')
                     raise media_util.MediaException
 
                 logging.info(f'Removing duplicate: {file_to_delete.stem}')
