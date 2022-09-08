@@ -1,8 +1,10 @@
+import sys
 import music_util
 import logging
 from pathlib import Path
 import media_util
 import subprocess
+import os
 
 
 def _sha(file: Path) -> str:
@@ -22,6 +24,7 @@ def rm_dup(args):
     def process_album(album_name: Path):
         logging.info(f'Processing album: {album_name}')
         album_file_dict: dict[int, Path] = {}
+        assert not album_file_dict
         for music_file in music_util.music_files(album):
             file_size = music_file.stat().st_size
             if file_size in album_file_dict and _sha(music_file) == _sha(album_file_dict[file_size]):
@@ -58,9 +61,11 @@ def rm_dup(args):
             print('Deleting files...')
             for file in files_removed:
                 file.unlink()
+                sys.stderr.write('.')
+
     except media_util.MediaException:
         pass
 
     logging.info('Finished.')
-    logging.info(f'Number of files removed: {len(files_removed)}')
+    logging.info(f'Number of files deleted: {len(files_removed)}')
     logging.info(f'Total bytes deleted: {media_util.gigabyte_string(bytes_deleted)}')
