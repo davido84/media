@@ -31,6 +31,7 @@ def rm_dup(args):
                 else:
                     logging.error(
                         f'Could not determine duplicate file which should be deleted:\n{file_1}\n{file_2}')
+                    raise media_util.MediaException
 
                 logging.info(f'Removing duplicate: {file_to_delete.stem}')
 
@@ -41,13 +42,16 @@ def rm_dup(args):
             else:
                 album_file_dict[file_size] = music_file
 
-    for album in music_util.album_folders(Path(args.input)):
-        process_album(album)
+    try:
+        for album in music_util.album_folders(Path(args.input)):
+            process_album(album)
 
-    if not args.dry_run:
-        print('Deleting files...')
-        for file in files_removed:
-            file.unlink()
+        if not args.dry_run:
+            print('Deleting files...')
+            for file in files_removed:
+                file.unlink()
+    except media_util.MediaException:
+        pass
 
     logging.info('Finished.')
     logging.info(f'Number of files removed: {len(files_removed)}')
