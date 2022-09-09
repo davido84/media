@@ -4,7 +4,7 @@ from fix_titles import fix_titles
 from rm_dup import rm_dup
 
 logging.basicConfig(level=logging.DEBUG,
-                    format='%(levelname)-8s %(message)s',
+                    format='%(asctime)s;%(levelname)-8s;%(message)s',
                     datefmt='%m-%d %H:%M',
                     filename='d:/cm.log',
                     filemode='w')
@@ -15,7 +15,7 @@ console.setLevel(logging.INFO)
 
 # set a format which is simpler for console use
 # formatter = logging.Formatter('%(name)-12s: %(levelname)-8s %(message)s')
-formatter = logging.Formatter('%(levelname)-8s %(message)s')
+formatter = logging.Formatter('%(levelname)-8s;%(message)s')
 # tell the handler to use this format
 console.setFormatter(formatter)
 # add the handler to the root logger

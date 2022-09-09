@@ -15,7 +15,7 @@ def _checksum(file: Path) -> str:
 
 
 def rm_dup(args):
-    logging.info('Remove duplicates')
+    logging.info('Remove duplicates started.')
 
     files_removed: list[Path] = []
     bytes_deleted = 0
@@ -43,24 +43,21 @@ def rm_dup(args):
                         f'Could not determine duplicate file which should be deleted:\n{file_1} -- {file_2}')
                     raise media_util.MediaException
 
-                logging.info(f'Removing duplicate: {file_to_delete.stem}')
+                if args.dry_run:
+                    logging.info(f'Found duplicate: "{file_to_delete.stem}"')
 
                 nonlocal files_removed, bytes_deleted
                 bytes_deleted += file_size
                 files_removed.append(file_to_delete)
-
+                if not args.dry_run:
+                    file_to_delete.unlink()
+                    logging.info(f'Deleted: "{file_to_delete}"')
             else:
                 album_file_dict[file_size] = music_file
 
     try:
         for album in music_util.album_folders(Path(args.input)):
             process_album(album)
-
-        if not args.dry_run:
-            print('Deleting files...')
-            for file in files_removed:
-                file.unlink()
-                sys.stderr.write('.')
 
     except media_util.MediaException:
         pass
