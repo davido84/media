@@ -4,9 +4,11 @@ import music_util
 from pathlib import Path
 
 
-_MAX_TITLE_LEN = 1000
+_MAX_TITLE_LEN = 100+5  # dd-tt
+
+
 _RE_CANONICAL_FILE_STEM = re.compile(
-    fr'^((?P<disc>\d{{1,2}})-)?(?P<track>\d{{1,3}}) (?P<title>[^\\/$<>|?*":]{{1,{_MAX_TITLE_LEN}}})$')
+    fr'^((?P<disc>\d{{1,2}})-)?(?P<track>\d{{1,3}}) (?P<title>[^\\/$<>|?*":]{{1,{_MAX_TITLE_LEN+1}}})$')
 
 _RE_FILENAME_MASKS: list[re.Pattern] = [
     re.compile(r'^Ep(?P<track>\d{1,3})_\d+\$(?P<title>[^\$]+).*$'),
@@ -28,6 +30,9 @@ def _parse_match(match_dict: dict[str, str]) -> [int, int, str]:
 
 def fix(file: Path) -> None | Path:
     assert not validate(file)
+    trimmed = file.with_stem(file.stem[:_MAX_TITLE_LEN])
+    if trimmed != file and validate(trimmed):
+        return trimmed
 
     for mask in _RE_FILENAME_MASKS:
         if (match := mask.match(file.stem)) is not None:
