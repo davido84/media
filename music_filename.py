@@ -11,7 +11,7 @@ _RE_CANONICAL_FILE_STEM = re.compile(
 _RE_FILENAME_MASKS: list[re.Pattern] = [
     re.compile(r'^(?P<disc>\d{1,2})-(?P<track>\d{1,3})_(?P<title>[^\$]+$)'),
     re.compile(r'^(?P<disc>\d{1,2})-(?P<track>\d{1,3})-(?P<title>[^\$]+$)'),
-    re.compile(r'^(?P<track>\d{1,2})-(?P<title>[^\$]+$)')
+    re.compile(r'^(?P<track>\d{1,3})-(?P<title>[^\$]+$)')
 ]
 
 
