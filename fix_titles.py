@@ -18,19 +18,14 @@ def fix_titles(args):
         if music_filename.validate(file):
             validated_files += 1
         elif new_name := music_filename.fix(file):
-            logging.info(f'Matched:{file} --> {new_name.stem}')
+            # logging.info(f'Matched:{file} --> {new_name.stem}')
             matched_files += 1
             if not args.dry_run:
                 os.rename(str(file), str(new_name))
                 renamed_files += 1
         else:
-            print(f'Unmatched: {file}')
+            logging.warning(f'Unmatched: {file}')
             unmatched_files.append(file)
-
-    if unmatched_files:
-        logging.warning('Unmatched files')
-        for file in unmatched_files:
-            logging.warning(f'{file}')
 
     logging.info('Finished.')
     logging.info(f'Validated: {validated_files:,}')
