@@ -1,9 +1,12 @@
-import sys
+import concurrent
+import concurrent.futures
+import os
 import music_util
 import logging
 from pathlib import Path
 import media_util
 import subprocess
+from functools import partial
 
 
 def _checksum(file: Path) -> str:
@@ -11,11 +14,24 @@ def _checksum(file: Path) -> str:
         'ffmpeg', '-loglevel', 'error', '-i', str(file), '-map', '0', '-f', 'hash', '-hash', 'md5', '-'],
                             capture_output=True, check=True)
     
-    return output.stdout.decode().strip()
+    return output.stdout.decode().strip()[4:]
+
+
+def run_checksum(file: Path) -> [Path, str]:
+    return file, _checksum(file)
 
 
 def show_duplicates(args):
-    pass
+    logging.info('Show duplicates')
+    starter = partial(run_checksum)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as tp:
+        ck = [tp.submit(starter, t) for t in music_util.music_files(Path(args.input))]
+        for fut in concurrent.futures.as_completed(ck):
+            file, checksum = fut.result()
+            logging.debug(f'{file.stem} : {checksum}')
+
+    logging.info('Finished')
 
 
 def rm_dup(args):

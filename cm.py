@@ -6,18 +6,18 @@ from fix_titles import fix_titles
 from dup import rm_dup
 
 logging.basicConfig(level=logging.DEBUG,
-                    format='%(asctime)s;%(levelname)-8s;%(message)s',
+                    format='%(asctime)s %(levelname)-8s %(message)s',
                     datefmt='%m-%d %H:%M',
                     filename='d:/cm.log',
                     filemode='w')
 
 # define a Handler which writes INFO messages or higher to the sys.stderr
 console = logging.StreamHandler()
-console.setLevel(logging.INFO)
+console.setLevel(logging.DEBUG)
 
 # set a format which is simpler for console use
 # formatter = logging.Formatter('%(name)-12s: %(levelname)-8s %(message)s')
-formatter = logging.Formatter('%(levelname)-8s;%(message)s')
+formatter = logging.Formatter('%(levelname)-8s %(message)s')
 # tell the handler to use this format
 console.setFormatter(formatter)
 # add the handler to the root logger
@@ -47,7 +47,7 @@ def main():
     parser_remove_duplicates = subparsers.add_parser('rm-dup', help='Remove duplicates', aliases=['rd'])
     parser_remove_duplicates.set_defaults(func=rm_dup)
 
-    parser_remove_duplicates = subparsers.add_parser('dup', help='Show duplicates')
+    parser_remove_duplicates = subparsers.add_parser('dup', help='Show duplicate files.')
     parser_remove_duplicates.set_defaults(func=dup.show_duplicates)
 
     args = parser.parse_args()
