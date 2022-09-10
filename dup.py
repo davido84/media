@@ -14,6 +14,10 @@ def _checksum(file: Path) -> str:
     return output.stdout.decode().strip()
 
 
+def show_duplicates(args):
+    pass
+
+
 def rm_dup(args):
     logging.info('Remove duplicates started.')
 

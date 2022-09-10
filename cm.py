@@ -1,7 +1,9 @@
 import argparse
 import logging
+
+import dup
 from fix_titles import fix_titles
-from rm_dup import rm_dup
+from dup import rm_dup
 
 logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s;%(levelname)-8s;%(message)s',
@@ -44,6 +46,9 @@ def main():
 
     parser_remove_duplicates = subparsers.add_parser('rm-dup', help='Remove duplicates', aliases=['rd'])
     parser_remove_duplicates.set_defaults(func=rm_dup)
+
+    parser_remove_duplicates = subparsers.add_parser('dup', help='Show duplicates')
+    parser_remove_duplicates.set_defaults(func=dup.show_duplicates)
 
     args = parser.parse_args()
     args.func(args)
