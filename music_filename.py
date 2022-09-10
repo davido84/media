@@ -30,7 +30,7 @@ def _parse_match(match_dict: dict[str, str]) -> [int, int, str]:
 
 def fix(file: Path) -> None | Path:
     assert not validate(file)
-    trimmed = file.with_stem(file.stem[:_MAX_TITLE_LEN])
+    trimmed = file.with_stem(file.stem[:_MAX_TITLE_LEN].strip())
     if trimmed != file and validate(trimmed):
         return trimmed
 
