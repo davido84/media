@@ -19,32 +19,49 @@ def _checksum(file: Path) -> str:
 
 def show_duplicates(args) -> None:
     file_size_dict: dict[int, Path] = {}
+    albums = [A for A in music_util.album_folders(Path(args.input))]
+    artists = set([A.parent for A in albums])
+    files_to_remove: set[Path] = set()
+    bytes_removed = 0
+
     for file in music_util.music_files(Path(args.input)):
+        if '_books' in str(file):
+            continue
+
         file_size = file.stat().st_size
         if file_size in file_size_dict:
-            logging.warning(f'"{file_size_dict[file_size]}" -- "{file}')
+            file_1 = file
+            file_2 = file_size_dict[file_size]
+            file_1_is_classical = '_classical' in str(file_1)
+            file_2_is_classical = '_classical' in str(file_2)
+
+            file_to_remove: Path | None = None
+            if file_1_is_classical != file_2_is_classical:
+                file_to_remove = file_1 if file_2_is_classical else file_2
+            else:
+                file_to_remove = file_1 if len(str(file_1)) > len(str(file_2)) else file_2
+                
+            logging.warning(f'Duplicate: {file_to_remove}')
+            files_to_remove.add(file_to_remove)
+            bytes_removed += file_to_remove.stat().st_size
+
         else:
             file_size_dict[file_size] = file
 
-    # def run_checksum(input_file: Path) -> [Path, str]:
-    #     return input_file, _checksum(input_file)
+    if not args.dry_run:
+        for file in files_to_remove:
+            file.unlink()
+            logging.info(f'Deleted {file}')
 
-    # checksum_dict: dict[str, Path] = {}
-    # num_duplicates = 0
+        for album in [A for A in albums if len(os.listdir(str(A))) == 0]:
+            logging.info(f'Removed empty folder: {album}')
+            os.rmdir(str(album))
+        for artist in [A for A in artists if len(os.listdir(str(A))) == 0]:
+            logging.info(f'Removed empty folder: {artist}')
+            os.rmdir(str(artist))
 
-    # with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as tp:
-    #     workers = [tp.submit(partial(run_checksum), T) for T in music_util.music_files(Path(args.input))]
-    #     for worker in concurrent.futures.as_completed(workers):
-    #         file, checksum = worker.result()
-    #         if checksum in checksum_dict:
-    #             logging.warning(f'"{checksum_dict[checksum]}" -- "{file}"')
-    #             num_duplicates += 1
-    #         else:
-    #             checksum_dict[checksum] = file
-    #
-    #         print(f'{file.stem} : {checksum}')
-
-    # logging.info(f'{num_duplicates} duplicate(s) found.')
+    logging.info(f'{len(files_to_remove)} duplicates found.')
+    logging.info(f'Total removed: {media_util.gigabyte_string(bytes_removed)}')
 
 
 def rm_dup(args):
