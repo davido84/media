@@ -18,25 +18,33 @@ def _checksum(file: Path) -> str:
 
 
 def show_duplicates(args) -> None:
-    def run_checksum(input_file: Path) -> [Path, str]:
-        return input_file, _checksum(input_file)
+    file_size_dict: dict[int, Path] = {}
+    for file in music_util.music_files(Path(args.input)):
+        file_size = file.stat().st_size
+        if file_size in file_size_dict:
+            logging.warning(f'"{file_size_dict[file_size]}" -- "{file}')
+        else:
+            file_size_dict[file_size] = file
 
-    checksum_dict: dict[str, Path] = {}
-    num_duplicates = 0
+    # def run_checksum(input_file: Path) -> [Path, str]:
+    #     return input_file, _checksum(input_file)
 
-    with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as tp:
-        workers = [tp.submit(partial(run_checksum), T) for T in music_util.music_files(Path(args.input))]
-        for worker in concurrent.futures.as_completed(workers):
-            file, checksum = worker.result()
-            if checksum in checksum_dict:
-                logging.warning(f'"{checksum_dict[checksum]}" -- "{file}"')
-                num_duplicates += 1
-            else:
-                checksum_dict[checksum] = file
+    # checksum_dict: dict[str, Path] = {}
+    # num_duplicates = 0
 
-            print(f'{file.stem} : {checksum}')
+    # with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as tp:
+    #     workers = [tp.submit(partial(run_checksum), T) for T in music_util.music_files(Path(args.input))]
+    #     for worker in concurrent.futures.as_completed(workers):
+    #         file, checksum = worker.result()
+    #         if checksum in checksum_dict:
+    #             logging.warning(f'"{checksum_dict[checksum]}" -- "{file}"')
+    #             num_duplicates += 1
+    #         else:
+    #             checksum_dict[checksum] = file
+    #
+    #         print(f'{file.stem} : {checksum}')
 
-    logging.info(f'{num_duplicates} duplicate(s) found.')
+    # logging.info(f'{num_duplicates} duplicate(s) found.')
 
 
 def rm_dup(args):
