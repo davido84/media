@@ -39,8 +39,8 @@ def show_duplicates(args) -> None:
             if file_1_is_classical != file_2_is_classical:
                 file_to_remove = file_1 if file_2_is_classical else file_2
             else:
-                file_to_remove = file_2 if len(str(file_1)) > len(str(file_2)) else file_1
-
+                file_to_remove = file_1 if len(str(file_1)) > len(str(file_2)) else file_2
+                
             logging.warning(f'Duplicate: {file_to_remove}')
             files_to_remove.add(file_to_remove)
             bytes_removed += file_to_remove.stat().st_size
