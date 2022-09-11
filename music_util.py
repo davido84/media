@@ -2,7 +2,7 @@ from pathlib import Path
 import unicodedata
 
 
-def normalize(s):
+def normalize(s) -> str:
     new_form = unicodedata.normalize('NFKD', s)
     assert '\\' not in new_form
     return u''.join([c for c in new_form if not unicodedata.combining(c)])
@@ -19,7 +19,3 @@ def album_folders(root: Path) -> set[Path]:
     for file in music_files(root):
         result.add(Path(file.parent))
     return result
-
-
-# def all_music_files(root: Path) -> list[Path]:
-#     return [F for F in music_files(root)]

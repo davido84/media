@@ -11,16 +11,16 @@ _RE_CANONICAL_FILE_STEM = re.compile(
     fr'^((?P<disc>\d{{1,2}})-)?(?P<track>\d{{1,3}}) (?P<title>[^\\/$<>|?*":]{{1,{_MAX_TITLE_LEN+1}}})$')
 
 _RE_FILENAME_MASKS: list[re.Pattern] = [
-    re.compile(r'^Ep(?P<track>\d{1,3})_\d+\$(?P<title>[^\$]+).*$'),
-    re.compile(r'^(?P<disc>\d{1,3})-(?P<track>\d{1,3})_\d+\$(?P<title>[^\$]+).*$'),
-    re.compile(r'^(?P<track>\d{1,3})-(?P<disc>\d{1,3})_\d+_(?P<title>[^\$])+.*$'),
-    re.compile(r'^(?P<track>\d{1,2})\$(?P<title>[^\$]+)\$(?P<disc>\d{1,2})\$.*$'),
-    re.compile(r'^(?P<track>\d{1,2})\$(?P<title>[^\$]+)\$1\$1\$.*$'),
-    re.compile(r'^(?P<track>\d{1,2})_(?P<title>[^\$]+)\$(?P<disc>\d{1,2})$'),
-    re.compile(r'^(?P<track>\d{1,2})_(?P<title>[^\$]+)\$(?P<disc>\d)\$\d$'),
-    re.compile(r'^(?P<disc>\d{1,2})-(?P<track>\d{1,3})_(?P<title>[^\$]+$)'),
-    re.compile(r'^(?P<disc>\d{1,2})-(?P<track>\d{1,3})-(?P<title>[^\$]+$)'),
-    re.compile(r'^(?P<track>\d{1,3})-(?P<title>[^\$]+$)')
+    re.compile(r'^Ep(?P<track>\d{1,3})_\d+\$(?P<title>[^$]+).*$'),
+    re.compile(r'^(?P<disc>\d{1,3})-(?P<track>\d{1,3})_\d+\$(?P<title>[^$]+).*$'),
+    re.compile(r'^(?P<track>\d{1,3})-(?P<disc>\d{1,3})_\d+_(?P<title>[^$])+.*$'),
+    re.compile(r'^(?P<track>\d{1,2})\$(?P<title>[^$]+)\$(?P<disc>\d{1,2})\$.*$'),
+    re.compile(r'^(?P<track>\d{1,2})\$(?P<title>[^$]+)\$1\$1\$.*$'),
+    re.compile(r'^(?P<track>\d{1,2})_(?P<title>[^$]+)\$(?P<disc>\d{1,2})$'),
+    re.compile(r'^(?P<track>\d{1,2})_(?P<title>[^$]+)\$(?P<disc>\d)\$\d$'),
+    re.compile(r'^(?P<disc>\d{1,2})-(?P<track>\d{1,3})_(?P<title>[^$]+$)'),
+    re.compile(r'^(?P<disc>\d{1,2})-(?P<track>\d{1,3})-(?P<title>[^$]+$)'),
+    re.compile(r'^(?P<track>\d{1,3})-(?P<title>[^$]+$)')
 ]
 
 

@@ -17,30 +17,26 @@ def _checksum(file: Path) -> str:
     return output.stdout.decode().strip()[4:]
 
 
-def show_duplicates(args):
+def show_duplicates(args) -> None:
     def run_checksum(input_file: Path) -> [Path, str]:
         return input_file, _checksum(input_file)
 
-    logging.info('Show duplicates')
     checksum_dict: dict[str, Path] = {}
-    duplicates: set[(Path, Path)] = set()
+    num_duplicates = 0
 
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as tp:
-        worker = [tp.submit(partial(run_checksum), t) for t in music_util.music_files(Path(args.input))]
-        for fut in concurrent.futures.as_completed(worker):
-            file, checksum = fut.result()
+        workers = [tp.submit(partial(run_checksum), T) for T in music_util.music_files(Path(args.input))]
+        for worker in concurrent.futures.as_completed(workers):
+            file, checksum = worker.result()
             if checksum in checksum_dict:
-                duplicates.add((file, checksum_dict[checksum]))
+                logging.warning(f'"{checksum_dict[checksum]}" -- "{file}"')
+                num_duplicates += 1
             else:
                 checksum_dict[checksum] = file
 
             print(f'{file.stem} : {checksum}')
 
-    logging.info(f'{len(duplicates)} duplicate(s) found.')
-    for dup in duplicates:
-        logging.info(f'"{dup[0]}" -- "{dup[1]}"')
-
-    logging.info('Finished.')
+    logging.info(f'{num_duplicates} duplicate(s) found.')
 
 
 def rm_dup(args):

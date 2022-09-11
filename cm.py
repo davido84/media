@@ -4,6 +4,7 @@ import logging
 import dup
 from fix_titles import fix_titles
 from dup import rm_dup
+import media_util
 
 logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s %(levelname)-8s %(message)s',
@@ -48,10 +49,11 @@ def main():
     parser_remove_duplicates.set_defaults(func=rm_dup)
 
     parser_remove_duplicates = subparsers.add_parser('dup', help='Show duplicate files.')
-    parser_remove_duplicates.set_defaults(func=dup.show_duplicates)
+    parser_remove_duplicates.set_defaults(func=dup.show_duplicates, desc='Show duplicates.')
 
     args = parser.parse_args()
-    args.func(args)
+    with media_util.media_method(args.desc):
+        args.func(args)
 
 
 if __name__ == "__main__":
