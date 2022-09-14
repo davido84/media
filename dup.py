@@ -1,12 +1,9 @@
-import concurrent
-import concurrent.futures
 import os
 import music_util
 import logging
 from pathlib import Path
 import media_util
 import subprocess
-from functools import partial
 
 
 def _checksum(file: Path) -> str:

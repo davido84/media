@@ -2,7 +2,8 @@ import argparse
 import logging
 
 import dup
-from fix_titles import fix_titles
+import music_titles
+from music_titles import fix_titles
 from dup import rm_dup
 import media_util
 
@@ -50,6 +51,10 @@ def main():
 
     parser_remove_duplicates = subparsers.add_parser('dup', help='Show duplicate files.')
     parser_remove_duplicates.set_defaults(func=dup.show_duplicates, desc='Show duplicates.')
+
+    parser_validate_metadata = subparsers.add_parser('validate-meta', help='Show duplicate files.', aliases=['vm'])
+    parser_validate_metadata.set_defaults(func=music_titles.validate_metadata, desc='Validate metadata.')
+
 
     args = parser.parse_args()
     with media_util.media_method(args.desc):

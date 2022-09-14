@@ -8,8 +8,9 @@ def normalize(s) -> str:
     return u''.join([c for c in new_form if not unicodedata.combining(c)])
 
 
-def music_files(root: Path):
-    for ext in ['flac', 'mp3', 'wav']:
+def music_files(root: Path, extensions: list[str] | None = None):
+    ext_list = ['flac', 'mp3', 'wav'] if extensions is None else extensions
+    for ext in ext_list:
         for file in root.rglob(f'*.{ext}'):
             yield Path(file)
 
