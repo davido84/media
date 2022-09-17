@@ -2,6 +2,10 @@ from pathlib import Path
 import unicodedata
 
 
+def is_book(filename: Path) -> bool:
+    return '_books' in str(filename)
+
+
 def normalize(s) -> str:
     new_form = unicodedata.normalize('NFKD', s)
     assert '\\' not in new_form

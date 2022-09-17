@@ -6,6 +6,7 @@ import music_titles
 from music_titles import fix_titles
 from dup import rm_dup
 import media_util
+from music_tag import tag_music_files
 
 logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s %(levelname)-8s %(message)s',
@@ -41,6 +42,8 @@ def main():
     parser = argparse.ArgumentParser(description='Convert Music Files')
     parser.add_argument('-i', '--input', type=str, help='Input folder or file', default='e:/music')
     parser.add_argument('-d', '--dry-run', action='store_true', default=False, help='Dry run')
+    parser.add_argument('-f', '--force', action='store_true', default=False, help='Force action')
+
     subparsers = parser.add_subparsers(title='Commands', description='Convert music commands')
 
     parser_fix_titles = subparsers.add_parser('fix-titles', help='Fix music filenames', aliases=['ft'])
@@ -54,6 +57,9 @@ def main():
 
     parser_validate_metadata = subparsers.add_parser('validate-meta', help='Show duplicate files.', aliases=['vm'])
     parser_validate_metadata.set_defaults(func=music_titles.validate_metadata, desc='Validate metadata.')
+
+    parser_tag_files = subparsers.add_parser('tag', help='Tag files')
+    parser_tag_files.set_defaults(func=tag_music_files, desc='Tag files')
 
     args = parser.parse_args()
     with media_util.media_method(args.desc):
