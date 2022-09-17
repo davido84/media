@@ -12,11 +12,15 @@ _RE_CANONICAL_FILE_STEM = re.compile(
 
 #  01-001_1_Track01$1$5.flac
 # 2-08_Track08.flac
+# 10-01_Track01.flac
+# 1_t$11.flac  (track 1, disc 11)
 
 _RE_FILENAME_MASKS: list[re.Pattern] = [
     re.compile(r'^(?P<disc>\d\d)-(?P<track>\d\d\d)_\d+_(?P<title>[^$]+).*$'),
     re.compile(r'^(?P<disc>\d\d)-(?P<track>\d\d\d)_(?P<title>[^$]+).*$'),
     re.compile(r'^(?P<disc>\d)-(?P<track>\d\d)_(?P<title>[^$]+).*$'),
+    re.compile(r'^(?P<disc>\d\d)-(?P<track>\d\d)_(?P<title>[^$]+).*$'),
+    re.compile(r'^(?P<track>\d{1,2})_(?P<title>t)\$(?P<disc>\d{1,2})$'),
 
     # re.compile(r'^Ep(?P<track>\d{1,3})_\d+\$(?P<title>[^$]+).*$'),
     # re.compile(r'^Ep(?P<track>\d{1,3})_\d+\$(?P<title>[^$]+).*$'),
