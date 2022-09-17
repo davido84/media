@@ -44,7 +44,7 @@ def main():
     subparsers = parser.add_subparsers(title='Commands', description='Convert music commands')
 
     parser_fix_titles = subparsers.add_parser('fix-titles', help='Fix music filenames', aliases=['ft'])
-    parser_fix_titles.set_defaults(func=fix_titles)
+    parser_fix_titles.set_defaults(func=fix_titles, desc='Fix titles.')
 
     parser_remove_duplicates = subparsers.add_parser('rm-dup', help='Remove duplicates', aliases=['rd'])
     parser_remove_duplicates.set_defaults(func=rm_dup)
@@ -54,7 +54,6 @@ def main():
 
     parser_validate_metadata = subparsers.add_parser('validate-meta', help='Show duplicate files.', aliases=['vm'])
     parser_validate_metadata.set_defaults(func=music_titles.validate_metadata, desc='Validate metadata.')
-
 
     args = parser.parse_args()
     with media_util.media_method(args.desc):

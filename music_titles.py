@@ -47,7 +47,6 @@ def validate_metadata(args):
 
 
 def fix_titles(args):
-    logging.info('Fix Titles')
     logging.info(f'Dry run: {args.dry_run}')
 
     matched_files = 0
