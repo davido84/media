@@ -4,6 +4,7 @@ from pathlib import Path
 
 class MusicFile:
     def __init__(self, file_name: Path):
+        self._file = file_name
         music_file = mutagen.File(str(file_name))
         self._title: str | None = music_file.get('title', None)
         self._artist: str | None = music_file.get('artist', None)

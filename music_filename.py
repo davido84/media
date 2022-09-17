@@ -11,10 +11,12 @@ _RE_CANONICAL_FILE_STEM = re.compile(
     fr'^((?P<disc>\d{{1,2}})-)?(?P<track>\d{{1,3}}) (?P<title>[^\\/$<>|?*":]{{1,{_MAX_TITLE_LEN+1}}})$')
 
 #  01-001_1_Track01$1$5.flac
+# 2-08_Track08.flac
 
 _RE_FILENAME_MASKS: list[re.Pattern] = [
     re.compile(r'^(?P<disc>\d\d)-(?P<track>\d\d\d)_\d+_(?P<title>[^$]+).*$'),
     re.compile(r'^(?P<disc>\d\d)-(?P<track>\d\d\d)_(?P<title>[^$]+).*$'),
+    re.compile(r'^(?P<disc>\d)-(?P<track>\d\d)_(?P<title>[^$]+).*$'),
 
     # re.compile(r'^Ep(?P<track>\d{1,3})_\d+\$(?P<title>[^$]+).*$'),
     # re.compile(r'^Ep(?P<track>\d{1,3})_\d+\$(?P<title>[^$]+).*$'),
@@ -35,9 +37,9 @@ def _parse_match(match_dict: dict[str, str]) -> [int, int, str]:
 
 
 def fix(file: Path) -> None | Path:
-    assert not validate(file)
+    assert not validate_filename(file)
     trimmed = file.with_stem(file.stem[:_MAX_TITLE_LEN].strip())
-    if trimmed != file and validate(trimmed):
+    if trimmed != file and validate_filename(trimmed):
         return trimmed
 
     for mask in _RE_FILENAME_MASKS:
@@ -48,7 +50,7 @@ def fix(file: Path) -> None | Path:
             new_stem = re.sub(r'\s+', ' ', new_stem)
             new_filename = file.with_stem(new_stem.replace('_', ' '))
 
-            if not validate(new_filename):
+            if not validate_filename(new_filename):
                 logging.error(f'Could not validate: {new_filename}')
 
             return new_filename
@@ -56,5 +58,12 @@ def fix(file: Path) -> None | Path:
     return None
 
 
-def validate(filename: Path) -> bool:
+def validate_filename(filename: Path) -> bool:
     return _RE_CANONICAL_FILE_STEM.match(filename.stem) is not None
+
+
+def title_info(filename: Path) -> [int, int, str] or None:  # disc, trac, title
+    if match := _RE_CANONICAL_FILE_STEM.match(filename.stem):
+        return int(match.group('disc')), int(match.group('track')), match.group('title')
+    else:
+        return None

@@ -41,7 +41,7 @@ def fix_titles(args):
     renamed_files = 0
 
     for file in music_util.music_files(Path(args.input)):
-        if music_filename.validate(file):
+        if music_filename.validate_filename(file):
             validated_files += 1
         elif new_name := music_filename.fix(file):
             logging.info(f'Matched:{file} --> {new_name.stem}')
