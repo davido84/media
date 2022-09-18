@@ -58,6 +58,7 @@ def main():
     parser_validate_metadata.set_defaults(func=music_titles.validate_metadata, desc='Validate metadata.')
 
     parser_tag_files = subparsers.add_parser('tag', help='Tag music files from filenames')
+    parser_tag_files.add_argument('--delete', help='Delete tags', action='store_true', default=False)
     parser_tag_files.set_defaults(func=tag_music_files_from_filename, desc='Tag files')
 
     args = parser.parse_args()

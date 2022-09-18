@@ -13,7 +13,7 @@ def normalize(s) -> str:
 
 
 def music_files(root: Path, extensions: list[str] | None = None):
-    ext_list = ['flac', 'mp3', 'wav'] if extensions is None else extensions
+    ext_list = ['flac', 'mp3'] if extensions is None else extensions
     for ext in ext_list:
         for file in root.rglob(f'*.{ext}'):
             yield Path(file)
