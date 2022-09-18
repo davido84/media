@@ -10,15 +10,21 @@ from musicfile import MusicFile
 
 
 def validate_metadata(args):
+    file_count = 0
+
     def do_validate(input_file: Path) -> [Path, bool]:
-        print('.', end='')
+        nonlocal file_count
+        if file_count % 100 == 0:
+            print('.', end='')
+        file_count += 1
         return input_file, MusicFile(input_file).is_valid
 
     num_errors = 0
     num_valid = 0
 
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as tp:
-        workers = [tp.submit(partial(do_validate), T) for T in music_util.music_files(Path(args.input), ['flac', 'mp3'])]
+        workers = [
+            tp.submit(partial(do_validate), T) for T in music_util.music_files(Path(args.input), ['flac', 'mp3'])]
         for worker in concurrent.futures.as_completed(workers):
             file, result = worker.result()
             if result:

@@ -1,12 +1,11 @@
 import argparse
 import logging
-
 import dup
 import music_titles
 from music_titles import fix_titles
 from dup import rm_dup
 import media_util
-from music_tag import tag_music_files
+from music_tag import tag_music_files_from_filename
 
 logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s %(levelname)-8s %(message)s',
@@ -58,8 +57,8 @@ def main():
     parser_validate_metadata = subparsers.add_parser('validate-meta', help='Show duplicate files.', aliases=['vm'])
     parser_validate_metadata.set_defaults(func=music_titles.validate_metadata, desc='Validate metadata.')
 
-    parser_tag_files = subparsers.add_parser('tag', help='Tag files')
-    parser_tag_files.set_defaults(func=tag_music_files, desc='Tag files')
+    parser_tag_files = subparsers.add_parser('tag', help='Tag music files from filenames')
+    parser_tag_files.set_defaults(func=tag_music_files_from_filename, desc='Tag files')
 
     args = parser.parse_args()
     with media_util.media_method(args.desc):

@@ -36,7 +36,7 @@ _RE_FILENAME_MASKS: list[re.Pattern] = [
 ]
 
 
-def _parse_match(match_dict: dict[str, str]) -> [int, int, str]:
+def _parse_match(match_dict: dict[str, str]) -> [int, int, str]:  # disc, trac, title
     return int(match_dict.get('disc', 1)), int(match_dict['track']), match_dict['title']
 
 
@@ -66,8 +66,8 @@ def validate_filename(filename: Path) -> bool:
     return _RE_CANONICAL_FILE_STEM.match(filename.stem) is not None
 
 
-def title_info(filename: Path) -> [int, int, str] or None:  # disc, trac, title
+def title_info_from_filename(filename: Path) -> [int, int, str] or None:  # disc, track, title
     if match := _RE_CANONICAL_FILE_STEM.match(filename.stem):
-        return int(match.group('disc')), int(match.group('track')), match.group('title')
+        return _parse_match(match.groupdict())
     else:
         return None

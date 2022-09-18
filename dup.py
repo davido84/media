@@ -32,7 +32,6 @@ def show_duplicates(args) -> None:
             file_1_is_classical = '_classical' in str(file_1)
             file_2_is_classical = '_classical' in str(file_2)
 
-            file_to_remove: Path | None = None
             if file_1_is_classical != file_2_is_classical:
                 file_to_remove = file_1 if file_2_is_classical else file_2
             else:
