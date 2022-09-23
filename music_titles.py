@@ -39,12 +39,12 @@ def validate_metadata(args):
 
 
 def fix_titles(args):
-    logging.info(f'Dry run: {args.dry_run}')
 
     matched_files = 0
     unmatched_files: list[Path] = []
     validated_files = 0
     renamed_files = 0
+    do_rename = not args.dry_run and not args.validate
 
     for file in music_util.music_files(Path(args.input)):
         if music_filename.validate_filename(file):
@@ -52,7 +52,7 @@ def fix_titles(args):
         elif new_name := music_filename.fix(file):
             logging.info(f'Matched:{file} --> {new_name.stem}')
             matched_files += 1
-            if not args.dry_run:
+            if not do_rename:
                 if new_name.exists():
                     file.unlink()
                 else:
@@ -66,4 +66,9 @@ def fix_titles(args):
     logging.info(f'Validated: {validated_files:,}')
     logging.info(f'Matched: {matched_files:,}')
     logging.info(f'Unmatched: {len(unmatched_files):,}')
-    logging.info(f'Renamed: {renamed_files:,}')
+
+    if do_rename:
+        logging.info(f'Renamed: {renamed_files:,}')
+    else:
+        if matched_files == 0 and not unmatched_files:
+            logging.info('All files validated.')

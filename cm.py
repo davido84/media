@@ -46,6 +46,8 @@ def main():
     subparsers = parser.add_subparsers(title='Commands', description='Convert music commands')
 
     parser_fix_titles = subparsers.add_parser('fix-titles', help='Fix music filenames', aliases=['ft'])
+    parser_fix_titles.add_argument('-v', '--validate', action='store_true',
+                                   help='Validate all titles are in canonical format.')
     parser_fix_titles.set_defaults(func=fix_titles, desc='Fix titles.')
 
     parser_remove_duplicates = subparsers.add_parser('rm-dup', help='Remove duplicates', aliases=['rd'])
