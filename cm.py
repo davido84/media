@@ -45,23 +45,28 @@ def main():
 
     subparsers = parser.add_subparsers(title='Commands', description='Convert music commands')
 
-    parser_fix_titles = subparsers.add_parser('fix-titles', help='Fix music filenames', aliases=['ft'])
+    parser_fix_titles = subparsers.add_parser('fix-titles', description='Fix music filenames', aliases=['ft'])
     parser_fix_titles.add_argument('-v', '--validate', action='store_true',
                                    help='Validate all titles are in canonical format.')
-    parser_fix_titles.set_defaults(func=fix_titles, desc='Fix titles.')
+    parser_fix_titles.set_defaults(func=fix_titles,
+                                   desc=parser_fix_titles.description)
 
-    parser_remove_duplicates = subparsers.add_parser('rm-dup', help='Remove duplicates', aliases=['rd'])
-    parser_remove_duplicates.set_defaults(func=rm_dup)
+    parser_remove_duplicates = subparsers.add_parser('rm-dup', description='Remove duplicates', aliases=['rd'])
+    parser_remove_duplicates.set_defaults(func=rm_dup,
+                                          desc=parser_remove_duplicates.description)
 
-    parser_remove_duplicates = subparsers.add_parser('dup', help='Show duplicate files.')
-    parser_remove_duplicates.set_defaults(func=dup.show_duplicates, desc='Show duplicates.')
+    parser_remove_duplicates = subparsers.add_parser('dup', description='Show duplicate files.')
+    parser_remove_duplicates.set_defaults(func=dup.show_duplicates,
+                                          desc=parser_remove_duplicates.description)
 
-    parser_validate_metadata = subparsers.add_parser('validate-meta', help='Show duplicate files.', aliases=['vm'])
-    parser_validate_metadata.set_defaults(func=music_titles.validate_metadata, desc='Validate metadata.')
+    parser_validate_metadata = subparsers.add_parser('validate-meta',
+                                                     description='Validate metadata.', aliases=['vm'])
+    parser_validate_metadata.set_defaults(func=music_titles.validate_metadata,
+                                          desc=parser_validate_metadata.description)
 
-    parser_tag_files = subparsers.add_parser('tag', help='Tag music files from filenames')
+    parser_tag_files = subparsers.add_parser('tag', description='Tag music files from filenames')
     parser_tag_files.add_argument('--delete', help='Delete tags', action='store_true', default=False)
-    parser_tag_files.set_defaults(func=tag_music_files_from_filename, desc='Tag files')
+    parser_tag_files.set_defaults(func=tag_music_files_from_filename, desc=parser_tag_files.description)
 
     args = parser.parse_args()
     with media_util.media_method(args.desc):
