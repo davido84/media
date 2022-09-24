@@ -62,7 +62,6 @@ def fix_titles(args):
             logging.warning(f'Unmatched: {file}')
             unmatched_files.append(file)
 
-    logging.info('Finished.')
     logging.info(f'Validated: {validated_files:,}')
     logging.info(f'Matched: {matched_files:,}')
     logging.info(f'Unmatched: {len(unmatched_files):,}')

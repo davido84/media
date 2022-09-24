@@ -7,6 +7,9 @@ from dup import rm_dup
 import media_util
 from music_tag import tag_music_files_from_filename
 
+#  ffmpeg flac:
+#  $ ffmpeg -i $SOURCE -q:a flac -compression_level 12 $OUT.flac
+
 logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s %(levelname)-8s %(message)s',
                     datefmt='%m-%d %H:%M',
