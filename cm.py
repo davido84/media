@@ -9,6 +9,7 @@ from music_tag import tag_music_files_from_filename
 
 #  ffmpeg flac:
 #  $ ffmpeg -i $SOURCE -q:a flac -compression_level 12 $OUT.flac
+# ffmpeg -i in.wav -compression_level 8 out.flac
 
 logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s %(levelname)-8s %(message)s',
