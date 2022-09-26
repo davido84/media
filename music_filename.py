@@ -30,7 +30,8 @@ _RE_FILENAME_MASKS: list[re.Pattern] = [
 
 
 def _parse_match(match_dict: dict[str, str]) -> [int, int, str]:  # disc, trac, title
-    return int(match_dict.get('disc', 1)), int(match_dict['track']), match_dict['title']
+    disc = 1 if match_dict.get('disc') is None else int(match_dict.get('disc'))
+    return disc, int(match_dict['track']), match_dict['title']
 
 
 def fix(file: Path) -> None | Path:

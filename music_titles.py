@@ -14,8 +14,9 @@ def validate_metadata(args):
 
     def do_validate(input_file: Path) -> [Path, bool]:
         nonlocal file_count
-        if file_count % 100 == 0:
-            print('.', end='')
+        if file_count % 1000 == 0:
+            print('.', end='', flush=True)
+
         file_count += 1
         return input_file, MusicFile(input_file).is_valid
 
