@@ -63,13 +63,13 @@ def main():
     parser_remove_duplicates.set_defaults(func=dup.show_duplicates,
                                           desc=parser_remove_duplicates.description)
 
-    parser_validate_metadata = subparsers.add_parser('validate-meta',
-                                                     description='Validate metadata.', aliases=['vm'])
+    parser_validate_metadata = subparsers.add_parser('validate',
+                                                     description='Validate metadata.')
     parser_validate_metadata.set_defaults(func=music_titles.validate_metadata,
                                           desc=parser_validate_metadata.description)
 
     parser_tag_files = subparsers.add_parser('tag', description='Tag music files from filenames')
-    parser_tag_files.add_argument('--delete', help='Delete tags', action='store_true', default=False)
+    parser_tag_files.add_argument('--clear', help='Delete tags', action='store_true', default=False)
     parser_tag_files.set_defaults(func=tag_music_files_from_filename, desc=parser_tag_files.description)
 
     args = parser.parse_args()

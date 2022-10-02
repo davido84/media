@@ -31,12 +31,11 @@ def validate_metadata(args):
             if result:
                 num_valid += 1
             else:
-                logging.warning(f'{file}')
                 num_errors += 1
 
         print('')
-        logging.info(f'{num_errors} error(s) found.')
-        logging.info(f'{num_valid} valid file(s).')
+        logging.info(f'{num_errors:,} error(s) found.')
+        logging.info(f'{num_valid:,} valid file(s).')
 
 
 def fix_titles(args):
