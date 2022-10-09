@@ -65,3 +65,18 @@ def title_info_from_filename(filename: Path) -> [int, int, str] or None:  # disc
         return _parse_match(match.groupdict())
     else:
         return None
+
+
+def action_filename(args) -> None:
+    logging.info('Validating')
+    num_errors = 0
+    num_files = 0
+    for music_file in music_util.music_files(Path(args.input)):
+        num_files += 1
+        if not validate_filename(music_file):
+            logging.error(f'f{music_file}')
+            num_errors += 1
+
+    logging.info(f'{num_files:,} files scanned, {num_errors:,} error(s).')
+    if num_errors == 0:
+        logging.info('SUCCESS')

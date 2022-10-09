@@ -38,7 +38,7 @@ def validate_metadata(args):
         logging.info(f'{num_valid:,} valid file(s).')
 
 
-def fix_titles(args):
+def process_titles(args):
 
     matched_files = 0
     unmatched_files: list[Path] = []

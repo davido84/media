@@ -2,7 +2,8 @@ import argparse
 import logging
 import dup
 import music_titles
-from music_titles import fix_titles
+from music_titles import process_titles
+from music_filename import action_filename
 from dup import rm_dup
 import media_util
 from music_tag import tag_music_files_from_filename
@@ -49,28 +50,29 @@ def main():
 
     subparsers = parser.add_subparsers(title='Commands', description='Convert music commands')
 
-    parser_fix_titles = subparsers.add_parser('fix-titles', description='Fix music filenames', aliases=['ft'])
-    parser_fix_titles.add_argument('-v', '--validate', action='store_true',
-                                   help='Validate all titles are in canonical format.')
-    parser_fix_titles.set_defaults(func=fix_titles,
-                                   desc=parser_fix_titles.description)
+    parser_filename = subparsers.add_parser('filename', description='Music Filenames', aliases=['fn', 'fname'])
+    parser_filename.add_argument('-v', '--validate', action='store_true',
+                                 help='Validate all filenames are in canonical format.')
+    parser_filename.add_argument('-f', '--fix', help='Fix invalid file names.', action='store_true')
+    parser_filename.set_defaults(func=action_filename,
+                                 desc=parser_filename.description)
 
-    parser_remove_duplicates = subparsers.add_parser('rm-dup', description='Remove duplicates', aliases=['rd'])
-    parser_remove_duplicates.set_defaults(func=rm_dup,
-                                          desc=parser_remove_duplicates.description)
+    # parser_remove_duplicates = subparsers.add_parser('rm-dup', description='Remove duplicates', aliases=['rd'])
+    # parser_remove_duplicates.set_defaults(func=rm_dup,
+    #                                       desc=parser_remove_duplicates.description)
 
-    parser_remove_duplicates = subparsers.add_parser('dup', description='Show duplicate files.')
-    parser_remove_duplicates.set_defaults(func=dup.show_duplicates,
-                                          desc=parser_remove_duplicates.description)
+    # parser_remove_duplicates = subparsers.add_parser('dup', description='Show duplicate files.')
+    # parser_remove_duplicates.set_defaults(func=dup.show_duplicates,
+    #                                       desc=parser_remove_duplicates.description)
 
-    parser_validate_metadata = subparsers.add_parser('validate',
-                                                     description='Validate metadata.')
-    parser_validate_metadata.set_defaults(func=music_titles.validate_metadata,
-                                          desc=parser_validate_metadata.description)
+    # parser_validate_metadata = subparsers.add_parser('validate',
+    #                                                  description='Validate metadata.')
+    # parser_validate_metadata.set_defaults(func=music_titles.validate_metadata,
+    #                                       desc=parser_validate_metadata.description)
 
-    parser_tag_files = subparsers.add_parser('tag', description='Tag music files from filenames')
-    parser_tag_files.add_argument('--clear', help='Delete tags', action='store_true', default=False)
-    parser_tag_files.set_defaults(func=tag_music_files_from_filename, desc=parser_tag_files.description)
+    # parser_tag_files = subparsers.add_parser('tag', description='Tag music files from filenames')
+    # parser_tag_files.add_argument('--clear', help='Delete tags', action='store_true', default=False)
+    # parser_tag_files.set_defaults(func=tag_music_files_from_filename, desc=parser_tag_files.description)
 
     args = parser.parse_args()
     with media_util.media_method(args.desc):
