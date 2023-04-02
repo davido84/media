@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 import sys
+import logging
 
 def remove_empty_folders(root_folder: str):
     folders_to_remove = []
@@ -11,8 +12,9 @@ def remove_empty_folders(root_folder: str):
 
     for folder in folders_to_remove:
         if Path(folder).exists():
+            assert not os.listdir(folder)
             os.rmdir(folder)
-            print(f'Removed folder: {folder}')
+            logging.getLogger().debug(f'Removed folder: {folder}')
 
 if __name__ == "__main__":
     remove_empty_folders(sys.argv[1])
