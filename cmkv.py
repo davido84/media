@@ -1,22 +1,28 @@
 import argparse
 from pathlib import Path
 import os
-from media_util import gigabyte_string
+from media_util import gigabyte_string, timed_method
 import subprocess
 import logging
 import shutil
 
+def _mkv_files(input_path: Path) ->list[Path]:
+    return sorted([F for F in input_path.glob('*.mkv')],  key = lambda x: os.stat(str(x)).st_size)
+
+def _total_mkv_size(input_path: Path) ->int:
+    return sum(F.stat().st_size for F in _mkv_files(input_path))
+
 def _run_mkv(iso_file: Path, output_path: Path, program_args) ->None:
 
     mkv_args = ['makemkvcon64.exe','--messages=-stdout', '--noscan', '--cache=2000', '--minlength=180',
-                'mkv', f'iso:{str(iso_file)}', 'all', f'{str(output_path)}']
+                'mkv', f'iso:{str(iso_file)}', 'all', f'{str(output_path)}'+'\\']
 
     cmd = ''.join([f'"{S}" ' for S in mkv_args]).strip()
-    logging.getLogger().info(f'Running: {cmd}')
+    logging.getLogger().debug(f'Running: {cmd}')
 
     if program_args.dry_run:
         output_file = Path(program_args.output_path, 'title.mkv')
-        logging.getLogger().info(f'Will create file: str{output_file}')
+        logging.getLogger().debug(f'Will create file: str{output_file}')
     else:
         subprocess.run(mkv_args, check=True, capture_output=True)
 
@@ -32,36 +38,29 @@ def _process_iso(input_file: Path, program_args) ->None:
         os.makedirs(str(output_path), exist_ok=True)
 
         _run_mkv(input_file, output_path, program_args)
+        iso_file_size = input_file.stat().st_size
 
-    # def folder_mkv_size(folder_name: Path) -> int:
-    #     return sum([F.stat().st_size for F in folder_name.rglob('*.mkv')])
-    #
-    # os.makedirs(str(program_args.output_path), exist_ok=True)
-    # result = _run_mkv(file, program_args)
-    #
-    # if result and not program_args.dry_run:
-    #     iso_file_size = file.stat().st_size
-    #     output_files = sorted([F for F in program_args.output_path.glob('*.mkv')],
-    #                           key =  lambda x: os.stat(str(x)).st_size)
-    #
-    #     total_bytes = folder_mkv_size(program_args.output_path)
-    #
-    #     if output_files:
-    #         while total_bytes >= iso_file_size:
-    #             output_files.pop().unlink()
-    #             total_bytes = folder_mkv_size(program_args.output_path)
-    #         assert output_files
-    #
-    #     file_sizes: set[int] = set()
-    #     for file in output_files:
-    #         file_size = file.stat().st_size
-    #         if file_size in file_sizes:
-    #             file.unlink()
-    #         else:
-    #             file_sizes.add(file_size)
-    #
-    # return result
+        # Remove larges files if the total converted size is > than
+        # the original sio file size
+        mkv_files = _mkv_files(output_path)
+        while mkv_files and _total_mkv_size(output_path) > iso_file_size:
+            file_to_remove: Path = mkv_files.pop()
+            logging.getLogger().debug(
+                f'Removing: {str(file_to_remove)} - {gigabyte_string(file_to_remove.stat().st_size)}')
+            file_to_remove.unlink()
 
+        # Remove any duplicate files
+        file_size_set: set[int] = set()
+        for file in _mkv_files(output_path):
+            file_size = file.stat().st_size
+            if file_size in file_size_set:
+                logging.getLogger().debug(f'Removing duplicate: {str(file)}')
+                file.unlink()
+            else:
+                file_size_set.add(file_size)
+
+        program_args.total_iso_bytes += iso_file_size
+        program_args.total_mkv_bytes += _total_mkv_size(output_path)
 
 def convert_mkv(program_args):
     logger = logging.getLogger()
@@ -74,22 +73,6 @@ def convert_mkv(program_args):
         iso_file_size = file.stat().st_size
         logger.info(f'Processing ISO: "{str(file)}", ({gigabyte_string(iso_file_size)})')
         _process_iso(file, program_args)
-
-
-        # logger.debug(f'Output path: str({output_path}')
-        # result = _process_iso(file, )
-        #
-        # result = process_iso(file, program_args)
-        # if not result:
-        #     logger.critical(f'ERROR')
-        #     has_errors = True
-        #     break
-        #
-        # if total_iso_bytes >= program_args.limit * 1024*1024:
-        #     break
-        #
-        # total_iso_bytes += file_size
-        # total_mkv_bytes += folder_mkv_size(program_args.output_path)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Convert mkv files')
@@ -124,10 +107,12 @@ if __name__ == "__main__":
         args.total_mkv_bytes = 0
         args.total_iso_bytes = 0
 
-        convert_mkv(args)
-        logging.getLogger().info(f'ISO data processed: {gigabyte_string(args.total_iso_bytes)}')
-        logging.getLogger().info(f'MKV data processed: {gigabyte_string(args.total_mkv_bytes)}')
-        logging.getLogger().info('Finished!')
+        with timed_method():
+            convert_mkv(args)
+            logging.getLogger().info(f'ISO data processed: {gigabyte_string(args.total_iso_bytes)}')
+            logging.getLogger().info(f'MKV data processed: {gigabyte_string(args.total_mkv_bytes)}')
+            logging.getLogger().info(f'Delta: {gigabyte_string(args.total_iso_bytes - args.total_mkv_bytes)}')
+            logging.getLogger().info('Finished!')
     except IOError as e:
         logging.getLogger().critical(f'IO Error: {str(e)}')
     except subprocess.CalledProcessError as e:
