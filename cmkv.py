@@ -4,10 +4,38 @@ import os
 from media_util import gigabyte_string, timed_method
 import subprocess
 import logging
+import re
 from rmfolders import remove_empty_folders
 import shutil
 
 _MESSAGE_HEADER='='*20
+
+# TINFO:0,11,0,"2217588736"
+# TINFO:0,9,0,"0:44:51"
+_TITLE_SIZE_RE = re.compile(r'^TINFO:(\d+),11,\d+,"(\d+)"')
+_TITLE_LENGTH_RE = re.compile(r'^TINFO:(\d+),\d+,\d+,"(\d+):(\d+):(\d+)"')
+
+def _scan_titles(iso_file: Path) ->list[int]:
+    def seconds(hours: int, minutes: int, sec: int) -> int:
+        return sec + minutes * 60 + hours * 60 * 60
+
+    result: list[int] = []
+    output_lines = [L.strip() for L in subprocess.run(
+        ['makemkvcon64.exe', '-r', 'info', str(iso_file)],
+        check=True, capture_output=True).stdout.decode('utf-8').split('\n')]
+
+    title_sizes: list[(int, int)] = sorted([(int(M.group(1)), int(M.group(2))) for M in
+                                    [_TITLE_SIZE_RE.match(L) for L in output_lines] if M is not None ],
+                                           key=lambda x : x[1], reverse=True)
+
+    title_lengths: list[(int,int)] = sorted([(int(M.group(1)),
+                                                seconds(int(M.group(2)), int(M.group(3)), int(M.group(4)) ))
+                                      for M in [_TITLE_LENGTH_RE.match(L) for L in output_lines] if M is not None],
+                                            key=lambda  x: x[1])
+
+    filtered_title_lengths = [T for T in title_lengths if T[1]>60*3]
+    return result
+
 
 def _mkv_files(input_path: Path) ->list[Path]:
     return sorted([F for F in input_path.glob('*.mkv')],  key = lambda x: os.stat(str(x)).st_size)
@@ -25,6 +53,8 @@ def _run_mkv(iso_file: Path, output_path: Path, program_args) ->None:
     subprocess.run(mkv_args, check=True, capture_output=True)
 
 def _process_iso(input_file: Path, program_args) ->None:
+    _scan_titles(input_file)
+
     media_stem = [L.strip() for L in list(input_file.parts[len(program_args.search_folder.parts):])]
     media_stem[-1] = input_file.stem
     output_path = Path(program_args.output_folder, *media_stem)
