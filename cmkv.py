@@ -23,6 +23,7 @@ _TITLE_SIZE_RE = re.compile(r'^TINFO:(\d+),11,\d+,"(\d+)"')
 _TITLE_LENGTH_RE = re.compile(r'^TINFO:(\d+),\d+,\d+,"(\d+):(\d+):(\d+)"')
 _TITLE_SEGMENT_MAP_RE = re.compile(r'TINFO:(\d+),26,0,"(\d+),\d+.*"') # More than segment indicates scrambling
 
+
 def _scan_titles(iso_file: Path) ->set[int]:
     def seconds(hours: int, minutes: int, sec: int) -> int:
         return sec + minutes * 60 + hours * 60 * 60
@@ -52,12 +53,13 @@ def _scan_titles(iso_file: Path) ->set[int]:
     return titles_to_convert
 
 
-
 def _mkv_files(input_path: Path) ->list[Path]:
     return sorted([F for F in input_path.glob('*.mkv')],  key = lambda x: os.stat(str(x)).st_size)
 
+
 def _total_mkv_size(input_path: Path) ->int:
     return sum(F.stat().st_size for F in _mkv_files(input_path))
+
 
 def _run_mkv(iso_file: Path, output_path: Path, program_args) ->None:
     mkv_args = ['makemkvcon64.exe','--messages=-stdout', '--noscan', '--cache=2000', '--minlength=180',
@@ -67,6 +69,7 @@ def _run_mkv(iso_file: Path, output_path: Path, program_args) ->None:
     logging.debug(f'{cmd}')
 
     subprocess.run(mkv_args, check=True, capture_output=True)
+
 
 def _process_iso(input_file: Path, program_args) ->None:
     _scan_titles(input_file)
@@ -107,6 +110,7 @@ def _process_iso(input_file: Path, program_args) ->None:
     else:
         logging.debug(f'Skipping existing output.')
 
+
 def convert_mkv(program_args):
     logging.info('Starting MKV conversion.')
 
@@ -125,6 +129,7 @@ def convert_mkv(program_args):
         if program_args.delete:
             iso_file.unlink()
             logging.debug(f'Removed file: {iso_file}')
+
 
 def _check_iso_playlist(iso_file: Path) ->bool:
     output_lines = [L.strip() for L in subprocess.run(
@@ -145,15 +150,16 @@ def _check_iso_playlist(iso_file: Path) ->bool:
             title_sizes.add(title[1])
     return True
 
+
 def check_playlists(program_args):
     num_checked=0
     error_files: list[Path] = []
     for iso_file in Path(program_args.search_folder).rglob('*.iso'):
-        sys.stdout.write(f'{str(iso_file)}...')
+        print(f'{str(iso_file)}...', flush=True, end='')
         if _check_iso_playlist(iso_file):
-            sys.stdout.write('OK\n')
+            print('OK')
         else:
-            sys.stdout.write('SCRAMBLED\n')
+            print('SCRAMBLED')
             error_files.append(iso_file)
         num_checked += 1
 
@@ -162,6 +168,7 @@ def check_playlists(program_args):
 
     for file in error_files:
         logging.debug(str(file))
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Extract mkv files.')
