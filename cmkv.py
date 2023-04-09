@@ -7,6 +7,7 @@ import logging
 import sys
 import re
 from rmfolders import remove_empty_folders
+from collections import defaultdict
 import shutil
 
 _MESSAGE_HEADER='='*20
@@ -136,19 +137,24 @@ def _check_iso_playlist(iso_file: Path) ->bool:
         ['makemkvcon64.exe', '-r', 'info', str(iso_file)],
         check=True, capture_output=True).stdout.decode('utf-8').split('\n')]
 
-    if not any([_TITLE_SEGMENT_MAP_RE.match(L) for L in output_lines]):
-        return True
-
     title_size_lines: list[(int, int)] = [(int(M.group(1)), int(M.group(2))) for M in
                                     [_TITLE_SIZE_RE.match(L) for L in output_lines] if M is not None ]
 
-    title_sizes: set[int] = set()
-    for title in [T for T in title_size_lines if T[1] >= 1024*1024*100]:
-        if title[1] in title_sizes:
-            return False
-        else:
-            title_sizes.add(title[1])
-    return True
+    title_size_dict: defaultdict[int, set[int]] = defaultdict(set)
+    for T in title_size_lines:
+        title_size_dict[T[1]].add(T[0])
+
+    # has_multiple_segments: bool =  not any([_TITLE_SEGMENT_MAP_RE.match(L) for L in output_lines])
+    max_same_size_titles: int = max(len(T) for T in title_size_dict.values())
+
+
+    # title_sizes: set[int] = set()
+    # for title in [T for T in title_size_lines if T[1] >= 1024*1024*100]:
+    #     if title[1] in title_sizes:
+    #         return False
+    #     else:
+    #         title_sizes.add(title[1])
+    return max_same_size_titles <= 2
 
 
 def check_playlists(program_args):
