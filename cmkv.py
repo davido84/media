@@ -33,7 +33,7 @@ def _scan_titles(iso_file: Path) ->set[int]:
 
     output_lines = [L.strip() for L in subprocess.run(
         ['makemkvcon64.exe', '-r', 'info', str(iso_file)],
-        check=True, capture_output=True).stdout.decode('utf-8').split('\n')]
+        check=True, capture_output=True).stdout.decode('ISO-8859-1').split('\n')]
 
     title_mpls: list[(int, str)] = [(int(M.group(1)), M.group(2)) for M in
                                     [_TITLE_MPLS_RE.match(L) for L in output_lines] if M is not None ]
@@ -135,7 +135,7 @@ def convert_mkv(program_args):
 def _check_iso_playlist(iso_file: Path) ->bool:
     output_lines = [L.strip() for L in subprocess.run(
         ['makemkvcon64.exe', '-r', 'info', str(iso_file)],
-        check=True, capture_output=True).stdout.decode('utf-8').split('\n')]
+        check=True, capture_output=True).stdout.decode('ISO-8859-1').split('\n')]
 
     title_size_lines: list[(int, int)] = [(int(M.group(1)), int(M.group(2))) for M in
                                     [_TITLE_SIZE_RE.match(L) for L in output_lines]
