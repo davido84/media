@@ -15,9 +15,13 @@ _MIN_SECONDS=60*3
 # TINFO:0,11,0,"2217588736"
 # TINFO:0,9,0,"0:44:51"
 # TINFO:2,16,0,"00008.mpls"
+# TINFO:2,26,0,"505,501,508,507,512,520,504,513,517,510,506,515,518,516,503,511,519,502,514,509"
+
+# Two big titles of the same size: Second one is Japanese, use the first one
 _TITLE_MPLS_RE = re.compile(r'^TINFO:(\d+),16,\d+,"(\d+\.mpls)"')
 _TITLE_SIZE_RE = re.compile(r'^TINFO:(\d+),11,\d+,"(\d+)"')
 _TITLE_LENGTH_RE = re.compile(r'^TINFO:(\d+),\d+,\d+,"(\d+):(\d+):(\d+)"')
+_TITLE_SEGMENT_MAP_RE = re.compile(r'TINFO:(\d+),26,0,"(\d+),\d+.*"') # More than segment indicates scrambling
 
 def _scan_titles(iso_file: Path) ->set[int]:
     def seconds(hours: int, minutes: int, sec: int) -> int:
@@ -127,6 +131,9 @@ def _check_iso_playlist(iso_file: Path) ->bool:
         ['makemkvcon64.exe', '-r', 'info', str(iso_file)],
         check=True, capture_output=True).stdout.decode('utf-8').split('\n')]
 
+    if not any([_TITLE_SEGMENT_MAP_RE.match(L) for L in output_lines]):
+        return True
+
     title_size_lines: list[(int, int)] = [(int(M.group(1)), int(M.group(2))) for M in
                                     [_TITLE_SIZE_RE.match(L) for L in output_lines] if M is not None ]
 
@@ -146,7 +153,7 @@ def check_playlists(program_args):
         if _check_iso_playlist(iso_file):
             sys.stdout.write('OK\n')
         else:
-            sys.stdout.write('ERROR\n')
+            sys.stdout.write('SCRAMBLED\n')
             error_files.append(iso_file)
         num_checked += 1
 
