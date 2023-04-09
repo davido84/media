@@ -4,37 +4,49 @@ import os
 from media_util import gigabyte_string, timed_method
 import subprocess
 import logging
+import sys
 import re
 from rmfolders import remove_empty_folders
 import shutil
 
 _MESSAGE_HEADER='='*20
+_MIN_SECONDS=60*3
 
 # TINFO:0,11,0,"2217588736"
 # TINFO:0,9,0,"0:44:51"
+# TINFO:2,16,0,"00008.mpls"
+_TITLE_MPLS_RE = re.compile(r'^TINFO:(\d+),16,\d+,"(\d+\.mpls)"')
 _TITLE_SIZE_RE = re.compile(r'^TINFO:(\d+),11,\d+,"(\d+)"')
 _TITLE_LENGTH_RE = re.compile(r'^TINFO:(\d+),\d+,\d+,"(\d+):(\d+):(\d+)"')
 
-def _scan_titles(iso_file: Path) ->list[int]:
+def _scan_titles(iso_file: Path) ->set[int]:
     def seconds(hours: int, minutes: int, sec: int) -> int:
         return sec + minutes * 60 + hours * 60 * 60
 
-    result: list[int] = []
+    titles_to_convert: set[int] = set()
+
     output_lines = [L.strip() for L in subprocess.run(
         ['makemkvcon64.exe', '-r', 'info', str(iso_file)],
         check=True, capture_output=True).stdout.decode('utf-8').split('\n')]
 
-    title_sizes: list[(int, int)] = sorted([(int(M.group(1)), int(M.group(2))) for M in
-                                    [_TITLE_SIZE_RE.match(L) for L in output_lines] if M is not None ],
-                                           key=lambda x : x[1], reverse=True)
+    title_mpls: list[(int, str)] = [(int(M.group(1)), M.group(2)) for M in
+                                    [_TITLE_MPLS_RE.match(L) for L in output_lines] if M is not None ]
 
-    title_lengths: list[(int,int)] = sorted([(int(M.group(1)),
+    title_sizes: list[(int, int, str)] = [(int(M.group(1)), int(M.group(2)), gigabyte_string(int(M.group(2)))) for M in
+                                    [_TITLE_SIZE_RE.match(L) for L in output_lines] if M is not None ]
+
+    title_lengths: list[(int,int)] = [(int(M.group(1)),
                                                 seconds(int(M.group(2)), int(M.group(3)), int(M.group(4)) ))
-                                      for M in [_TITLE_LENGTH_RE.match(L) for L in output_lines] if M is not None],
-                                            key=lambda  x: x[1])
+                                      for M in [_TITLE_LENGTH_RE.match(L) for L in output_lines] if M is not None]
 
-    filtered_title_lengths = [T for T in title_lengths if T[1]>60*3]
-    return result
+    all_titles: list[(int,int,int)] = [(T[0][0],T[0][1], T[1][1]) for T in
+        list(zip(title_sizes, title_lengths)) if T[1][1] >= _MIN_SECONDS]
+
+    # John Wick correct: Source file name: 00641.mpls
+    # 505,508,507,501,512,504,520,513,517,506,515,518,510,516,503,511,519,502,514,509
+    # Remove large "Play All" titles
+    return titles_to_convert
+
 
 
 def _mkv_files(input_path: Path) ->list[Path]:
@@ -110,6 +122,40 @@ def convert_mkv(program_args):
             iso_file.unlink()
             logging.debug(f'Removed file: {iso_file}')
 
+def _check_iso_playlist(iso_file: Path) ->bool:
+    output_lines = [L.strip() for L in subprocess.run(
+        ['makemkvcon64.exe', '-r', 'info', str(iso_file)],
+        check=True, capture_output=True).stdout.decode('utf-8').split('\n')]
+
+    title_size_lines: list[(int, int)] = [(int(M.group(1)), int(M.group(2))) for M in
+                                    [_TITLE_SIZE_RE.match(L) for L in output_lines] if M is not None ]
+
+    title_sizes: set[int] = set()
+    for title in [T for T in title_size_lines if T[1] >= 1024*1024*100]:
+        if title[1] in title_sizes:
+            return False
+        else:
+            title_sizes.add(title[1])
+    return True
+
+def check_playlists(program_args):
+    num_checked=0
+    error_files: list[Path] = []
+    for iso_file in Path(program_args.search_folder).rglob('*.iso'):
+        sys.stdout.write(f'{str(iso_file)}...')
+        if _check_iso_playlist(iso_file):
+            sys.stdout.write('OK\n')
+        else:
+            sys.stdout.write('ERROR\n')
+            error_files.append(iso_file)
+        num_checked += 1
+
+    print(f'{num_checked} files checked.')
+    print(f'{len(error_files)} errors, {num_checked-len(error_files)} okay.')
+
+    for file in error_files:
+        logging.debug(str(file))
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Extract mkv files.')
     parser.add_argument('-m', '--limit', type=int, help='Processing limit in gigabytes.', default=100)
@@ -122,7 +168,8 @@ if __name__ == "__main__":
     args.output_folder = args.output_folder.strip()
 
     os.makedirs(str(args.output_folder), exist_ok=True)
-    log_file_name = Path(args.output_folder, 'makemkv-log.txt')
+    # log_file_name = Path(args.output_folder, 'makemkv-log.txt')
+    log_file_name = Path(args.search_folder, 'check-playlists.txt')
 
     logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s',
                         filename=str(log_file_name),
@@ -141,22 +188,23 @@ if __name__ == "__main__":
     # add the handler to the root logger
     logging.getLogger().addHandler(console)
 
-    try:
-        args.total_mkv_bytes = 0
-        args.total_iso_bytes = 0
-
-        with timed_method():
-            args.limit *= 1024*1024*1024
-            convert_mkv(args)
-            logging.debug(f'{_MESSAGE_HEADER} Remove Empty Folders {_MESSAGE_HEADER}')
-            remove_empty_folders(str(args.search_folder))
-            logging.debug(f'{_MESSAGE_HEADER} Summary {_MESSAGE_HEADER}')
-            logging.info(f'ISO bytes processed: {gigabyte_string(args.total_iso_bytes)}')
-            logging.info(f'MKV bytes processed: {gigabyte_string(args.total_mkv_bytes)}')
-            logging.info(f'Reduction: {gigabyte_string(args.total_iso_bytes - args.total_mkv_bytes)}')
-            logging.info('Finished!')
-    except IOError as e:
-        logging.critical(f'IO Error: {str(e)}')
-    except subprocess.CalledProcessError as e:
-        logging.critical(f'makemkvcon error')
-        logging.critical(e.output.decode('utf-8'))
+    check_playlists(args)
+    # try:
+    #     args.total_mkv_bytes = 0
+    #     args.total_iso_bytes = 0
+    #
+    #     with timed_method():
+    #         args.limit *= 1024*1024*1024
+    #         convert_mkv(args)
+    #         logging.debug(f'{_MESSAGE_HEADER} Remove Empty Folders {_MESSAGE_HEADER}')
+    #         remove_empty_folders(str(args.search_folder))
+    #         logging.debug(f'{_MESSAGE_HEADER} Summary {_MESSAGE_HEADER}')
+    #         logging.info(f'ISO bytes processed: {gigabyte_string(args.total_iso_bytes)}')
+    #         logging.info(f'MKV bytes processed: {gigabyte_string(args.total_mkv_bytes)}')
+    #         logging.info(f'Reduction: {gigabyte_string(args.total_iso_bytes - args.total_mkv_bytes)}')
+    #         logging.info('Finished!')
+    # except IOError as e:
+    #     logging.critical(f'IO Error: {str(e)}')
+    # except subprocess.CalledProcessError as e:
+    #     logging.critical(f'makemkvcon error')
+    #     logging.critical(e.output.decode('utf-8'))
