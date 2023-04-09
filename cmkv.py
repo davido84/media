@@ -146,7 +146,8 @@ def _check_iso_playlist(iso_file: Path) ->bool:
         title_size_dict[T[1]].add(T[0])
 
     # has_multiple_segments: bool =  not any([_TITLE_SEGMENT_MAP_RE.match(L) for L in output_lines])
-    max_same_size_titles: int = max(len(T) for T in title_size_dict.values())
+    sizes = [len(T) for T in title_size_dict.values()]
+    max_same_size_titles: int = max(sizes) if sizes else 0
 
     return max_same_size_titles <= 2
 
