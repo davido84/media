@@ -138,7 +138,8 @@ def _check_iso_playlist(iso_file: Path) ->bool:
         check=True, capture_output=True).stdout.decode('utf-8').split('\n')]
 
     title_size_lines: list[(int, int)] = [(int(M.group(1)), int(M.group(2))) for M in
-                                    [_TITLE_SIZE_RE.match(L) for L in output_lines] if M is not None ]
+                                    [_TITLE_SIZE_RE.match(L) for L in output_lines]
+                                          if M is not None and int(M.group(2)) > 1024*1024*1024]
 
     title_size_dict: defaultdict[int, set[int]] = defaultdict(set)
     for T in title_size_lines:
@@ -147,13 +148,6 @@ def _check_iso_playlist(iso_file: Path) ->bool:
     # has_multiple_segments: bool =  not any([_TITLE_SEGMENT_MAP_RE.match(L) for L in output_lines])
     max_same_size_titles: int = max(len(T) for T in title_size_dict.values())
 
-
-    # title_sizes: set[int] = set()
-    # for title in [T for T in title_size_lines if T[1] >= 1024*1024*100]:
-    #     if title[1] in title_sizes:
-    #         return False
-    #     else:
-    #         title_sizes.add(title[1])
     return max_same_size_titles <= 2
 
 
@@ -170,7 +164,7 @@ def check_playlists(program_args):
         num_checked += 1
 
     print(f'{num_checked} files checked.')
-    print(f'{len(error_files)} errors, {num_checked-len(error_files)} okay.')
+    print(f'{len(error_files)} error(s), {num_checked-len(error_files)} okay.')
 
     for file in error_files:
         logging.debug(str(file))
