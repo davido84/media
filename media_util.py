@@ -2,6 +2,30 @@ from contextlib import contextmanager
 import time
 import logging
 
+def setup_logging(log_file_name: str):
+    log_format = '%(asctime)s %(levelname)s: %(message)s'
+    console_format = '%(levelname)-8s %(message)s'
+
+    if log_file_name is None:
+        logging.basicConfig(format=console_format,
+                            encoding='utf-8',
+                            level=logging.INFO)
+    else:
+        logging.basicConfig(format=log_format,
+                            filename=log_file_name,
+                            encoding='utf-8',
+                            filemode='w',
+                            datefmt='%m-%d %H:%M',
+                            level=logging.DEBUG)
+
+        console = logging.StreamHandler()
+        console.setLevel(logging.INFO)
+        # set a format which is simpler for console use
+        formatter = logging.Formatter(console_format)
+        console.setFormatter(formatter)
+        # add the handler to the root logger
+        logging.getLogger().addHandler(console)
+
 def gigabyte_string(n: int) -> str:
     one_kb = 1024
     if n >= one_kb ** 3:
