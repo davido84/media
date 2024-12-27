@@ -127,3 +127,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+.vs/media/FileContentIndex/
+
+.vs/media/v17/
+
+.vs/
