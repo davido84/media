@@ -7,15 +7,17 @@ import re
 import shutil
 from pathlib import Path
 import os
+import mediautil
+from mediautil import IsoTitleInfo
 
 class Command(Enum):
-    MAKE = 'make'  # Run handbrake on folder tree
+    MAKE = 'make' # Run handbrake on folder tree
     META = 'meta' # Create JSON meta files
     PREP = 'prep' # Create folder tree, fix filenames
 
 class Settings:
     input_folder: Path
-    output_folder: Path|None
+    output_folder: Path | None
     dry_run: bool
     force: bool
 
@@ -26,16 +28,18 @@ def action_prep(settings: Settings):
     print('Preparing file names...')
 
     for iso_file in settings.input_folder.rglob("*.iso"):
-        print(f'{str(iso_file)}')
+        title_info = IsoTitleInfo(iso_file)
+
+        print(f'{str(iso_file)} : {title_info}')
 
         # Lower-case iso
-        iso_file.rename(iso_file.with_suffix('.iso'))
-        
+        mediautil.rename(iso_file, iso_file.with_suffix('.iso'), settings.dry_run)
 
-        # if iso_file.parent != settings.input_folder and iso_file.parent.is_dir():
-        #    print("DIRECTORY")
-
-
+        # Standardize season, episode
+        if title_info.is_tv:
+            mediautil.rename(iso_file,
+                iso_file.with_stem(f'{title_info.season:02}-{title_info.disc:02}'),
+                settings.dry_run)
 
 
 def action_make(settings: Settings):
@@ -45,8 +49,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description='Process video.')
     parser.add_argument('--input', '-i', required=True, help='Input folder')
     parser.add_argument('--output', '-o', default=None, help='Output folder', required=False)
-    parser.add_argument('--dry-run', '-y', default=False, required=False)
-    parser.add_argument('--force', '-f', default=False, required=False)
+    parser.add_argument('--dry-run', '-y',action='store_true', default=False)
+    parser.add_argument('--force', '-f', action='store_true', default=False)
    
     subparsers = parser.add_subparsers(title='Commands', description='Process video commands')
 
