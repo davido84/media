@@ -6,7 +6,6 @@ import re
 import shutil
 from pathlib import Path
 import os
-import mediautil
 from mediautil import IsoTitleInfo, MediaType
 
 logger = logging.getLogger('ConvertMedia')
@@ -38,14 +37,16 @@ def action_prep(settings: Settings):
     for iso_file in settings.input_folder.rglob("*.iso"):
         title_info = IsoTitleInfo(iso_file, settings.input_folder)
 
+        if not title_info.title:
+            logger.error('Missing title')
+            continue
+
         logger.info(f'{title_info} : "{str(iso_file)}"')
+
         # Check to see tha we are no more than 1 folder below the input folder
         if iso_file.parent != settings.input_folder and iso_file.parent.parent != settings.input_folder:
             logger.warning(f'"{title_info.title}" Folder depth is more than one')
 
-        # if all([not title_info.imdb, not title_info.tvdb, not title_info.year]):
-        #    logger.warning('Missing year')
-        
         # Check for TV
         if title_info.season is None and title_info.tvdb is not None:
             logger.warning(f'"{title_info.title}" contains tvdb but no season/disc')
@@ -63,20 +64,16 @@ def action_prep(settings: Settings):
             rename_file(iso_file,
                 iso_file.with_stem(f'{title_info.disc:02}'), settings.dry_run)
 
-
 def action_make(settings: Settings):
     print('Make!')
     
 def main() -> int:
-    # logging.basicConfig(filename='myapp.log', level=logging.INFO)
-
-    # logger.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-
     parser = argparse.ArgumentParser(description='Process video.')
     parser.add_argument('--input', '-i', required=True, help='Input folder')
     parser.add_argument('--output', '-o', default=None, help='Output folder', required=False)
     parser.add_argument('--dry-run', '-y',action='store_true', default=False)
     parser.add_argument('--force', '-f', action='store_true', default=False)
+    parser.add_argument('--logfile', type=str, default=None)
    
     subparsers = parser.add_subparsers(title='Commands', description='Process video commands')
 
@@ -89,15 +86,17 @@ def main() -> int:
     args = parser.parse_args()
 
     logger.setLevel(logging.INFO)
+
     # Create handlers
     console_handler = logging.StreamHandler()  # Log to the console
-    # file_handler = logging.FileHandler("logfile.log")  # Log to a file
-    console_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
-    # file_handler.setFormatter(formatter)
-    # Add handlers to the logger
+    formatter = logging.Formatter('%(levelname)s: %(message)s')
+    console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
-    # logger.addHandler(file_handler)
 
+    if args.logfile:
+        file_handler = logging.FileHandler(args.logfile)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
 
     settings = Settings()
     settings.input_folder = Path(args.input)

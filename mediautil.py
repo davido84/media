@@ -40,18 +40,18 @@ class IsoTitleInfo:
     def __repr__(self):
         result = f'{self.year} '
         result += f'{str(self.media_type)} '
-        result += f'"{self.title}"'
+        result += f'"{self.title}",'
         
         if self.imdb is not None:
-            result += f', IMDB {self.imdb}'
+            result += f',IMDB {self.imdb}'
         if self.is_tv() and self.tvdb:
-                result += f', TVDB {self.tvdb}'
+                result += f',TVDB {self.tvdb}'
         
         if self.season is not None:
             result += f', Season {self.season}'
 
         if self.disc is not None:
-            result += f', Disc {self.disc}'
+            result += f',Disc {self.disc}'
 
         return result
     
