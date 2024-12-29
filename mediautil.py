@@ -1,18 +1,16 @@
-import os
-from tarfile import is_tarfile
-import threading
+from pickle import NONE
 import subprocess
 import shutil
 import re
 import logging
 from pathlib import Path
+from enum import Enum
 
-def rename(file: Path, new_name: Path, dry_run: bool) ->None:
-    if str(file) != str(new_name):
-        if dry_run:
-            print(f'[RENAME] {str(file)} -> {str(new_name)}')
-        else:
-            file.rename(new_name)
+class MediaType:
+    TV = 'TV'
+    MOVIE = 'MOVIE'
+    MUSIC = 'MUSIC'
+    HOME = 'HOME'
 
 class IsoTitleInfo:
     title: str
@@ -21,50 +19,61 @@ class IsoTitleInfo:
     imdb: int | None
     season: int | None
     disc: int | None
-    is_tv: bool
+    media_type: MediaType = MediaType.HOME
+
+    def __init__(self, iso_file: Path, root_path: Path):
+        final_name: str = iso_file.stem if iso_file.parent == root_path else iso_file.parent.stem
+
+        self.season, self.disc = tv_disc(iso_file.stem)
+        self.tvdb = title_tvdb(final_name)
+        self.imdb = title_imdb(final_name)
+        self.year = title_year(final_name)
+        self.title = title_name(final_name)
+
+        if self.tvdb is not None:
+            self.media_type = MediaType.TV
+        elif self.year is not None:
+            self.media_type = MediaType.MOVIE
+        else:
+            self.media_type = MediaType.HOME
 
     def __repr__(self):
-        result = f'"{self.title}"'
-        if self.is_tv:
-            result += ' (TV)'
-        if self.year is not None:
-            result += f',{self.year}'
+        result = f'{self.year} '
+        result += f'{str(self.media_type)} '
+        result += f'"{self.title}"'
+        
         if self.imdb is not None:
-            result += f',IMDB {self.imdb}'
-        if self.is_tv:
-            if self.tvdb:
-                result += f',{self.tvdb}'
-            result += f',Season {self.season},Disc {self.disc}'
+            result += f', IMDB {self.imdb}'
+        if self.is_tv() and self.tvdb:
+                result += f', TVDB {self.tvdb}'
+        
+        if self.season is not None:
+            result += f', Season {self.season}'
+
+        if self.disc is not None:
+            result += f', Disc {self.disc}'
+
         return result
-
-    def __init__(self, iso_file: Path):
-        self.season, self.disc = tv_disc(iso_file.stem)
-        self.is_tv = self.season is not None
-
-        file_name: str = iso_file.parent.stem if self.is_tv else iso_file.stem
-
-        self.imdb = title_imdb(file_name)
-        self.tvdb = title_tvdb(file_name)
-        self.year = title_year(file_name)
-        self.title = title_name(file_name)
-
+    
+    def is_tv(self) -> bool:
+        return self.media_type == MediaType.MUSIC
 
 def title_name(filename: str) -> str:
-    assert title_name
-    if match := re.match(r'^(.*)\(\d\d\d\d\).*$', filename):
-        return match.group(1).strip()
-    elif match := re.search(r'^(.*)\{tvdb.*$', filename):
-        return match.group(1).strip()
-    return filename.strip()
+    assert filename
+
+    result = re.sub(r'\(\d\d\d\d\)', '', filename)
+    result = re.sub(r'\{tvdb\-\d+\}', '', result)
+    result = re.sub(r'\{imdb\-tt\d+\}', '', result)
+    return result.strip()
 
 def title_year(filename: str) -> int:
     if match := re.search(r'\((\d\d\d\d)\)', filename):
-        assert int(match.group(1)) > 1920
+        assert int(match.group(1)) > 1933
         return int(match.group(1))
     return None
 
 def title_tvdb(filename: str) -> int | None:
-    match = re.search(r'\{tvdb\-(\d+)\}$', filename)
+    match = re.search(r'\{tvdb\-(\d+)\}', filename)
     if match:
         assert int(match.group(1)) > 0
         return int(match.group(1))
@@ -81,12 +90,11 @@ def title_imdb(filename: str) -> int | None:
 def tv_disc(filename: str) -> tuple[int, int]:
     season = None
     disc = None
-    if match := re.match(r'^\s*(\d+)-(\d+).*$', filename):
+    if match := re.match(r'^\s*(\d+)-(\d+)\s*$', filename):
         season = int(match.group(1))
         disc = int(match.group(2))
 
-    elif match := re.match(r'^\s*\d+$', filename):
-        season = 1
+    elif match := re.match(r'^\s*(\d+)\s*$', filename):
         disc = int(match.group(1))
 
     assert(season is None or season >= 1)
@@ -97,7 +105,6 @@ class RunMkvConResult:
     return_code: int = 0
     timed_out: bool = False
     stdout: list[str] = []
-
 
 def run_mkvcon(title: str, args: list[str]) ->RunMkvConResult:
     final_args = [shutil.which('makemkvcon64.exe'), '--noscan', '-r', '--cache=2048']
