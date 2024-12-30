@@ -3,8 +3,11 @@ import logging
 from enum import Enum
 import sys
 from pathlib import Path
-from mediautil import IsoTitleInfo
+from subprocess import CompletedProcess
+
+from mediautil import IsoTitleInfo, run_handbrake
 from datetime import datetime
+import subprocess
 
 _LOG_LEVELS = {
     "debug": logging.DEBUG,
@@ -96,7 +99,18 @@ def action_prep(settings: Settings):
 
 def action_make(settings: Settings):
     print('Make!')
-    
+
+def action_test(settings: Settings):
+    files : list[Path] = []
+    for pattern in ['*.iso', '*.mkv']:
+        files.extend(settings.input_folder.rglob(pattern))
+
+    for count, test_file in enumerate(files, start=1):
+        logger.info(f'Checking {str(test_file)}, ({count} of {len(files)})')
+        if run_handbrake(test_file, ['--scan'], capture_output=False).returncode != 0:
+            logger.error(f'{str(test_file)} : Error running hand brake')
+            break
+
 def main() -> int:
     parser = argparse.ArgumentParser(description='Process video.')
     parser.add_argument('--input', '-i', required=True, help='Input folder')
@@ -114,6 +128,9 @@ def main() -> int:
 
     parser_prep = subparsers.add_parser('prep')
     parser_prep.set_defaults(func=action_prep)
+
+    parser_test = subparsers.add_parser('test')
+    parser_test.set_defaults(func=action_test)
 
     args = parser.parse_args()
     logger.setLevel(_LOG_LEVELS[args.loglevel])

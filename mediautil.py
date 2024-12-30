@@ -1,6 +1,8 @@
 import re
 from pathlib import Path
 from enum import Enum
+import subprocess
+from subprocess import CompletedProcess
 
 _RE_TVDB = re.compile(r'\{tvdb\s*-\s*(\d+)}', re.IGNORECASE)
 _RE_IMDB = re.compile(r'\{imdb\s*-\s*tt(\d+)}', re.IGNORECASE)
@@ -101,32 +103,15 @@ def tv_disc(filename: str) -> tuple[int, int]:
 
     return season, disc
 
-class RunMkvConResult:
-    return_code: int = 0
-    timed_out: bool = False
-    stdout: list[str] = []
+def run_external(name: str, args: list[str], capture_output: bool) -> CompletedProcess:
+    stdout_capture = subprocess.PIPE if capture_output else subprocess.DEVNULL
+    stderr_capture = subprocess.PIPE if capture_output else subprocess.DEVNULL
+    final_args = [name]
+    final_args.extend(args)
+    return subprocess.run(final_args,
+        stdout=stdout_capture, stderr=stderr_capture, text=True)
 
-# def run_mkvcon(title: str, args: list[str]) ->RunMkvConResult:
-#     final_args = [shutil.which('makemkvcon64.exe'), '--noscan', '-r', '--cache=2048']
-#     final_args.extend(args)
-#
-#     proc = subprocess.Popen(final_args,
-#                         stdout=subprocess.PIPE,
-#                         stderr=subprocess.STDOUT)
-#
-#     result = RunMkvConResult()
-#
-#     if proc.returncode == 0:
-#         while True:
-#             try:
-#                 line = proc.stdout.readline().decode('utf-8').strip()
-#             except UnicodeDecodeError:
-#                 logging.warning('UnicodeDecodeError')
-#                 continue
-#
-#             result.stdout.append(line)
-#             if not line and proc.poll() is not None:
-#                 break
-#
-#     result.return_code = proc.returncode
-#     return RunMkvConResult()
+def run_handbrake(file: Path, args: list[str], capture_output: bool=True) -> CompletedProcess:
+    final_args = ['-i', str(file)]
+    final_args.extend(args)
+    return run_external('handbrakecli.exe', final_args, capture_output)
