@@ -6,6 +6,12 @@ import logging
 from pathlib import Path
 from enum import Enum
 
+_RE_TVDB = re.compile(r'\{tvdb\s*\-\s*(\d+)\}', re.IGNORECASE)
+_RE_IMDB = re.compile(r'\{imdb\s*\-\s*tt(\d+)\}', re.IGNORECASE)
+_RE_YEAR = re.compile(r'\(\s*(\d\d\d\d)\s*\)')
+_RE_SEASON_DISC = re.compile(r'^\s*(\d+)\s*-\s*(\d+)\s*$')
+_RE_DISC = re.compile(r'^\s*(\d+)\s*$')
+
 class MediaType:
     TV = 'TV'
     MOVIE = 'MOVIE'
@@ -28,7 +34,6 @@ class IsoTitleInfo:
         self.tvdb = title_tvdb(final_name)
         self.imdb = title_imdb(final_name)
         self.year = title_year(final_name)
-        self.title = title_name(final_name)
 
         if self.tvdb is not None:
             self.media_type = MediaType.TV
@@ -37,10 +42,15 @@ class IsoTitleInfo:
         else:
             self.media_type = MediaType.HOME
 
+        self.title = title_name(final_name)
+
+        if self.is_tv() and self.season is None:
+            self.season = 1
+
     def __repr__(self):
         result = f'{self.year} '
         result += f'{str(self.media_type)} '
-        result += f'"{self.title}",'
+        result += f'"{self.title}"'
         
         if self.imdb is not None:
             result += f',IMDB {self.imdb}'
@@ -56,49 +66,43 @@ class IsoTitleInfo:
         return result
     
     def is_tv(self) -> bool:
-        return self.media_type == MediaType.MUSIC
+        return self.media_type == MediaType.TV
 
 def title_name(filename: str) -> str:
-    assert filename
+    result = _RE_YEAR.sub('', filename)
+    result = _RE_TVDB.sub('', result)
+    result = _RE_IMDB.sub('', result)
 
-    result = re.sub(r'\(\d\d\d\d\)', '', filename)
-    result = re.sub(r'\{tvdb\-\d+\}', '', result)
-    result = re.sub(r'\{imdb\-tt\d+\}', '', result)
     return result.strip()
 
 def title_year(filename: str) -> int:
-    if match := re.search(r'\((\d\d\d\d)\)', filename):
-        assert int(match.group(1)) > 1933
+    if match := _RE_YEAR.search(filename):
         return int(match.group(1))
     return None
 
 def title_tvdb(filename: str) -> int | None:
-    match = re.search(r'\{tvdb\-(\d+)\}', filename)
+    match = _RE_TVDB.search(filename)
     if match:
-        assert int(match.group(1)) > 0
         return int(match.group(1))
 
     return None
 
 def title_imdb(filename: str) -> int | None:
-    match = re.search(r'\{imdb-tt(\d+)\}', filename)
+    match = _RE_IMDB.search(filename)
     if match:
-        assert int(match.group(1)) > 0
         return int(match.group(1))
     return None
 
 def tv_disc(filename: str) -> tuple[int, int]:
     season = None
     disc = None
-    if match := re.match(r'^\s*(\d+)-(\d+)\s*$', filename):
+    if match := _RE_SEASON_DISC.match(filename):
         season = int(match.group(1))
         disc = int(match.group(2))
 
-    elif match := re.match(r'^\s*(\d+)\s*$', filename):
+    elif match := _RE_DISC.match(filename): 
         disc = int(match.group(1))
 
-    assert(season is None or season >= 1)
-    assert(disc is None or disc >= 1)
     return season, disc
 
 class RunMkvConResult:
