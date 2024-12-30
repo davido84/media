@@ -1,8 +1,14 @@
 import re
+import logging
 from pathlib import Path
 from enum import Enum
 import subprocess
 from subprocess import CompletedProcess
+
+def get_logger():
+    return logging.getLogger('ConvertMedia')
+
+_DRY_RUN_PREFIX = '[DRY RUN] : '
 
 _RE_TVDB = re.compile(r'\{tvdb\s*-\s*(\d+)}', re.IGNORECASE)
 _RE_IMDB = re.compile(r'\{imdb\s*-\s*tt(\d+)}', re.IGNORECASE)
@@ -103,15 +109,34 @@ def tv_disc(filename: str) -> tuple[int, int]:
 
     return season, disc
 
-def run_external(name: str, args: list[str], capture_output: bool) -> CompletedProcess:
+def rename_file(file: Path, new_name: Path, dry_run: bool) -> Path:
+    if str(file) != str(new_name):
+        info = f'"{str(file)}" -> "{new_name}"'
+        if dry_run:
+            get_logger().info(f'{_DRY_RUN_PREFIX} (rename) {info}')
+        else:
+            try:
+                get_logger().info(f'* Renamed file {info}')
+                return file.rename(new_name)
+            except OSError:
+                get_logger().critical(f'Error renaming: {str(file)}')
+
+    return new_name
+
+def run_external(name: str, args: list[str], capture_output: bool, dry_run) -> CompletedProcess:
     stdout_capture = subprocess.PIPE if capture_output else subprocess.DEVNULL
     stderr_capture = subprocess.PIPE if capture_output else subprocess.DEVNULL
     final_args = [name]
     final_args.extend(args)
+    if dry_run:
+        get_logger().info(_DRY_RUN_PREFIX + ','.join(final_args))
+        return CompletedProcess(args=[], returncode=0)
+
     return subprocess.run(final_args,
         stdout=stdout_capture, stderr=stderr_capture, text=True)
 
-def run_handbrake(file: Path, args: list[str], capture_output: bool=True) -> CompletedProcess:
+def run_handbrake(file: Path, args: list[str], capture_output: bool=True,
+                  dry_run: bool=False) -> CompletedProcess:
     final_args = ['-i', str(file)]
     final_args.extend(args)
-    return run_external('handbrakecli.exe', final_args, capture_output)
+    return run_external('handbrakecli.exe', final_args, capture_output, dry_run)
