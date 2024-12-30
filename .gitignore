@@ -133,3 +133,5 @@ dmypy.json
 .vs/media/v17/
 
 .vs/
+
+.idea/
