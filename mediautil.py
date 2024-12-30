@@ -1,18 +1,14 @@
-from pickle import NONE
-import subprocess
-import shutil
 import re
-import logging
 from pathlib import Path
 from enum import Enum
 
-_RE_TVDB = re.compile(r'\{tvdb\s*\-\s*(\d+)\}', re.IGNORECASE)
-_RE_IMDB = re.compile(r'\{imdb\s*\-\s*tt(\d+)\}', re.IGNORECASE)
+_RE_TVDB = re.compile(r'\{tvdb\s*-\s*(\d+)}', re.IGNORECASE)
+_RE_IMDB = re.compile(r'\{imdb\s*-\s*tt(\d+)}', re.IGNORECASE)
 _RE_YEAR = re.compile(r'\(\s*(\d\d\d\d)\s*\)')
 _RE_SEASON_DISC = re.compile(r'^\s*(\d+)\s*-\s*(\d+)\s*$')
 _RE_DISC = re.compile(r'^\s*(\d+)\s*$')
 
-class MediaType:
+class MediaType(Enum):
     TV = 'TV'
     MOVIE = 'MOVIE'
     MUSIC = 'MUSIC'
@@ -25,7 +21,7 @@ class IsoTitleInfo:
     imdb: int | None
     season: int | None
     disc: int | None
-    media_type: MediaType = MediaType.HOME
+    media_type: MediaType
 
     def __init__(self, iso_file: Path, root_path: Path):
         final_name: str = iso_file.stem if iso_file.parent == root_path else iso_file.parent.stem
@@ -75,7 +71,7 @@ def title_name(filename: str) -> str:
 
     return result.strip()
 
-def title_year(filename: str) -> int:
+def title_year(filename: str) -> int | None:
     if match := _RE_YEAR.search(filename):
         return int(match.group(1))
     return None
@@ -110,27 +106,27 @@ class RunMkvConResult:
     timed_out: bool = False
     stdout: list[str] = []
 
-def run_mkvcon(title: str, args: list[str]) ->RunMkvConResult:
-    final_args = [shutil.which('makemkvcon64.exe'), '--noscan', '-r', '--cache=2048']
-    final_args.extend(args)
-
-    proc = subprocess.Popen(final_args,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT)
-
-    result = RunMkvConResult()
-
-    if proc.returncode == 0:
-        while True:
-            try:
-                line = proc.stdout.readline().decode('utf-8').strip()
-            except UnicodeDecodeError:
-                logging.warning('UnicodeDecodeError')
-                continue
-
-            result.stdout.append(line)
-            if not line and proc.poll() is not None:
-                break
-
-    result.return_code = proc.returncode
-    return RunMkvConResult()
+# def run_mkvcon(title: str, args: list[str]) ->RunMkvConResult:
+#     final_args = [shutil.which('makemkvcon64.exe'), '--noscan', '-r', '--cache=2048']
+#     final_args.extend(args)
+#
+#     proc = subprocess.Popen(final_args,
+#                         stdout=subprocess.PIPE,
+#                         stderr=subprocess.STDOUT)
+#
+#     result = RunMkvConResult()
+#
+#     if proc.returncode == 0:
+#         while True:
+#             try:
+#                 line = proc.stdout.readline().decode('utf-8').strip()
+#             except UnicodeDecodeError:
+#                 logging.warning('UnicodeDecodeError')
+#                 continue
+#
+#             result.stdout.append(line)
+#             if not line and proc.poll() is not None:
+#                 break
+#
+#     result.return_code = proc.returncode
+#     return RunMkvConResult()

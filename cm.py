@@ -2,8 +2,6 @@ import argparse
 import logging
 from enum import Enum
 import sys
-import re
-import shutil
 from pathlib import Path
 from mediautil import IsoTitleInfo
 from datetime import datetime
@@ -20,7 +18,7 @@ logger = logging.getLogger('ConvertMedia')
 
 def rename_file(file: Path, new_name: Path, dry_run: bool) -> Path:
     if str(file) != str(new_name):
-        info = f'[RENAME] "{str(file)}" -> "{new_name}"'
+        info = f'"{str(file)}" -> "{new_name}"'
         if dry_run:
             logger.info(f'[RENAME dry run] {info}')
         else:
@@ -50,7 +48,7 @@ def action_meta(settings: Settings):
 def check_iso_warnings(settings: Settings, iso_file: Path, title_info: IsoTitleInfo) -> None:
     # Check to see tha we are no more than 1 folder below the input folder
     if iso_file.parent != settings.input_folder and iso_file.parent.parent != settings.input_folder:
-        logger.warning(f'"{title_info.title}" Folder depth is more than one')
+        logger.warning(f'"{iso_file}" Folder depth is more than one')
 
     if '{' in title_info.title or '}' in title_info.title:
         logger.warning(f'{title_info.title} : possible invalid title')
@@ -70,7 +68,7 @@ def check_iso_warnings(settings: Settings, iso_file: Path, title_info: IsoTitleI
         logger.error(f'{title_info.title} possible invalid year')
 
 def action_prep(settings: Settings):
-    print('Preparing file names...')
+    logger.info('PREP - Preparing file names...')
 
     for iso_file in settings.input_folder.rglob("*.iso"):
         if '_exclude' in str(iso_file):
@@ -106,7 +104,7 @@ def main() -> int:
     parser.add_argument('--dry-run', '-y',action='store_true', default=False)
     parser.add_argument('--force', '-f', action='store_true', default=False)
     parser.add_argument('--logfile', type=str, default=None)
-    parser.add_argument("--loglevel", type=str, default="info", choices=_LOG_LEVELS.keys(),
+    parser.add_argument("--loglevel", type=str, default='info', choices=_LOG_LEVELS.keys(),
         help="Set the logging level. Options: debug, info, warning, error, critical.")
    
     subparsers = parser.add_subparsers(title='Commands', description='Process video commands')
@@ -131,7 +129,8 @@ def main() -> int:
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
 
-    logger.info(f'Convert video started {datetime.now().strftime("%m-%d %H:%M:%S")}')
+    time_format = "%B %d %I:%M:%S %p"
+    logger.info(f'Convert video started: {datetime.now().strftime(time_format)}')
 
     settings = Settings()
     settings.input_folder = Path(args.input)
@@ -145,7 +144,7 @@ def main() -> int:
         print('Error: missing command')
         return -1
 
-    logger.info(f'Convert video finished {datetime.now().strftime("%m-%d %H:%M:%S")}')
+    logger.info(f'Convert video finished: {datetime.now().strftime(time_format)}')
     return 0
 
 if __name__ == "__main__":
