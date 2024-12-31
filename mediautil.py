@@ -133,7 +133,7 @@ def run_external(name: str, args: list[str], capture_output: bool, dry_run) -> C
         return CompletedProcess(args=[], returncode=0)
 
     return subprocess.run(final_args,
-        stdout=stdout_capture, stderr=stderr_capture, text=True)
+        stdout=stdout_capture, stderr=stderr_capture, text=True, check=True)
 
 def run_handbrake(file: Path, args: list[str], capture_output: bool=True,
                   dry_run: bool=False) -> CompletedProcess:

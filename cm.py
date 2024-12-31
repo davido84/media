@@ -3,9 +3,12 @@ import logging
 from enum import Enum
 import sys
 from pathlib import Path
+from subprocess import CalledProcessError
+
 import mediautil
 from mediautil import IsoTitleInfo, run_handbrake, rename_file
 from datetime import datetime
+import re
 
 _LOG_LEVELS = {
     "debug": logging.DEBUG,
@@ -21,7 +24,6 @@ class Command(Enum):
     MAKE = 'make' # Run handbrake on folder tree
     META = 'meta' # Create JSON meta files
     PREP = 'prep' # Create folder tree, fix filenames
-    TEST = 'test' # Test handbrake
 
 class Settings:
     input_folder: Path
@@ -30,7 +32,25 @@ class Settings:
     force: bool
 
 def action_meta(settings: Settings):
-    print('Meta!')
+    try:
+        for media_file in media_files(settings):
+            output_file: Path = Path(media_file.with_suffix('.json'))
+            if output_file.exists() and not settings.force:
+                continue
+
+            logger.info(str(media_file))
+            result = run_handbrake(media_file, ['--json', '--scan', '--main-feature'])
+            json: str = result.stdout.split('JSON Title Set:')[1]
+
+            if not settings.dry_run:
+                output_file.write_text(json)
+
+    except CalledProcessError:
+        logger.error('Error running Handbrake')
+    except OSError:
+        logger.error('Error writing file')
+    except IndexError:
+        logger.error('Output is missing JSON section')
 
 def check_iso_warnings(settings: Settings, media_file: Path, title_info: IsoTitleInfo) -> None:
     # Check to see tha we are no more than 1 folder below the input folder
@@ -91,34 +111,25 @@ def media_files(settings: Settings) -> list[Path]:
 
     return files
 
-def action_test(settings: Settings):
-    files = media_files(settings)
-    for count, test_file in enumerate(files, start=1):
-        logger.info(f'Checking {str(test_file)}, ({count} of {len(files)})')
-        if run_handbrake(test_file, ['--scan'], capture_output=False).returncode != 0:
-            logger.error(f'{str(test_file)} : Error running hand brake')
-            break
-
 def main() -> int:
     parser = argparse.ArgumentParser(description='Process video.')
     parser.add_argument('--input', '-i', required=True, help='Input folder')
     parser.add_argument('--output', '-o', default=None, help='Output folder', required=False)
-    parser.add_argument('--dry-run', '-y',action='store_true', default=False)
-    parser.add_argument('--force', '-f', action='store_true', default=False)
-    parser.add_argument('--logfile', type=str, default=None)
+    parser.add_argument('--dry-run', '-y',action='store_true', default=False,
+                        help='Do not write any output or change any files.')
+    parser.add_argument('--force', '-f', action='store_true', default=False,
+                        help='Overwrite existing output files.')
+    parser.add_argument('--logfile', type=str, default=None, help='Log file name')
     parser.add_argument("--loglevel", type=str, default='info', choices=_LOG_LEVELS.keys(),
         help="Set the logging level. Options: debug, info, warning, error, critical.")
    
     subparsers = parser.add_subparsers(title='Commands', description='Process video commands')
 
-    parser_meta = subparsers.add_parser('meta')
+    parser_meta = subparsers.add_parser('meta', help='Create JSON files for ISO images')
     parser_meta.set_defaults(func=action_meta)
 
-    parser_prep = subparsers.add_parser('prep')
+    parser_prep = subparsers.add_parser('prep', help='Clean up file names and check filenames for errors.')
     parser_prep.set_defaults(func=action_prep)
-
-    parser_test = subparsers.add_parser('test')
-    parser_test.set_defaults(func=action_test)
 
     args = parser.parse_args()
     logger.setLevel(_LOG_LEVELS[args.loglevel])
@@ -142,6 +153,9 @@ def main() -> int:
     settings.output_folder = Path if args.output else None
     settings.dry_run = args.dry_run
     settings.force = args.force
+
+    if settings.dry_run:
+        logger.info('DRY RUN')
 
     try:
         args.func(settings)
