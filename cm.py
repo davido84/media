@@ -6,8 +6,8 @@ from pathlib import Path
 from subprocess import CalledProcessError
 
 import mediautil
-from mediautil import IsoTitleInfo, run_handbrake, rename_file
-from datetime import datetime
+from mediautil import IsoTitleInfo, run_handbrake, rename_file, scan_media_file, DiscTitle
+from datetime import datetime, timedelta
 import re
 
 _LOG_LEVELS = {
@@ -21,15 +21,40 @@ _LOG_LEVELS = {
 logger = mediautil.get_logger()
 
 class Command(Enum):
-    MAKE = 'make' # Run handbrake on folder tree
-    META = 'meta' # Create JSON meta files
+    # Commands are generally in the order they should be run:
     PREP = 'prep' # Create folder tree, fix filenames
+    META = 'meta' # Create JSON meta files
+    CHECK = 'check' # Check JSON
+    MAKE = 'make' # Run handbrake on folder tree
+
 
 class Settings:
     input_folder: Path
     output_folder: Path | None
     dry_run: bool
     force: bool
+
+def action_check(settings: Settings):
+    for file in media_files(settings):
+        logger.info(f'"{str(file)}"')
+
+        json_file = file.with_suffix('.json')
+        main_feature, titles = scan_media_file(json_file)
+
+        logger.info(f'  Main feature: {main_feature}')
+        num_titles = len(titles)
+
+        if num_titles == 0:
+            logging.error(f'"{str(file)}" : Missing title list')
+
+        logger.info(fr'  Title count: {num_titles}')
+
+        if main_feature > num_titles:
+            logger.warning(f'"{str(file)}" : Invalid main feature number')
+
+        for title in titles:
+            logger.info(str(title))
+
 
 def action_meta(settings: Settings):
     try:
@@ -38,7 +63,7 @@ def action_meta(settings: Settings):
             if output_file.exists() and not settings.force:
                 continue
 
-            logger.info(str(media_file))
+            logger.info(f'"{str(media_file)}"')
             result = run_handbrake(media_file, ['--json', '--scan', '--main-feature'])
             json: str = result.stdout.split('JSON Title Set:')[1]
 
@@ -61,15 +86,15 @@ def check_iso_warnings(settings: Settings, media_file: Path, title_info: IsoTitl
         logger.warning(f'{title_info.title} : possible invalid title')
 
     if title_info.season is None and title_info.tvdb is not None:
-        logger.warning(f'"{title_info.title}" contains tvdb but no season/disc')
+        logger.warning(f'{title_info.title} contains tvdb but no season/disc')
     if title_info.tvdb is not None and not title_info.is_tv():
-        logger.warning(f'"{title_info.title}" contains tvdb but not identified as TV')
+        logger.warning(f'{title_info.title} contains tvdb but not identified as TV')
 
     if title_info.disc is not None and title_info.disc < 1:
-        logger.error(f'{media_file} : Invalid disc number')
+        logger.error(f'"{media_file}" : Invalid disc number')
 
     if title_info.season is not None and title_info.season < 1:
-        logger.error(f'{media_file} : Invalid season number')
+        logger.error(f'"{media_file}" : Invalid season number')
 
     if title_info.year is not None and title_info.year < 1933:
         logger.error(f'{title_info.title} possible invalid year')
@@ -109,7 +134,7 @@ def media_files(settings: Settings) -> list[Path]:
     for pattern in ['*.iso', '*.mkv']:
         files.extend(settings.input_folder.rglob(pattern))
 
-    return files
+    return [F for F in files if '_exclude' not in str(F)]
 
 def main() -> int:
     parser = argparse.ArgumentParser(description='Process video.')
@@ -130,6 +155,9 @@ def main() -> int:
 
     parser_prep = subparsers.add_parser('prep', help='Clean up file names and check filenames for errors.')
     parser_prep.set_defaults(func=action_prep)
+
+    parser_check = subparsers.add_parser('check', help='Check JSON meta data')
+    parser_check.set_defaults(func=action_check)
 
     args = parser.parse_args()
     logger.setLevel(_LOG_LEVELS[args.loglevel])

@@ -3,7 +3,9 @@ import logging
 from pathlib import Path
 from enum import Enum
 import subprocess
+import json
 from subprocess import CompletedProcess
+from datetime import timedelta
 
 def get_logger():
     return logging.getLogger('ConvertMedia')
@@ -21,6 +23,37 @@ class MediaType(Enum):
     MOVIE = 'MOVIE'
     MUSIC = 'MUSIC'
     HOME = 'HOME'
+
+class DiscTitle:
+    number: int
+    picture_width: int
+    duration: timedelta
+
+    def __init__(self, title_number: int):
+        self.number = title_number
+
+    def __repr__(self):
+        return f'{self.number}, Width: {self.picture_width}, Duration: {self.duration}, Total Seconds: {int(self.duration.total_seconds())}'
+
+def scan_media_file(filename: Path) -> tuple[int, list[DiscTitle]]:
+    titles: list[DiscTitle] = []
+    main_feature: int = 1
+    json_dict: dict = {}
+
+    with open(str(filename.with_suffix('.json')), 'r') as file:
+        json_dict = json.load(file)  # Parse JSON into a dictionary
+
+    main_feature = int(json_dict['MainFeature']) if 'MainFeature' in json_dict else 1
+    for title_number, title_dict in enumerate(json_dict['TitleList'], start=0):
+        title = DiscTitle(title_number+1)
+        title.picture_width = int(title_dict['Geometry']['Width'])
+        title.duration = timedelta(hours=int(title_dict['Duration']['Hours']),
+                                   minutes=int(title_dict['Duration']['Minutes']),
+                                   seconds=int(title_dict['Duration']['Seconds']))
+
+        titles.append(title)
+
+    return main_feature, titles
 
 class IsoTitleInfo:
     title: str
