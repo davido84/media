@@ -66,6 +66,9 @@ def parse_args():
                          help="Integrated loudness target in LUFS, used with --normalize-audio. "
                               "-16 is typical for general/streaming content, -23 is the EBU "
                               "broadcast standard. Default: -16")
+    parser.add_argument("-f", "--force", action="store_true",
+                         help="Overwrite existing files in the output folder without asking "
+                              "for confirmation.")
     return parser.parse_args()
 
 
@@ -265,6 +268,26 @@ def main():
 
     mp4_files = sorted(args.input_folder.rglob("*.mp4"))
     logging.info(f"Found {len(mp4_files)} .mp4 file(s) to process.")
+
+    if not same_location and not args.dry_run and not args.force:
+        existing = []
+        for src in mp4_files:
+            rel_path = src.relative_to(args.input_folder)
+            dst = args.output_folder / rel_path
+            if dst.exists():
+                existing.append(dst)
+
+        if existing:
+            print(f"\n{len(existing)} file(s) already exist in the output folder and "
+                  f"will be overwritten:")
+            for f in existing[:10]:
+                print(f"  - {f}")
+            if len(existing) > 10:
+                print(f"  ... and {len(existing) - 10} more")
+            answer = input("\nContinue and overwrite? [y/N] ").strip().lower()
+            if answer != "y":
+                print("Aborted. No files were modified.")
+                sys.exit(0)
 
     total_orig = 0
     total_new = 0
