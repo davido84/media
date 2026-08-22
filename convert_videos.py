@@ -71,6 +71,9 @@ def parse_args():
                          help="Overwrite output files that already exist. Without this flag, "
                               "if a file already exists at the output path, it is silently "
                               "skipped.")
+    parser.add_argument("--limit", type=float, default=250,
+                         help="Stop processing once this many GB of files have been "
+                              "converted or copied (cumulative original size). Default: 250")
     return parser.parse_args()
 
 
@@ -139,7 +142,9 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
     if needs_downscale:
         # Scale down so neither dimension exceeds 1080p, preserving aspect ratio.
         # force_original_aspect_ratio=decrease only shrinks, never upscales.
-        cmd += ["-vf", "scale=1920:1080:force_original_aspect_ratio=decrease"]
+        # force_divisible_by=2 rounds the calculated dimension to an even number,
+        # since x265/x264 require even width & height for 4:2:0 chroma subsampling.
+        cmd += ["-vf", "scale=1920:1080:force_original_aspect_ratio=decrease:force_divisible_by=2"]
 
     if encoding == "hardware":
         # Intel Quick Sync HEVC encoder. QSV uses -global_quality as its CRF-equivalent
@@ -278,7 +283,8 @@ def main():
                  f"Encoding: {args.encoding} "
                  f"Normalize audio: {'yes (' + str(args.loudnorm_target) + ' LUFS)' if args.normalize_audio else 'no'} "
                  f"Duration limit: {'none' if args.duration == -1 else f'{args.duration}s'} "
-                 f"Min size: {args.min_size_mb}MB")
+                 f"Min size: {args.min_size_mb}MB "
+                 f"Data limit: {args.limit}GB")
 
     mp4_files = sorted(args.input_folder.rglob("*.mp4"))
     logging.info(f"Found {len(mp4_files)} .mp4 file(s) to process.")
@@ -287,6 +293,8 @@ def main():
     total_new = 0
     failed_files = []
     skipped_existing = 0
+    limit_bytes = args.limit * 1024 ** 3
+    limit_reached = False
 
     total_files = len(mp4_files)
     for index, src in enumerate(mp4_files, start=1):
@@ -320,8 +328,21 @@ def main():
             total_orig += orig_size
             total_new += new_size
 
+            if total_orig >= limit_bytes:
+                limit_reached = True
+                logging.info(f"Data limit of {args.limit}GB reached "
+                             f"({human_size(total_orig)} processed). Stopping.")
+                print(f"\nData limit of {args.limit}GB reached "
+                     f"({human_size(total_orig)} processed). Stopping.")
+                break
+
     if skipped_existing:
         logging.info(f"{skipped_existing} file(s) skipped because the output file already existed.")
+
+    if limit_reached:
+        remaining_unprocessed = total_files - index
+        if remaining_unprocessed:
+            logging.info(f"{remaining_unprocessed} file(s) left unprocessed due to --limit.")
 
     logging.info(f"Batch conversion complete [{mode}].")
 
