@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Batch-convert .mp4 files in a folder (recursively) to H.265/HEVC using ffmpeg,
+Batch-convert .mp4 and .mkv files in a folder (recursively) to H.265/HEVC using ffmpeg,
 running software encoding. Files already encoded in H.265 are copied as-is.
 
 Usage:
@@ -34,11 +34,11 @@ class ConversionError(Exception):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Recursively re-encode .mp4 files to H.265 (software), "
+        description="Recursively re-encode .mp4/.mkv files to H.265 (software), "
                     "downscaling to 1080p if larger, skipping files already in H.265."
     )
     parser.add_argument("-i", "--input", dest="input_folder", type=Path, default=Path("."),
-                         help="Folder to scan recursively for .mp4 files. Default: current folder")
+                         help="Folder to scan recursively for .mp4/.mkv files. Default: current folder")
     parser.add_argument("-o", "--output", dest="output_folder", type=Path, default=None,
                          help="Folder to write converted/copied files to. Default: current folder. "
                               "If this is the same as the input folder, converted files replace "
@@ -161,7 +161,7 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
     else:
         cmd += ["-c:v", "libx265", "-preset", "slow", "-crf", str(crf)]
 
-    cmd += ["-c:a", "libopus", "-b:a", "128k"]
+    cmd += ["-c:a", "libopus", "-ac", "2", "-b:a", "128k"]
 
     if normalize_audio:
         # One-pass EBU R128 loudness normalization. TP/LRA use sensible general-purpose
@@ -297,8 +297,9 @@ def main():
                  f"Min size: {args.min_size_mb}MB "
                  f"Data limit: {'none' if args.limit == -1 else f'{args.limit}GB'}")
 
-    mp4_files = sorted(args.input_folder.rglob("*.mp4"))
-    logging.info(f"Found {len(mp4_files)} .mp4 file(s) to process.")
+    video_extensions = ("*.mp4", "*.MP4", "*.mkv", "*.MKV")
+    mp4_files = sorted(set().union(*(args.input_folder.rglob(pat) for pat in video_extensions)))
+    logging.info(f"Found {len(mp4_files)} .mp4/.mkv file(s) to process.")
 
     total_orig = 0
     total_new = 0
