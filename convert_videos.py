@@ -71,9 +71,10 @@ def parse_args():
                          help="Overwrite output files that already exist. Without this flag, "
                               "if a file already exists at the output path, it is silently "
                               "skipped.")
-    parser.add_argument("--limit", type=float, default=250,
+    parser.add_argument("--limit", type=float, default=-1,
                          help="Stop processing once this many GB of files have been "
-                              "converted or copied (cumulative original size). Default: 250")
+                              "converted or copied (cumulative original size). "
+                              "Default: -1 (no limit)")
     return parser.parse_args()
 
 
@@ -92,11 +93,12 @@ def setup_logging(output_folder: Path) -> Path:
 
 
 def probe_video(path: Path) -> dict:
-    """Return codec_name, width, height for the first video stream. Raises ConversionError on failure."""
+    """Return codec_name, width, height, and duration (seconds, float) for the video.
+    Raises ConversionError on failure."""
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
-        "-show_entries", "stream=codec_name,width,height",
+        "-show_entries", "stream=codec_name,width,height:format=duration",
         "-of", "json",
         str(path),
     ]
@@ -106,7 +108,13 @@ def probe_video(path: Path) -> dict:
         streams = data.get("streams", [])
         if not streams:
             raise ConversionError(path, "no video stream found")
-        return streams[0]
+        info = dict(streams[0])
+        duration_str = data.get("format", {}).get("duration")
+        try:
+            info["duration"] = float(duration_str) if duration_str is not None else None
+        except ValueError:
+            info["duration"] = None
+        return info
     except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as e:
         raise ConversionError(path, f"ffprobe failed: {e}")
 
@@ -167,8 +175,11 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
 def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: float,
                   same_location: bool, dry_run: bool = False, encoding: str = "software",
                   normalize_audio: bool = False, loudnorm_target: float = -16):
-    """Returns (original_size, new_size) in bytes on success, or None if skipped/dry-run.
-    Raises ConversionError if ffprobe or ffmpeg fails."""
+    """Returns (original_size, new_size, video_duration_seconds, action, downscaled) on
+    success, or None if skipped/dry-run. action is 'encoded' or 'copied'. downscaled is
+    True if the file was scaled down from >1080p. video_duration_seconds is None if the
+    file was small enough to skip probing entirely. Raises ConversionError if ffprobe or
+    ffmpeg fails."""
     min_size_bytes = min_size_mb * 1024 * 1024
     src_size = src.stat().st_size
 
@@ -176,7 +187,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         if same_location:
             logging.info(f"KEPT (below {min_size_mb}MB minimum, already in place, "
                          f"{human_size(src_size)}): {src}")
-            return (src_size, src_size)
+            return (src_size, src_size, None, "copied", False)
         if dry_run:
             logging.info(f"[DRY RUN] WOULD COPY (below {min_size_mb}MB minimum, "
                          f"{human_size(src_size)}): {src} -> {dst}")
@@ -185,29 +196,30 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         shutil.copy2(src, dst)
         logging.info(f"COPIED (below {min_size_mb}MB minimum, "
                      f"{human_size(src_size)}): {src} -> {dst}")
-        return (src_size, src_size)
+        return (src_size, src_size, None, "copied", False)
 
     info = probe_video(src)
     codec = info.get("codec_name", "")
     width = info.get("width", 0)
     height = info.get("height", 0)
+    video_duration = info.get("duration")
 
     if codec == "hevc":
         if same_location:
             logging.info(f"KEPT (already H.265, already in place): {src}")
-            return (src_size, src_size)
+            return (src_size, src_size, video_duration, "copied", False)
         if dry_run:
             logging.info(f"[DRY RUN] WOULD COPY (already H.265): {src} -> {dst}")
             return None
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
         logging.info(f"COPIED (already H.265): {src} -> {dst}")
-        return (src_size, src_size)
+        return (src_size, src_size, video_duration, "copied", False)
 
     needs_downscale = width > 1920 or height > 1080
 
-    action = "[DRY RUN] WOULD ENCODE" if dry_run else "ENCODING"
-    logging.info(f"{action}: {src} -> {dst} (codec={codec}, {width}x{height}, "
+    log_action = "[DRY RUN] WOULD ENCODE" if dry_run else "ENCODING"
+    logging.info(f"{log_action}: {src} -> {dst} (codec={codec}, {width}x{height}, "
                  f"downscale={'yes' if needs_downscale else 'no'}, crf={crf}, "
                  f"encoding={encoding}, "
                  f"normalize_audio={'yes (' + str(loudnorm_target) + ' LUFS)' if normalize_audio else 'no'}, "
@@ -245,11 +257,10 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     saved_pct = (1 - new_size / orig_size) * 100 if orig_size else 0
     logging.info(f"DONE: {src} -> {dst} "
                  f"({human_size(orig_size)} -> {human_size(new_size)}, {saved_pct:.1f}% smaller)")
-    return (orig_size, new_size)
+    return (orig_size, new_size, video_duration, "encoded", needs_downscale)
 
 
 def main():
-    start_time = time.monotonic()
     args = parse_args()
 
     if not args.input_folder.is_dir():
@@ -284,22 +295,42 @@ def main():
                  f"Normalize audio: {'yes (' + str(args.loudnorm_target) + ' LUFS)' if args.normalize_audio else 'no'} "
                  f"Duration limit: {'none' if args.duration == -1 else f'{args.duration}s'} "
                  f"Min size: {args.min_size_mb}MB "
-                 f"Data limit: {args.limit}GB")
+                 f"Data limit: {'none' if args.limit == -1 else f'{args.limit}GB'}")
 
     mp4_files = sorted(args.input_folder.rglob("*.mp4"))
     logging.info(f"Found {len(mp4_files)} .mp4 file(s) to process.")
 
     total_orig = 0
     total_new = 0
+    total_duration_seconds = 0.0
     failed_files = []
     skipped_existing = 0
-    limit_bytes = args.limit * 1024 ** 3
+    encoded_count = 0
+    copied_count = 0
+    downscaled_count = 0
+    limit_bytes = float("inf") if args.limit == -1 else args.limit * 1024 ** 3
     limit_reached = False
 
     total_files = len(mp4_files)
+    total_size_bytes = sum(f.stat().st_size for f in mp4_files)
+    processed_bytes = 0
+    batch_start = time.monotonic()
+
     for index, src in enumerate(mp4_files, start=1):
-        remaining = total_files - index
-        print(f"[{index}/{total_files}] Processing (remaining: {remaining}): {src}")
+        src_size = src.stat().st_size
+        remaining_bytes = total_size_bytes - processed_bytes
+
+        elapsed_so_far = time.monotonic() - batch_start
+        if processed_bytes > 0 and elapsed_so_far > 0:
+            rate = processed_bytes / elapsed_so_far  # bytes/sec
+            eta_str = human_duration(remaining_bytes / rate) if rate > 0 else "unknown"
+        else:
+            eta_str = "calculating..."
+
+        print(f"Processed: {human_size(processed_bytes)} | "
+              f"Remaining: {human_size(remaining_bytes)} | "
+              f"ETA: {eta_str} | "
+              f"Current file ({human_size(src_size)}): {src.name}")
 
         if same_location:
             dst = src
@@ -311,6 +342,7 @@ def main():
             prefix = "[DRY RUN] WOULD SKIP" if args.dry_run else "SKIPPED"
             logging.info(f"{prefix} (output file already exists): {dst}")
             skipped_existing += 1
+            processed_bytes += src_size
             continue
 
         try:
@@ -321,12 +353,23 @@ def main():
             failed_path = e.file.resolve()
             logging.error(f"CONVERSION FAILED: {failed_path}\n{e.reason}")
             failed_files.append(failed_path)
+            processed_bytes += src_size
             continue
 
+        processed_bytes += src_size
+
         if result is not None:
-            orig_size, new_size = result
+            orig_size, new_size, video_duration, action, downscaled = result
             total_orig += orig_size
             total_new += new_size
+            if video_duration is not None:
+                total_duration_seconds += video_duration
+            if action == "encoded":
+                encoded_count += 1
+            else:
+                copied_count += 1
+            if downscaled:
+                downscaled_count += 1
 
             if total_orig >= limit_bytes:
                 limit_reached = True
@@ -354,20 +397,31 @@ def main():
         for f in failed_files:
             print(f"  - {f}")
 
+    breakdown = (f"Encoded: {encoded_count} | Copied: {copied_count} | "
+                 f"Skipped (existing): {skipped_existing} | Failed: {len(failed_files)}")
+    logging.info(breakdown)
+    print(f"\n{breakdown}")
+
+    downscale_line = f"Downscaled from >1080p: {downscaled_count} file(s)"
+    logging.info(downscale_line)
+    print(downscale_line)
+
     if args.dry_run:
         print(f"\n[DRY RUN] No files were modified. Log written to: {log_path}")
     else:
         reduction_bytes = total_orig - total_new
         reduction_pct = (reduction_bytes / total_orig * 100) if total_orig else 0
-        summary = (f"Total reduction: {reduction_bytes:,} bytes "
-                    f"({human_size(reduction_bytes)}), {reduction_pct:.1f}% smaller "
+        summary = (f"Total reduction: {human_size(reduction_bytes)}, "
+                    f"{reduction_pct:.1f}% smaller "
                     f"({human_size(total_orig)} -> {human_size(total_new)})")
         logging.info(summary)
         print(f"\n{summary}")
+        runtime_summary = f"Total video running time: {human_duration(total_duration_seconds)}"
+        logging.info(runtime_summary)
+        print(runtime_summary)
         print(f"Log written to: {log_path}")
 
-    elapsed = time.monotonic() - start_time
-    final_line = f"Finished with {len(failed_files)} error(s). Total run time: {human_duration(elapsed)}"
+    final_line = f"Finished with {len(failed_files)} error(s)."
     logging.info(final_line)
     print(final_line)
 
