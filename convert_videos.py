@@ -129,14 +129,14 @@ def human_size(num_bytes: int) -> str:
 
 
 def human_duration(seconds: float) -> str:
-    seconds = int(round(seconds))
-    hours, remainder = divmod(seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
+    total_minutes = int(round(seconds / 60))
+    days, remainder = divmod(total_minutes, 1440)
+    hours, minutes = divmod(remainder, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
     if hours:
-        return f"{hours}h {minutes}m {secs}s"
-    if minutes:
-        return f"{minutes}m {secs}s"
-    return f"{secs}s"
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_downscale: bool,
@@ -156,10 +156,15 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
 
     if encoding == "hardware":
         # Intel Quick Sync HEVC encoder. QSV uses -global_quality as its CRF-equivalent
-        # quality knob rather than -crf.
-        cmd += ["-c:v", "hevc_qsv", "-global_quality", str(crf), "-preset", "slow"]
+        # quality knob rather than -crf. p010le is QSV's 10-bit pixel format.
+        cmd += ["-pix_fmt", "p010le", "-c:v", "hevc_qsv", "-global_quality", str(crf),
+                "-preset", "slow"]
     else:
-        cmd += ["-c:v", "libx265", "-preset", "slow", "-crf", str(crf)]
+        # yuv420p10le: encode in 10-bit. Even for 8-bit sources, x265's finer
+        # quantization steps in 10-bit mode noticeably improve compression
+        # efficiency at a given CRF, at negligible compatibility cost on modern
+        # players/decoders.
+        cmd += ["-pix_fmt", "yuv420p10le", "-c:v", "libx265", "-preset", "slow", "-crf", str(crf)]
 
     cmd += ["-c:a", "libopus", "-ac", "2", "-b:a", "128k"]
 
