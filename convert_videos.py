@@ -68,8 +68,9 @@ def parse_args():
                               "-16 is typical for general/streaming content, -23 is the EBU "
                               "broadcast standard. Default: -16")
     parser.add_argument("-f", "--force", action="store_true",
-                         help="Overwrite existing files in the output folder without asking "
-                              "for confirmation.")
+                         help="Overwrite output files that already exist. Without this flag, "
+                              "if a file already exists at the output path, it is silently "
+                              "skipped.")
     return parser.parse_args()
 
 
@@ -282,29 +283,10 @@ def main():
     mp4_files = sorted(args.input_folder.rglob("*.mp4"))
     logging.info(f"Found {len(mp4_files)} .mp4 file(s) to process.")
 
-    if not same_location and not args.dry_run and not args.force:
-        existing = []
-        for src in mp4_files:
-            rel_path = src.relative_to(args.input_folder)
-            dst = args.output_folder / rel_path
-            if dst.exists():
-                existing.append(dst)
-
-        if existing:
-            print(f"\n{len(existing)} file(s) already exist in the output folder and "
-                  f"will be overwritten:")
-            for f in existing[:10]:
-                print(f"  - {f}")
-            if len(existing) > 10:
-                print(f"  ... and {len(existing) - 10} more")
-            answer = input("\nContinue and overwrite? [y/N] ").strip().lower()
-            if answer != "y":
-                print("Aborted. No files were modified.")
-                sys.exit(0)
-
     total_orig = 0
     total_new = 0
     failed_files = []
+    skipped_existing = 0
 
     total_files = len(mp4_files)
     for index, src in enumerate(mp4_files, start=1):
@@ -316,6 +298,12 @@ def main():
         else:
             rel_path = src.relative_to(args.input_folder)
             dst = args.output_folder / rel_path
+
+        if not same_location and dst.exists() and not args.force:
+            prefix = "[DRY RUN] WOULD SKIP" if args.dry_run else "SKIPPED"
+            logging.info(f"{prefix} (output file already exists): {dst}")
+            skipped_existing += 1
+            continue
 
         try:
             result = process_file(src, dst, args.crf, args.duration, args.min_size_mb,
@@ -331,6 +319,9 @@ def main():
             orig_size, new_size = result
             total_orig += orig_size
             total_new += new_size
+
+    if skipped_existing:
+        logging.info(f"{skipped_existing} file(s) skipped because the output file already existed.")
 
     logging.info(f"Batch conversion complete [{mode}].")
 
