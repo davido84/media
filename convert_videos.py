@@ -20,6 +20,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -113,6 +114,17 @@ def human_size(num_bytes: int) -> str:
             return f"{size:.1f}{unit}"
         size /= 1024
     return f"{size:.1f}TB"
+
+
+def human_duration(seconds: float) -> str:
+    seconds = int(round(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
 
 
 def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_downscale: bool,
@@ -231,6 +243,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
 
 
 def main():
+    start_time = time.monotonic()
     args = parse_args()
 
     if not args.input_folder.is_dir():
@@ -340,6 +353,11 @@ def main():
         logging.info(summary)
         print(f"\n{summary}")
         print(f"Log written to: {log_path}")
+
+    elapsed = time.monotonic() - start_time
+    final_line = f"Finished with {len(failed_files)} error(s). Total run time: {human_duration(elapsed)}"
+    logging.info(final_line)
+    print(final_line)
 
 
 if __name__ == "__main__":
