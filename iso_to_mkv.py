@@ -186,6 +186,15 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
    season directory) as well as by filename. --include keeps only
    matching files; --exclude keeps only non-matching files. A summary of
    how many files matched is logged once, before the batch begins.
+
+Note: Jellyfin/Plex-friendly output naming (renaming the main feature to
+"<Title> (<Year>).mkv" and extras to "extra.<n>.mkv") used to live here,
+but was deliberately split out into a separate script, organize_media.py,
+which operates on already-extracted .mkv files instead. Naming/organizing
+is a media-library problem, not a disc-extraction problem, and the split
+means it can be re-run safely any number of times with zero risk to
+source ISOs, and works on .mkv files from any source, not just this
+script. See organize_media.py's own docstring for details.
 -----------------------------------------------------------------------------
 """
 
