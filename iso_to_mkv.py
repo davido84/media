@@ -38,6 +38,15 @@ IMPORTANT ASSUMPTIONS / CAVEATS (please read before relying on this in prod)
         detection is NOT 100% reliable - it sometimes fails to run, and
         rarely flags the wrong title - so treat it as strong evidence, not
         absolute certainty, and spot check important discs.
+        The script also watches for MakeMKV's own confirmed message "This
+        disc requires Java runtime (JRE), but none was found" (see
+        https://www.makemkv.com/bdjava/) and logs an explicit WARNING
+        distinguishing "this disc needed Java and none was found" from
+        "this disc just never engaged Java" (jre_required_missing vs.
+        jre_engaged=False) - the former is a real, fixable problem
+        (install a JRE, or point MakeMKV at one via app_Java in
+        ~/.MakeMKV/settings.conf), the latter is simply a disc that never
+        needed BD-Java in the first place.
 
      b) A duration-clustering fallback, used only when no unambiguous
         FPL_MainFeature marker is found. This looks for a very large
@@ -199,6 +208,14 @@ ATTR_TYPE = 1  # stream attribute: "Video" / "Audio" / "Subtitles"
 # need manual disambiguation rather than being silently treated as equal.
 FPL_MAIN_FEATURE_RE = re.compile(r"\(FPL_MainFeature\)")
 FPL_SUBSTRING = "FPL_MainFeature"
+
+# Exact, confirmed MakeMKV message (see e.g. makemkv.com/bdjava/ and its own
+# forums) printed when a disc actually needs BD-Java (fake-playlist
+# protection, BD+ handshake, or Soft-KCD) but no JRE could be found. This is
+# a much stronger, more specific signal than the mere absence of the
+# "Using Java runtime" success line, which also doesn't appear on discs
+# that never needed Java in the first place.
+JRE_MISSING_MARKER = "This disc requires Java runtime (JRE), but none was found"
 
 DVD_MAX_SIZE_GB_DEFAULT = 8.5  # decimal GB (10**9 bytes), matching how DVD-9 capacity is marketed
 DISC_TYPE_DVD = "DVD"
@@ -472,16 +489,22 @@ class Title:
     streams: Dict[int, Stream] = field(default_factory=dict)
 
 
-def get_disc_titles(makemkvcon_bin: str, iso_path: Path) -> Tuple[int, str, Dict[int, Title], bool]:
+def get_disc_titles(makemkvcon_bin: str, iso_path: Path) -> Tuple[int, str, Dict[int, Title], bool, bool]:
     """Run `makemkvcon info` on the ISO and parse the title/stream table.
 
-    Returns (returncode, raw_output, titles, jre_engaged). jre_engaged is
-    True if makemkvcon reported it launched the Java runtime for this disc
-    (i.e. it attempted BD-Java based main-feature detection)."""
+    Returns (returncode, raw_output, titles, jre_engaged, jre_required_missing).
+    jre_engaged is True if makemkvcon reported it launched the Java runtime
+    for this disc (i.e. it attempted BD-Java based main-feature detection).
+    jre_required_missing is True if this disc specifically needed Java (for
+    fake-playlist protection, a BD+ handshake, or Soft-KCD) and MakeMKV
+    could not find a JRE to use - a much stronger signal than jre_engaged
+    simply being False, which is also true for every disc that never
+    needed Java at all."""
     cmd = [makemkvcon_bin, "-r", "--cache=1", "info", f"iso:{iso_path}"]
     rc, output = run_cmd(cmd)
     titles: Dict[int, Title] = {}
     jre_engaged = "Using Java runtime" in output
+    jre_required_missing = JRE_MISSING_MARKER in output
 
     for line in output.splitlines():
         line = line.strip()
@@ -525,7 +548,7 @@ def get_disc_titles(makemkvcon_bin: str, iso_path: Path) -> Tuple[int, str, Dict
             elif code == ATTR_LANGNAME:
                 s.lang_name = value
 
-    return rc, output, titles, jre_engaged
+    return rc, output, titles, jre_engaged, jre_required_missing
 
 
 def looks_like_warning(output: str) -> Optional[str]:
@@ -755,7 +778,7 @@ def process_iso(
     disc_type = classify_disc(iso_path, args.dvd_max_size_gb * 1_000_000_000, disc_type_override)
     logger.info(f"Classified as {disc_type} ({human_bytes(iso_path.stat().st_size)})", iso_path)
 
-    rc, output, titles, jre_engaged = get_disc_titles(args.makemkvcon, iso_path)
+    rc, output, titles, jre_engaged, jre_required_missing = get_disc_titles(args.makemkvcon, iso_path)
     if rc != 0 or not titles:
         logger.error(f"Failed to read title information (exit code {rc})", iso_path)
         logger.append_raw_to_file(output)
@@ -772,6 +795,15 @@ def process_iso(
     else:
         if jre_engaged:
             logger.info("MakeMKV engaged the Java runtime for BD-Java main-feature analysis", iso_path)
+        elif jre_required_missing:
+            logger.warning(
+                "This disc requires a Java runtime (JRE) for BD-Java processing (fake-playlist "
+                "protection, a BD+ handshake, or Soft-KCD), but MakeMKV could not find one - "
+                "install a JRE or set app_Java in MakeMKV's settings.conf. See "
+                "https://www.makemkv.com/bdjava/",
+                iso_path,
+            )
+            stats.warnings += 1
 
         suspected, dup_duration, dup_count = detect_obfuscation(titles, args.obfuscation_threshold)
 
@@ -817,10 +849,15 @@ def process_iso(
             candidates = [tid for tid, t in titles.items() if t.duration_sec >= min_length_sec]
 
             if suspected:
+                if jre_required_missing:
+                    jre_note = " - JRE was required but not found, see warning above"
+                elif not jre_engaged:
+                    jre_note = " - JRE was not engaged"
+                else:
+                    jre_note = ", and Java did not resolve it"
                 logger.warning(
                     f"Suspected Playlist Obfuscation: {dup_count} titles share a duration of "
-                    f"~{format_duration(dup_duration)} (no (FPL_MainFeature) marker found"
-                    f"{' - JRE was not engaged' if not jre_engaged else ', and Java did not resolve it'})",
+                    f"~{format_duration(dup_duration)} (no (FPL_MainFeature) marker found{jre_note})",
                     iso_path,
                 )
                 stats.warnings += 1
