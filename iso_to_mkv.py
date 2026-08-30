@@ -94,6 +94,22 @@ IMPORTANT ASSUMPTIONS / CAVEATS (please read before relying on this in prod)
    track has no usable language tag, English is used as the documented
    fallback, and this is logged.
 
+3a. English subtitle selection keeps EVERY subtitle track tagged 'eng',
+   not just one - so if a disc has both a plain English subtitle track
+   and a separate English SDH/CC track, both are kept, since SDH/CC text
+   isn't always identical to the plain subtitle (it often adds sound
+   descriptions, speaker labels, etc). MakeMKV's own confirmed naming for
+   these includes "Text (Lossy Conversion)" for a Blu-ray CC track pulled
+   via ccextractor, and "SDH Subtitles" - see MakeMKV's forums. As a
+   fallback ONLY for a subtitle track with NO language tag at all (an
+   explicitly non-English tag is still trusted over the name), a name
+   matching CC_SDH_NAME_RE is treated as English too, and this is logged
+   as a caveat since it's a heuristic, not a certainty. True DVD "Line 21"
+   closed captions are a different thing entirely - they're embedded in
+   the video signal itself and MakeMKV doesn't expose them as a separate
+   track at all, so they're automatically preserved as part of the video
+   stream with nothing for this script to do.
+
 4. Track selection is done by passing an explicit comma-separated list
    of track IDs as the final argument to `makemkvcon mkv`, rather than
    using a MakeMKV settings profile. This is supported by makemkvcon.
@@ -216,6 +232,14 @@ FPL_SUBSTRING = "FPL_MainFeature"
 # "Using Java runtime" success line, which also doesn't appear on discs
 # that never needed Java in the first place.
 JRE_MISSING_MARKER = "This disc requires Java runtime (JRE), but none was found"
+
+# Matches MakeMKV's own naming for CC/SDH-style subtitle tracks - confirmed
+# real examples from MakeMKV's forums include "Text (Lossy Conversion)"
+# (what ccextractor-derived Blu-ray CC tracks get named) and "SDH
+# Subtitles". Used only as a fallback signal when a subtitle track's
+# language tag is missing - if it's already tagged (with any language),
+# the tag is trusted over the name.
+CC_SDH_NAME_RE = re.compile(r"\b(cc|sdh|closed.?caption|lossy conversion)\b", re.IGNORECASE)
 
 DVD_MAX_SIZE_GB_DEFAULT = 8.5  # decimal GB (10**9 bytes), matching how DVD-9 capacity is marketed
 DISC_TYPE_DVD = "DVD"
@@ -477,6 +501,7 @@ class Stream:
     stream_type: Optional[str] = None
     lang_code: Optional[str] = None
     lang_name: Optional[str] = None
+    name: Optional[str] = None  # attribute 2; e.g. "Text (Lossy Conversion)" for ccextractor'd CC tracks
 
 
 @dataclass
@@ -547,6 +572,8 @@ def get_disc_titles(makemkvcon_bin: str, iso_path: Path) -> Tuple[int, str, Dict
                 s.lang_code = value
             elif code == ATTR_LANGNAME:
                 s.lang_name = value
+            elif code == ATTR_NAME:
+                s.name = value
 
     return rc, output, titles, jre_engaged, jre_required_missing
 
@@ -687,6 +714,28 @@ def select_tracks(title: Title) -> Tuple[List[int], str, List[str]]:
             )
 
     subtitle_eng_ids = [sid for sid, s in subtitle_items if (s.lang_code or "").strip().lower() == "eng"]
+
+    # Untagged CC/SDH tracks: MakeMKV's own generated names for these
+    # (e.g. "Text (Lossy Conversion)" for a ccextractor'd Blu-ray CC track,
+    # or "SDH Subtitles") are used as a fallback ONLY when the track has no
+    # language tag at all - an explicitly non-English tag is still trusted
+    # over the name. This exists specifically so an English CC/SDH track
+    # doesn't silently get dropped alongside a differently-tagged regular
+    # English subtitle track: both are wanted, since CC/SDH text isn't
+    # always identical to the plain subtitle track.
+    untagged_cc_ids = [
+        sid for sid, s in subtitle_items
+        if sid not in subtitle_eng_ids
+        and not (s.lang_code or "").strip()
+        and s.name and CC_SDH_NAME_RE.search(s.name)
+    ]
+    if untagged_cc_ids:
+        subtitle_eng_ids = subtitle_eng_ids + untagged_cc_ids
+        caveats.append(
+            f"{len(untagged_cc_ids)} subtitle track(s) named like CC/SDH had no language tag - "
+            "included anyway based on the track name, alongside any already-tagged English "
+            "subtitle track(s) - please spot check this title"
+        )
 
     if subtitle_items and not subtitle_eng_ids:
         caveats.append(
