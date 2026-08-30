@@ -141,10 +141,10 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
      - Resume support: if an ISO's natural output folder already
        contains at least as many real .mkv files as the number of
        titles this run would extract, the ISO is skipped entirely
-       (logged, counted separately in the summary). This is whole-ISO
-       granularity only - an interrupted multi-title disc is safely
-       redone in full rather than partially resumed. Force a redo with
-       --overwrite.
+       (logged, counted separately in the summary) - this is the
+       default behavior. This is whole-ISO granularity only - an
+       interrupted multi-title disc is safely redone in full rather
+       than partially resumed. Force a redo with -f/--force.
      - Title extraction streams makemkvcon's progress output live
        (parsing PRGT/PRGV robot-mode lines) instead of going silent for
        the whole extraction; only shown when stdout is a real terminal.
@@ -746,7 +746,7 @@ def process_iso(
     # do that safely is fragile); it will just fully redo that one ISO,
     # which is the safe default over a false "looks done" skip.
     natural_out_dir = output_root / iso_path.stem
-    if not args.overwrite:
+    if not args.force:
         pre_existing_mkvs = existing_output_mkvs(natural_out_dir)
     else:
         pre_existing_mkvs = []
@@ -868,7 +868,7 @@ def process_iso(
         logger.info(
             f"Found {len(pre_existing_mkvs)} existing .mkv file(s) in {natural_out_dir} "
             f"(expected {len(candidates)}) - looks already converted, skipping. "
-            f"Use --overwrite to redo.",
+            f"Use --force to redo.",
             iso_path,
         )
         stats.already_converted_skipped += 1
@@ -1050,8 +1050,9 @@ def parse_args() -> argparse.Namespace:
              "to still be grouped into the 'episode' cluster for Play All detection",
     )
     p.add_argument(
-        "--overwrite", action="store_true",
-        help="Redo an ISO even if its output folder already looks fully converted",
+        "-f", "--force", action="store_true",
+        help="Redo an ISO even if its output folder already looks fully converted "
+             "(default: skip it)",
     )
     p.add_argument(
         "--free-space-margin-pct", type=float, default=10.0, metavar="PCT",
