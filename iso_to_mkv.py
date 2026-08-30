@@ -152,6 +152,15 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        process cleanly, then still prints the summary-so-far and closes
        the log, rather than leaving an orphaned process or a truncated
        log file.
+
+8. --include=REGEX / --exclude=REGEX (mutually exclusive - argparse
+   rejects passing both) filter the discovered ISO list before any
+   processing starts. The regex is matched with re.search (no anchoring
+   required) against each ISO's full resolved path, not just the
+   filename, so you can filter by a folder name too (e.g. a show or
+   season directory) as well as by filename. --include keeps only
+   matching files; --exclude keeps only non-matching files. A summary of
+   how many files matched is logged once, before the batch begins.
 -----------------------------------------------------------------------------
 """
 
@@ -972,6 +981,13 @@ def process_iso(
 # Argument parsing
 # --------------------------------------------------------------------------
 
+def compile_regex_arg(value: str) -> re.Pattern:
+    try:
+        return re.compile(value)
+    except re.error as e:
+        raise argparse.ArgumentTypeError(f"Invalid regular expression {value!r}: {e}")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Batch-convert .iso files to .mkv using makemkvcon.",
@@ -995,6 +1011,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--limit", type=float, default=-1, metavar="GB",
         help="Stop once this many GB of ISO source data have been converted (-1 = no limit)",
+    )
+    filter_group = p.add_mutually_exclusive_group()
+    filter_group.add_argument(
+        "--include", type=compile_regex_arg, default=None, metavar="REGEX",
+        help="Only process ISOs whose full path matches this regex; all others are skipped. "
+             "Mutually exclusive with --exclude",
+    )
+    filter_group.add_argument(
+        "--exclude", type=compile_regex_arg, default=None, metavar="REGEX",
+        help="Skip any ISO whose full path matches this regex; all others are processed. "
+             "Mutually exclusive with --include",
     )
     p.add_argument(
         "--obfuscation-threshold", type=int, default=100, metavar="N",
@@ -1081,6 +1108,21 @@ def main() -> int:
     iso_files = sorted(
         {p for p in input_root.rglob("*") if p.is_file() and p.suffix.lower() == ".iso"}
     )
+
+    if args.include:
+        before = len(iso_files)
+        iso_files = [p for p in iso_files if args.include.search(str(p))]
+        logger.info(
+            f"--include={args.include.pattern!r} applied: {len(iso_files)} of {before} "
+            f"ISO(s) matched and will be processed"
+        )
+    elif args.exclude:
+        before = len(iso_files)
+        iso_files = [p for p in iso_files if not args.exclude.search(str(p))]
+        logger.info(
+            f"--exclude={args.exclude.pattern!r} applied: {before - len(iso_files)} of {before} "
+            f"ISO(s) matched and will be skipped"
+        )
 
     if not iso_files:
         logger.info(f"No .iso files found under {input_root}")
