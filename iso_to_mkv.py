@@ -189,6 +189,14 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
    matching files; --exclude keeps only non-matching files. A summary of
    how many files matched is logged once, before the batch begins.
 
+9. Each ISO's output directory mirrors its location relative to --input,
+   it does NOT flatten everything directly under --output. E.g. an ISO at
+   <input>/Show/S1E1/s1e1.iso produces output under
+   <output>/Show/S1E1/s1e1/ - the same relative "Show/S1E1" folder
+   structure, plus the usual per-ISO folder named after the ISO's own
+   stem. This also governs where resume support (point 7) looks for an
+   already-converted ISO's output.
+
 Note: Jellyfin/Plex-friendly output naming (renaming the main feature to
 "<Title> (<Year>).mkv" and extras to "extra.<n>.mkv") used to live here,
 but was deliberately split out into a separate script, organize_media.py,
@@ -637,14 +645,26 @@ def detect_playall_title(
     return None
 
 
-def unique_output_dir(output_root: Path, stem: str, used: set) -> Path:
+def unique_output_dir(output_root: Path, relative_dir: Path, stem: str, used: set) -> Path:
+    """Mirrors the ISO's directory structure relative to --input under
+    output_root, so e.g. <input>/Show/S1E1/s1e1.iso produces
+    <output>/Show/S1E1/s1e1/ rather than flattening everything directly
+    under output_root. used is keyed on the full relative output path
+    (not just the stem), since preserving structure already makes
+    same-stem collisions across different subfolders a non-issue - this
+    disambiguation now only matters for two ISOs landing on the exact
+    same relative output path, which realistically shouldn't happen
+    given each input ISO has a distinct path, but the safety net costs
+    nothing to keep."""
     name = stem
     n = 2
-    while name in used:
+    key = str(relative_dir / name)
+    while key in used:
         name = f"{stem}_{n}"
+        key = str(relative_dir / name)
         n += 1
-    used.add(name)
-    return output_root / name
+    used.add(key)
+    return output_root / relative_dir / name
 
 
 # --------------------------------------------------------------------------
@@ -676,6 +696,7 @@ class ProcessResult:
 
 def process_iso(
     iso_path: Path,
+    input_root: Path,
     output_root: Path,
     args: argparse.Namespace,
     logger: DualLogger,
@@ -688,6 +709,22 @@ def process_iso(
 
     min_length_sec = args.min_length * 60.0
 
+    # The ISO's directory structure relative to --input is mirrored under
+    # --output (e.g. <input>/Show/S1E1/s1e1.iso -> <output>/Show/S1E1/s1e1/)
+    # rather than flattening every ISO's output directly under output_root.
+    try:
+        relative_dir = iso_path.parent.relative_to(input_root)
+    except ValueError:
+        # Shouldn't happen given iso_path came from rglob(input_root), but
+        # fall back to flat output rather than crashing if it somehow does.
+        logger.warning(
+            f"Could not determine {iso_path}'s folder relative to --input {input_root} - "
+            f"placing its output directly under the output root instead",
+            iso_path,
+        )
+        stats.warnings += 1
+        relative_dir = Path(".")
+
     # --- Resume support (workflow enhancement 4) ---
     # Checked against the disc's natural (non-disambiguated) output path,
     # since that's what a previous run would have used. Only a whole-ISO
@@ -696,7 +733,7 @@ def process_iso(
     # titles (predicting makemkvcon's own output filenames well enough to
     # do that safely is fragile); it will just fully redo that one ISO,
     # which is the safe default over a false "looks done" skip.
-    natural_out_dir = output_root / iso_path.stem
+    natural_out_dir = output_root / relative_dir / iso_path.stem
     if not args.force:
         pre_existing_mkvs = existing_output_mkvs(natural_out_dir)
     else:
@@ -851,7 +888,7 @@ def process_iso(
         stats.already_converted_skipped += 1
         return ProcessResult(skipped_already_done=True)
 
-    out_dir = unique_output_dir(output_root, iso_path.stem, used_output_names)
+    out_dir = unique_output_dir(output_root, relative_dir, iso_path.stem, used_output_names)
     if not args.dry_run:
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1195,7 +1232,7 @@ def main() -> int:
                 f"- estimated time remaining: {eta_str}"
             )
 
-            result = process_iso(iso_path, output_root, args, logger, stats, used_output_names)
+            result = process_iso(iso_path, input_root, output_root, args, logger, stats, used_output_names)
 
             # --- Circuit breaker (safety enhancement 2, cont'd) ---
             # A single bad disc failing to scan is normal; several in a
