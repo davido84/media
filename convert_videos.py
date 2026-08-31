@@ -32,7 +32,16 @@ class ConversionError(Exception):
         super().__init__(f"{file}: {reason}")
 
 
-def parse_args():
+def str_to_bool(value: str) -> bool:
+    """argparse type function for explicit True/False style boolean options."""
+    if value.lower() in ("true", "1", "yes"):
+        return True
+    if value.lower() in ("false", "0", "no"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected True or False, got: {value!r}")
+
+
+def build_parser():
     parser = argparse.ArgumentParser(
         description="Recursively re-encode .mp4/.mkv files to H.265 (software), "
                     "downscaling to 1080p if larger, skipping files already in H.265."
@@ -52,17 +61,18 @@ def parse_args():
     parser.add_argument("--dry-run", action="store_true",
                          help="List what would be done for each file without actually "
                               "encoding or copying anything.")
-    parser.add_argument("--min-size-mb", type=float, default=100,
+    parser.add_argument("--min-size-mb", type=float, default=50,
                          help="Files smaller than this size (in MB) are skipped and just "
-                              "copied to the output folder as-is. Default: 100")
+                              "copied to the output folder as-is. Default: 50")
     parser.add_argument("--encoding", choices=["hardware", "software"], default="software",
                          help="Encoding mode. 'software' uses libx265 (CPU). 'hardware' uses "
                               "Intel Quick Sync (hevc_qsv). Default: software")
-    parser.add_argument("--normalize-audio", action="store_true",
+    parser.add_argument("--normalize-audio", type=str_to_bool, default=True,
+                         metavar="{True,False}",
                          help="Apply EBU R128 loudness normalization (ffmpeg's loudnorm filter) "
                               "to the audio track during encoding. Only affects files that are "
                               "actually re-encoded — files copied as-is (already H.265, or below "
-                              "--min-size-mb) are left untouched. Default: off")
+                              "--min-size-mb) are left untouched. Default: True")
     parser.add_argument("--loudnorm-target", type=float, default=-16,
                          help="Integrated loudness target in LUFS, used with --normalize-audio. "
                               "-16 is typical for general/streaming content, -23 is the EBU "
@@ -75,7 +85,22 @@ def parse_args():
                          help="Stop processing once this many GB of files have been "
                               "converted or copied (cumulative original size). "
                               "Default: -1 (no limit)")
-    return parser.parse_args()
+    parser.add_argument("-w", "--downscale", action="store_true",
+                         help="Downscale video to fit within 1920x1080 if the source is "
+                              "larger, when re-encoding. Without this flag, files are "
+                              "encoded at their original resolution regardless of size. "
+                              "Default: off")
+    parser.add_argument("-e", "--strip-no-english-audio", action="store_true",
+                         help="When re-encoding, drop non-English audio tracks if the "
+                              "main (first) audio track is tagged English. If the main "
+                              "track is tagged as a different language, or has no "
+                              "language tag at all, all audio tracks are kept regardless. "
+                              "Default: off (all audio tracks are kept)")
+    return parser
+
+
+def parse_args():
+    return build_parser().parse_args()
 
 
 def setup_logging(output_folder: Path) -> Path:
@@ -92,31 +117,79 @@ def setup_logging(output_folder: Path) -> Path:
     return log_path
 
 
-def probe_video(path: Path) -> dict:
-    """Return codec_name, width, height, and duration (seconds, float) for the video.
-    Raises ConversionError on failure."""
+def probe_media(path: Path) -> dict:
+    """Probe a media file with a single ffprobe call, returning:
+      {
+        "video": {"codec_name": str, "width": int, "height": int, "duration": float|None},
+        "audio_languages": [lang_or_None, ...],   # index i == ffmpeg's 0:a:i
+        "subtitle_tracks": [(lang_or_None, codec_name), ...],  # index i == 0:s:i
+      }
+    Raises ConversionError if ffprobe fails or no video stream is found."""
     cmd = [
         "ffprobe", "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=codec_name,width,height:format=duration",
+        "-show_entries", "stream=codec_name,codec_type,width,height:stream_tags=language:format=duration",
         "-of", "json",
         str(path),
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         data = json.loads(result.stdout)
-        streams = data.get("streams", [])
-        if not streams:
-            raise ConversionError(path, "no video stream found")
-        info = dict(streams[0])
-        duration_str = data.get("format", {}).get("duration")
-        try:
-            info["duration"] = float(duration_str) if duration_str is not None else None
-        except ValueError:
-            info["duration"] = None
-        return info
     except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as e:
         raise ConversionError(path, f"ffprobe failed: {e}")
+
+    video_info = None
+    audio_languages = []
+    subtitle_tracks = []
+
+    for s in data.get("streams", []):
+        codec_type = s.get("codec_type")
+        lang = s.get("tags", {}).get("language")
+        lang = lang.lower() if lang else None
+
+        if codec_type == "video" and video_info is None:
+            video_info = {
+                "codec_name": s.get("codec_name", ""),
+                "width": s.get("width", 0),
+                "height": s.get("height", 0),
+            }
+        elif codec_type == "audio":
+            audio_languages.append(lang)
+        elif codec_type == "subtitle":
+            subtitle_tracks.append((lang, s.get("codec_name", "unknown")))
+
+    if video_info is None:
+        raise ConversionError(path, "no video stream found")
+
+    duration_str = data.get("format", {}).get("duration")
+    try:
+        video_info["duration"] = float(duration_str) if duration_str is not None else None
+    except ValueError:
+        video_info["duration"] = None
+
+    return {
+        "video": video_info,
+        "audio_languages": audio_languages,
+        "subtitle_tracks": subtitle_tracks,
+    }
+
+
+def probe_duration(path: Path) -> float:
+    """Return the duration (seconds) of a media file via a lightweight ffprobe call, or
+    None if duration could not be determined. Raises ConversionError if ffprobe itself
+    fails to read the file (a strong signal of a corrupt/incomplete output)."""
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+    except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as e:
+        raise ConversionError(path, f"ffprobe (post-encode validation) failed: {e}")
+
+    duration_str = data.get("format", {}).get("duration")
+    try:
+        return float(duration_str) if duration_str is not None else None
+    except ValueError:
+        return None
+
 
 
 def human_size(num_bytes: int) -> str:
@@ -140,12 +213,24 @@ def human_duration(seconds: float) -> str:
 
 
 def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_downscale: bool,
-                      encoding: str = "software", normalize_audio: bool = False,
-                      loudnorm_target: float = -16) -> list:
+                      encoding: str = "software", normalize_audio: bool = True,
+                      loudnorm_target: float = -16, audio_stream_indices: list = None,
+                      subtitle_stream_indices: list = None) -> list:
     cmd = ["ffmpeg", "-y", "-i", str(src)]
 
     if duration != -1:
         cmd += ["-t", str(duration)]
+
+    audio_stream_indices = audio_stream_indices or []
+    subtitle_stream_indices = subtitle_stream_indices or []
+
+    # Explicit stream mapping disables ffmpeg's automatic "best stream" selection,
+    # so the video stream must always be mapped too.
+    cmd += ["-map", "0:v:0"]
+    for idx in audio_stream_indices:
+        cmd += ["-map", f"0:a:{idx}"]
+    for idx in subtitle_stream_indices:
+        cmd += ["-map", f"0:s:{idx}"]
 
     if needs_downscale:
         # Scale down so neither dimension exceeds 1080p, preserving aspect ratio.
@@ -157,8 +242,13 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
     if encoding == "hardware":
         # Intel Quick Sync HEVC encoder. QSV uses -global_quality as its CRF-equivalent
         # quality knob rather than -crf. p010le is QSV's 10-bit pixel format.
+        # veryslow + look_ahead (with an explicit depth) maximize quality-per-bit for
+        # QSV. -low_power 0 forces the full-featured encode pipeline rather than the
+        # fixed-function low-power path some Intel iGPUs default to, which can
+        # otherwise silently ignore lookahead and other quality features.
         cmd += ["-pix_fmt", "p010le", "-c:v", "hevc_qsv", "-global_quality", str(crf),
-                "-preset", "slow"]
+                "-preset", "veryslow", "-low_power", "0",
+                "-look_ahead", "1", "-look_ahead_depth", "40"]
     else:
         # yuv420p10le: encode in 10-bit. Even for 8-bit sources, x265's finer
         # quantization steps in 10-bit mode noticeably improve compression
@@ -173,20 +263,28 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
         # defaults; only the integrated loudness target (I) is user-configurable.
         cmd += ["-af", f"loudnorm=I={loudnorm_target}:TP=-1.5:LRA=11"]
 
+    if subtitle_stream_indices:
+        # Passthrough: subtitle tracks are copied as-is, not re-encoded. Since the
+        # output container always matches the input's (same file extension), the
+        # original subtitle codec (subrip, ass, PGS, etc.) remains valid.
+        cmd += ["-c:s", "copy"]
+
     cmd += [str(dst)]
     return cmd
 
 
 def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: float,
                   same_location: bool, dry_run: bool = False, encoding: str = "software",
-                  normalize_audio: bool = False, loudnorm_target: float = -16):
+                  normalize_audio: bool = True, loudnorm_target: float = -16,
+                  downscale: bool = False, strip_non_english_audio: bool = False):
     """Returns (original_size, new_size, video_duration_seconds, action, downscaled) on
     success, or None if skipped/dry-run. action is 'encoded' or 'copied'. downscaled is
     True if the file was scaled down from >1080p. video_duration_seconds is None if the
     file was small enough to skip probing entirely. Raises ConversionError if ffprobe or
     ffmpeg fails."""
     min_size_bytes = min_size_mb * 1024 * 1024
-    src_size = src.stat().st_size
+    src_stat = src.stat()
+    src_size = src_stat.st_size
 
     if src_size < min_size_bytes:
         if same_location:
@@ -203,11 +301,12 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                      f"{human_size(src_size)}): {src} -> {dst}")
         return (src_size, src_size, None, "copied", False)
 
-    info = probe_video(src)
-    codec = info.get("codec_name", "")
-    width = info.get("width", 0)
-    height = info.get("height", 0)
-    video_duration = info.get("duration")
+    media = probe_media(src)
+    video_info = media["video"]
+    codec = video_info.get("codec_name", "")
+    width = video_info.get("width", 0)
+    height = video_info.get("height", 0)
+    video_duration = video_info.get("duration")
 
     if codec == "hevc":
         if same_location:
@@ -221,7 +320,59 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         logging.info(f"COPIED (already H.265): {src} -> {dst}")
         return (src_size, src_size, video_duration, "copied", False)
 
-    needs_downscale = width > 1920 or height > 1080
+    needs_downscale = downscale and (width > 1920 or height > 1080)
+
+    audio_languages = media["audio_languages"]
+    if audio_languages:
+        track_list = ", ".join(f"{i}:{lang or 'und'}" for i, lang in enumerate(audio_languages))
+        logging.info(f"AUDIO TRACKS FOUND ({len(audio_languages)}): {track_list}: {src}")
+    else:
+        logging.info(f"AUDIO TRACKS FOUND: none: {src}")
+
+    subtitle_tracks = media["subtitle_tracks"]
+    if subtitle_tracks:
+        sub_list = ", ".join(f"{i}:{lang or 'und'} ({sub_codec})"
+                              for i, (lang, sub_codec) in enumerate(subtitle_tracks))
+        logging.info(f"SUBTITLE TRACKS FOUND ({len(subtitle_tracks)}): {sub_list}: {src}")
+    else:
+        logging.info(f"SUBTITLE TRACKS FOUND: none: {src}")
+
+    if not strip_non_english_audio:
+        keep_audio_indices = list(range(len(audio_languages)))
+        if audio_languages:
+            logging.info(f"AUDIO: strip-no-english-audio is off; keeping all "
+                         f"{len(audio_languages)} track(s): {src}")
+    elif audio_languages:
+        primary_lang = audio_languages[0]
+        if primary_lang in ("eng", "en"):
+            keep_audio_indices = [i for i, lang in enumerate(audio_languages) if lang in ("eng", "en")]
+            if not keep_audio_indices:
+                keep_audio_indices = [0]  # safety net; shouldn't happen since primary is English
+        else:
+            keep_audio_indices = list(range(len(audio_languages)))
+
+        kept_str = ", ".join(f"{i}:{audio_languages[i] or 'und'}" for i in keep_audio_indices)
+        dropped = [i for i in range(len(audio_languages)) if i not in keep_audio_indices]
+        dropped_str = ", ".join(f"{i}:{audio_languages[i] or 'und'}" for i in dropped) if dropped else "none"
+        reason = (f"main track is English" if primary_lang in ("eng", "en")
+                  else f"main track is not English (tagged '{primary_lang}')" if primary_lang
+                  else "main track is untagged/unknown language")
+        logging.info(f"AUDIO: {reason}; keeping [{kept_str}]; discarding [{dropped_str}]: {src}")
+    else:
+        keep_audio_indices = []
+
+    # Subtitle/CC tracks: always carry through every English-tagged track; drop the
+    # rest (including untagged, since it can't be confirmed English).
+    keep_subtitle_indices = [i for i, (lang, codec) in enumerate(subtitle_tracks)
+                              if lang in ("eng", "en")]
+    if subtitle_tracks:
+        kept_str = (", ".join(f"{i}:{subtitle_tracks[i][0] or 'und'}" for i in keep_subtitle_indices)
+                    if keep_subtitle_indices else "none")
+        dropped = [i for i in range(len(subtitle_tracks)) if i not in keep_subtitle_indices]
+        dropped_str = (", ".join(f"{i}:{subtitle_tracks[i][0] or 'und'}" for i in dropped)
+                       if dropped else "none")
+        logging.info(f"SUBTITLE: keeping English track(s) [{kept_str}]; "
+                     f"discarding [{dropped_str}]: {src}")
 
     log_action = "[DRY RUN] WOULD ENCODE" if dry_run else "ENCODING"
     logging.info(f"{log_action}: {src} -> {dst} (codec={codec}, {width}x{height}, "
@@ -232,7 +383,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
 
     if dry_run:
         cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
-                                normalize_audio, loudnorm_target)
+                                normalize_audio, loudnorm_target, keep_audio_indices,
+                                keep_subtitle_indices)
         logging.info(f"[DRY RUN] Command: {' '.join(cmd)}")
         return None
 
@@ -245,7 +397,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
 
     encode_target.parent.mkdir(parents=True, exist_ok=True)
     cmd = build_ffmpeg_cmd(src, encode_target, crf, duration, needs_downscale, encoding,
-                            normalize_audio, loudnorm_target)
+                            normalize_audio, loudnorm_target, keep_audio_indices,
+                            keep_subtitle_indices)
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
@@ -254,8 +407,32 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         raise ConversionError(src, f"ffmpeg exited with code {result.returncode}: "
                                     f"{result.stderr[-2000:]}")
 
+    # Post-encode validation: confirm the output's duration roughly matches the
+    # source's before trusting it (and, for in-place mode, before it ever overwrites
+    # the original). Skipped for test/partial encodes (--duration), since those are
+    # intentionally shorter than the source.
+    if duration == -1 and video_duration is not None:
+        output_duration = probe_duration(encode_target)
+        if output_duration is None:
+            if encode_target.exists():
+                encode_target.unlink(missing_ok=True)
+            raise ConversionError(src, "post-encode validation failed: could not "
+                                        "determine output duration")
+        tolerance = max(2.0, 0.02 * video_duration)
+        if abs(output_duration - video_duration) > tolerance:
+            if encode_target.exists():
+                encode_target.unlink(missing_ok=True)
+            raise ConversionError(src, f"post-encode validation failed: source duration "
+                                        f"{video_duration:.1f}s vs output duration "
+                                        f"{output_duration:.1f}s (tolerance {tolerance:.1f}s)")
+        logging.info(f"VALIDATED: output duration {output_duration:.1f}s matches source "
+                     f"{video_duration:.1f}s: {src}")
+
     if same_location:
         os.replace(encode_target, dst)  # dst == src here; atomic swap-in
+
+    # Preserve the source file's modification/access time on the newly encoded output.
+    os.utime(dst, (src_stat.st_atime, src_stat.st_mtime))
 
     orig_size = src_size
     new_size = dst.stat().st_size if dst.exists() else 0
@@ -270,6 +447,14 @@ def main():
 
     if not args.input_folder.is_dir():
         print(f"Input folder does not exist: {args.input_folder}", file=sys.stderr)
+        sys.exit(1)
+
+    video_extensions = ("*.mp4", "*.MP4", "*.mkv", "*.MKV")
+    mp4_files = sorted(set().union(*(args.input_folder.rglob(pat) for pat in video_extensions)))
+
+    if not mp4_files:
+        print(f"No .mp4 or .mkv files found in: {args.input_folder}\n", file=sys.stderr)
+        build_parser().print_help()
         sys.exit(1)
 
     if args.duration != -1 and args.output_folder is None:
@@ -300,10 +485,10 @@ def main():
                  f"Normalize audio: {'yes (' + str(args.loudnorm_target) + ' LUFS)' if args.normalize_audio else 'no'} "
                  f"Duration limit: {'none' if args.duration == -1 else f'{args.duration}s'} "
                  f"Min size: {args.min_size_mb}MB "
-                 f"Data limit: {'none' if args.limit == -1 else f'{args.limit}GB'}")
+                 f"Data limit: {'none' if args.limit == -1 else f'{args.limit}GB'} "
+                 f"Downscale to 1080p: {'yes' if args.downscale else 'no'} "
+                 f"Strip non-English audio: {'yes' if args.strip_no_english_audio else 'no'}")
 
-    video_extensions = ("*.mp4", "*.MP4", "*.mkv", "*.MKV")
-    mp4_files = sorted(set().union(*(args.input_folder.rglob(pat) for pat in video_extensions)))
     logging.info(f"Found {len(mp4_files)} .mp4/.mkv file(s) to process.")
 
     total_orig = 0
@@ -354,7 +539,8 @@ def main():
         try:
             result = process_file(src, dst, args.crf, args.duration, args.min_size_mb,
                                    same_location, args.dry_run, args.encoding,
-                                   args.normalize_audio, args.loudnorm_target)
+                                   args.normalize_audio, args.loudnorm_target, args.downscale,
+                                   args.strip_no_english_audio)
         except ConversionError as e:
             failed_path = e.file.resolve()
             logging.error(f"CONVERSION FAILED: {failed_path}\n{e.reason}")
