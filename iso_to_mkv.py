@@ -133,7 +133,7 @@ IMPORTANT ASSUMPTIONS / CAVEATS (please read before relying on this in prod)
    discarded; everything else - the episodes AND any bonus content
    outside the cluster - is kept for extraction as normal. This is always
    logged when it fires; nothing is discarded silently. Disable with
-   --detect-playall=False if a disc's real structure ever fights with
+   --no-detect-playall if a disc's real structure ever fights with
    this.
 
 Test this script with --dry-run against your library before turning it
@@ -249,16 +249,6 @@ MIN_OUTPUT_FILE_BYTES = 1_000_000  # 1 MB
 # --------------------------------------------------------------------------
 # Small helpers
 # --------------------------------------------------------------------------
-
-def str2bool(value: str) -> bool:
-    if isinstance(value, bool):
-        return value
-    v = value.strip().lower()
-    if v in ("true", "t", "yes", "y", "1"):
-        return True
-    if v in ("false", "f", "no", "n", "0"):
-        return False
-    raise argparse.ArgumentTypeError(f"Expected a boolean value (True/False), got: {value!r}")
 
 
 def human_bytes(n: float) -> str:
@@ -960,7 +950,7 @@ def process_iso(
     stats.isos_converted += 1
 
     if args.keep_source:
-        logger.info("Keeping source file (--keep-source=True)", iso_path)
+        logger.info("Keeping source file (--keep-source)", iso_path)
     else:
         if args.dry_run:
             logger.info("[DRY RUN] Would delete source ISO file", iso_path)
@@ -985,10 +975,22 @@ def compile_regex_arg(value: str) -> re.Pattern:
         raise argparse.ArgumentTypeError(f"Invalid regular expression {value!r}: {e}")
 
 
+class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
+    """Same as ArgumentDefaultsHelpFormatter, except --no-detect-playall
+    shows "(default: enabled)" instead of the literal "(default: True)" -
+    which reads as if the disabling flag were itself on by default, when
+    it's actually detect_playall (the setting it controls) that defaults
+    to True/enabled."""
+    def _get_help_string(self, action):
+        if action.dest == "detect_playall":
+            return action.help + " (default: enabled)"
+        return super()._get_help_string(action)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Batch-convert .iso files to .mkv using makemkvcon.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=_HelpFormatter,
     )
     p.add_argument("-i", "--input", default=".", help="Input folder to search recursively for .iso files")
     p.add_argument("-o", "--output", default=".", help="Output root folder")
@@ -1001,7 +1003,7 @@ def parse_args() -> argparse.Namespace:
         help="Log file path",
     )
     p.add_argument(
-        "--keep-source", type=str2bool, default=False, metavar="{True,False}",
+        "--keep-source", action="store_true",
         help="Keep the source ISO after a successful conversion instead of deleting it",
     )
     p.add_argument("--dry-run", action="store_true", help="Show what would happen without changing anything")
@@ -1033,8 +1035,9 @@ def parse_args() -> argparse.Namespace:
         help="Force disc-type classification for this run instead of using the size heuristic",
     )
     p.add_argument(
-        "--detect-playall", type=str2bool, default=True, metavar="{True,False}",
-        help="Detect and exclude a 'Play All' concatenation title (common on TV-show DVDs)",
+        "--no-detect-playall", dest="detect_playall", action="store_false", default=True,
+        help="Disable detection of a 'Play All' concatenation title (common on TV-show DVDs); "
+             "on by default",
     )
     p.add_argument(
         "--playall-tolerance-sec", type=float, default=30.0, metavar="SECONDS",
