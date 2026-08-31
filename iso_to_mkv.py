@@ -171,6 +171,14 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        process cleanly, then still prints the summary-so-far and closes
        the log, rather than leaving an orphaned process or a truncated
        log file.
+     - Every makemkvcon command actually run (both the `info` scan and
+       each title's `mkv` extraction) has its verbatim command line
+       written to the log file, tagged [CMD] - but never printed to the
+       console, which would just be noise for a normal run. This is
+       purely for troubleshooting (e.g. spotting a bad path or quoting
+       issue after the fact); dry-run's own "[DRY RUN] Would run: ..."
+       preview is unrelated and still prints to the console as before,
+       since nothing is actually happening in that mode.
 
 8. --include=REGEX / --exclude=REGEX (mutually exclusive - argparse
    rejects passing both) filter the discovered ISO list before any
@@ -375,6 +383,14 @@ class DualLogger:
         print(f"{ts} [{level}]{console_target} {message}")
         self._raw(f"{ts} [{level}]{file_target} {message}")
 
+    def file_only(self, level: str, message: str, iso_path: Optional[Path] = None) -> None:
+        """Same formatting as _log, but never printed to the console - for
+        detail (like a verbatim command line) that's worth having in the
+        log for troubleshooting but would just be noise on-screen."""
+        ts = self._timestamp()
+        file_target = f" {iso_path}:" if iso_path is not None else ""
+        self._raw(f"{ts} [{level}]{file_target} {message}")
+
     def info(self, message: str, iso_path: Optional[Path] = None) -> None:
         self._log("INFO", message, iso_path)
 
@@ -487,7 +503,9 @@ class Title:
     info_text: Optional[str] = None  # attribute 30; may contain "(FPL_MainFeature)"
 
 
-def get_disc_titles(makemkvcon_bin: str, iso_path: Path) -> Tuple[int, str, Dict[int, Title], bool, bool]:
+def get_disc_titles(
+    makemkvcon_bin: str, iso_path: Path, logger: "DualLogger"
+) -> Tuple[int, str, Dict[int, Title], bool, bool]:
     """Run `makemkvcon info` on the ISO and parse the title table.
 
     Returns (returncode, raw_output, titles, jre_engaged, jre_required_missing).
@@ -499,6 +517,7 @@ def get_disc_titles(makemkvcon_bin: str, iso_path: Path) -> Tuple[int, str, Dict
     simply being False, which is also true for every disc that never
     needed Java at all."""
     cmd = [makemkvcon_bin, "-r", "--cache=1", "info", f"iso:{iso_path}"]
+    logger.file_only("CMD", " ".join(cmd), iso_path)
     rc, output = run_cmd(cmd)
     titles: Dict[int, Title] = {}
     jre_engaged = "Using Java runtime" in output
@@ -687,7 +706,7 @@ def process_iso(
     disc_type = classify_disc(iso_path, args.dvd_max_size_gb * 1_000_000_000, disc_type_override)
     logger.info(f"Classified as {disc_type} ({human_bytes(iso_path.stat().st_size)})", iso_path)
 
-    rc, output, titles, jre_engaged, jre_required_missing = get_disc_titles(args.makemkvcon, iso_path)
+    rc, output, titles, jre_engaged, jre_required_missing = get_disc_titles(args.makemkvcon, iso_path, logger)
     if rc != 0 or not titles:
         logger.error(f"Failed to read title information (exit code {rc})", iso_path)
         logger.append_raw_to_file(output)
@@ -763,6 +782,10 @@ def process_iso(
 
         else:
             # --- Signal 2 (fallback): duration-clustering heuristic ---
+            logger.info(
+                "MakeMKV did not identify a main title via (FPL_MainFeature) for this disc",
+                iso_path,
+            )
             candidates = [tid for tid, t in titles.items() if t.duration_sec >= min_length_sec]
 
             if suspected:
@@ -867,6 +890,7 @@ def process_iso(
             break  # further titles for this ISO won't fare any better
 
         before_snapshot = snapshot_output_dir(out_dir)
+        logger.file_only("CMD", " ".join(cmd), iso_path)
         progress_cb = make_progress_printer(iso_path.name, tid)
         rc, mkv_output = run_cmd_with_progress(cmd, on_progress=progress_cb)
         if progress_cb is not None:
