@@ -88,40 +88,28 @@ IMPORTANT ASSUMPTIONS / CAVEATS (please read before relying on this in prod)
    misclassified as DVD by this heuristic; use --disc-type=bluray for
    batches like that.
 
-3. "Original audio language" is approximated as the language of the
-   FIRST audio track listed for a title (MakeMKV conventionally lists
-   the disc's native/original audio track first, before dubs). If that
-   track has no usable language tag, English is used as the documented
-   fallback, and this is logged.
-
-3a. English subtitle selection keeps EVERY subtitle track tagged 'eng',
-   not just one - so if a disc has both a plain English subtitle track
-   and a separate English SDH/CC track, both are kept, since SDH/CC text
-   isn't always identical to the plain subtitle (it often adds sound
-   descriptions, speaker labels, etc). MakeMKV's own confirmed naming for
-   these includes "Text (Lossy Conversion)" for a Blu-ray CC track pulled
-   via ccextractor, and "SDH Subtitles" - see MakeMKV's forums. As a
-   fallback ONLY for a subtitle track with NO language tag at all (an
-   explicitly non-English tag is still trusted over the name), a name
-   matching CC_SDH_NAME_RE is treated as English too, and this is logged
-   as a caveat since it's a heuristic, not a certainty. True DVD "Line 21"
-   closed captions are a different thing entirely - they're embedded in
-   the video signal itself and MakeMKV doesn't expose them as a separate
-   track at all, so they're automatically preserved as part of the video
-   stream with nothing for this script to do.
-
-4. Track selection is done by passing an explicit comma-separated list
-   of track IDs as the final argument to `makemkvcon mkv`, rather than
-   using a MakeMKV settings profile. This is supported by makemkvcon.
+3. Every audio and subtitle track on each extracted title is kept as-is -
+   this script does NOT attempt any language filtering or track
+   selection. That used to be attempted in two different ways (a bogus
+   trailing CLI argument to makemkvcon, then a two-pass mkvmerge remux),
+   but both were dropped: makemkvcon has no CLI mechanism to select
+   tracks at all (confirmed by a real failure and corroborated by
+   MakeMKV's own forums, where this has been a known, unaddressed
+   limitation since at least 2011 - "Can't extract specific audio files.
+   Can't specify subtitles."), and the mkvmerge-based workaround added
+   real cost (a second remux pass, doubled disk/time, an extra
+   dependency, and a subtle trust issue where mkvmerge's own exit code
+   doesn't reliably indicate whether a selection actually succeeded) for
+   something that's simpler to handle in a later encoding pass instead
+   (e.g. HandBrakeCLI, which already supports audio/subtitle track
+   selection as part of encoding). So: this script's job stops at
+   "extract each wanted title losslessly, with everything on it" -
+   language/track curation is intentionally left to whatever processes
+   the .mkv files next.
 
 5. Discovery, extraction, min-length filtering, and logging are otherwise
    identical for DVD and Blu-ray - only the obfuscation-detection section
-   (point 2/2a-DVD) actually branches by disc type. DVD language metadata
-   is also frequently missing or incomplete (much more so than Blu-ray),
-   which can make the original-audio and English-subtitle detection below
-   fall back more often; when that happens the script logs a WARNING per
-   title rather than silently guessing, so watch the warning count on DVD
-   batches and spot check flagged titles.
+   (point 2/2a-DVD) actually branches by disc type.
 
 6. "Play All" concatenation title detection (common on TV-show DVDs, where
    one title is every episode stitched back-to-back so a DVD player can
@@ -219,12 +207,9 @@ DEFAULT_LOG = "./convert.log"
 
 # MakeMKV robot-mode attribute IDs (see module docstring, point 1)
 ATTR_NAME = 2
-ATTR_LANGCODE = 3
-ATTR_LANGNAME = 4
 ATTR_DURATION = 9
 ATTR_DISKSIZE_BYTES = 11
 ATTR_INFO = 30  # title "info/comment" text; carries "(FPL_MainFeature)" when JRE identifies it
-ATTR_TYPE = 1  # stream attribute: "Video" / "Audio" / "Subtitles"
 
 # Exact marker MakeMKV writes into a title's info text when its BD-Java
 # analysis (requires JRE) has identified that title as the main feature.
@@ -241,14 +226,6 @@ FPL_SUBSTRING = "FPL_MainFeature"
 # "Using Java runtime" success line, which also doesn't appear on discs
 # that never needed Java in the first place.
 JRE_MISSING_MARKER = "This disc requires Java runtime (JRE), but none was found"
-
-# Matches MakeMKV's own naming for CC/SDH-style subtitle tracks - confirmed
-# real examples from MakeMKV's forums include "Text (Lossy Conversion)"
-# (what ccextractor-derived Blu-ray CC tracks get named) and "SDH
-# Subtitles". Used only as a fallback signal when a subtitle track's
-# language tag is missing - if it's already tagged (with any language),
-# the tag is trusted over the name.
-CC_SDH_NAME_RE = re.compile(r"\b(cc|sdh|closed.?caption|lossy conversion)\b", re.IGNORECASE)
 
 DVD_MAX_SIZE_GB_DEFAULT = 8.5  # decimal GB (10**9 bytes), matching how DVD-9 capacity is marketed
 DISC_TYPE_DVD = "DVD"
@@ -506,25 +483,16 @@ def make_progress_printer(iso_name: str, title_id: int):
 
 
 @dataclass
-class Stream:
-    stream_type: Optional[str] = None
-    lang_code: Optional[str] = None
-    lang_name: Optional[str] = None
-    name: Optional[str] = None  # attribute 2; e.g. "Text (Lossy Conversion)" for ccextractor'd CC tracks
-
-
-@dataclass
 class Title:
     title_id: int
     duration_sec: float = 0.0
     size_bytes: int = 0
     name: Optional[str] = None
     info_text: Optional[str] = None  # attribute 30; may contain "(FPL_MainFeature)"
-    streams: Dict[int, Stream] = field(default_factory=dict)
 
 
 def get_disc_titles(makemkvcon_bin: str, iso_path: Path) -> Tuple[int, str, Dict[int, Title], bool, bool]:
-    """Run `makemkvcon info` on the ISO and parse the title/stream table.
+    """Run `makemkvcon info` on the ISO and parse the title table.
 
     Returns (returncode, raw_output, titles, jre_engaged, jre_required_missing).
     jre_engaged is True if makemkvcon reported it launched the Java runtime
@@ -563,26 +531,6 @@ def get_disc_titles(makemkvcon_bin: str, iso_path: Path) -> Tuple[int, str, Dict
                 t.name = value
             elif code == ATTR_INFO:
                 t.info_text = value
-
-        elif line.startswith("SINFO:"):
-            fields = csv_fields(line[len("SINFO:"):])
-            if len(fields) < 5:
-                continue
-            try:
-                tid, sid, code = int(fields[0]), int(fields[1]), int(fields[2])
-            except ValueError:
-                continue
-            value = fields[4]
-            t = titles.setdefault(tid, Title(title_id=tid))
-            s = t.streams.setdefault(sid, Stream())
-            if code == ATTR_TYPE:
-                s.stream_type = value
-            elif code == ATTR_LANGCODE:
-                s.lang_code = value
-            elif code == ATTR_LANGNAME:
-                s.lang_name = value
-            elif code == ATTR_NAME:
-                s.name = value
 
     return rc, output, titles, jre_engaged, jre_required_missing
 
@@ -672,99 +620,6 @@ def detect_playall_title(
     if abs(longest_duration - cluster_sum) <= effective_tolerance:
         return longest_tid, sorted(cluster)
     return None
-
-
-def select_tracks(title: Title) -> Tuple[List[int], str, List[str]]:
-    """Pick video + original-language audio + English subtitles.
-    Returns (sorted track id list, human readable original-language label,
-    list of caveat strings worth logging as warnings - e.g. when language
-    metadata was missing/unreliable, which is far more common on DVDs
-    than on Blu-rays)."""
-    caveats: List[str] = []
-    video_ids = sorted(sid for sid, s in title.streams.items() if s.stream_type == "Video")
-    audio_items = sorted(
-        ((sid, s) for sid, s in title.streams.items() if s.stream_type == "Audio"),
-        key=lambda x: x[0],
-    )
-    subtitle_items = [
-        (sid, s) for sid, s in title.streams.items()
-        if s.stream_type in ("Subtitles", "Subtitle")
-    ]
-
-    fallback_used = False
-    orig_lang = None
-    if audio_items:
-        first_code = (audio_items[0][1].lang_code or "").strip().lower()
-        if first_code and first_code not in ("und", "undetermined", ""):
-            orig_lang = first_code
-
-    if orig_lang is None:
-        orig_lang = "eng"
-        fallback_used = True
-
-    selected_audio_ids = [sid for sid, s in audio_items if (s.lang_code or "").strip().lower() == orig_lang]
-
-    if not selected_audio_ids and audio_items:
-        eng_ids = [sid for sid, s in audio_items if (s.lang_code or "").strip().lower() == "eng"]
-        if eng_ids:
-            selected_audio_ids = eng_ids
-            orig_lang = "eng"
-            fallback_used = True
-        else:
-            # Last resort: keep the first audio track rather than none at all.
-            # No language tag matched anything - this is common on DVDs with
-            # incomplete IFO metadata, so flag it rather than assuming we
-            # guessed right.
-            selected_audio_ids = [audio_items[0][0]]
-            caveats.append(
-                "No audio track had a usable language tag; kept the first audio "
-                "track without language confirmation (common on DVDs with "
-                "incomplete metadata) - please spot check this title"
-            )
-
-    subtitle_eng_ids = [sid for sid, s in subtitle_items if (s.lang_code or "").strip().lower() == "eng"]
-
-    # Untagged CC/SDH tracks: MakeMKV's own generated names for these
-    # (e.g. "Text (Lossy Conversion)" for a ccextractor'd Blu-ray CC track,
-    # or "SDH Subtitles") are used as a fallback ONLY when the track has no
-    # language tag at all - an explicitly non-English tag is still trusted
-    # over the name. This exists specifically so an English CC/SDH track
-    # doesn't silently get dropped alongside a differently-tagged regular
-    # English subtitle track: both are wanted, since CC/SDH text isn't
-    # always identical to the plain subtitle track.
-    untagged_cc_ids = [
-        sid for sid, s in subtitle_items
-        if sid not in subtitle_eng_ids
-        and not (s.lang_code or "").strip()
-        and s.name and CC_SDH_NAME_RE.search(s.name)
-    ]
-    if untagged_cc_ids:
-        subtitle_eng_ids = subtitle_eng_ids + untagged_cc_ids
-        caveats.append(
-            f"{len(untagged_cc_ids)} subtitle track(s) named like CC/SDH had no language tag - "
-            "included anyway based on the track name, alongside any already-tagged English "
-            "subtitle track(s) - please spot check this title"
-        )
-
-    if subtitle_items and not subtitle_eng_ids:
-        caveats.append(
-            f"{len(subtitle_items)} subtitle track(s) present but none tagged 'eng' - "
-            "no subtitles were selected (check whether one is actually English but "
-            "untagged, common on DVDs)"
-        )
-
-    track_ids = sorted(set(video_ids) | set(selected_audio_ids) | set(subtitle_eng_ids))
-
-    lang_display = None
-    for sid, s in audio_items:
-        if sid in selected_audio_ids and s.lang_name:
-            lang_display = s.lang_name
-            break
-    label = lang_display or orig_lang
-    if fallback_used:
-        label += " (fallback)"
-
-    return track_ids, label, caveats
 
 
 def unique_output_dir(output_root: Path, stem: str, used: set) -> Path:
@@ -976,19 +831,17 @@ def process_iso(
     all_ok = True
     for tid in sorted(candidates):
         title = titles[tid]
-        track_ids, lang_label, caveats = select_tracks(title)
-        for caveat in caveats:
-            logger.warning(f"Title {tid}: {caveat}", iso_path)
-            stats.warnings += 1
         logger.info(
-            f"Extracting title {tid} (duration {format_duration(title.duration_sec)}, "
-            f"original audio: {lang_label}) -> {out_dir}",
+            f"Extracting title {tid} (duration {format_duration(title.duration_sec)}) -> {out_dir}",
             iso_path,
         )
 
+        # Every audio/subtitle track on the title is extracted as-is - see
+        # docstring point 3 for why this script doesn't attempt track
+        # filtering (makemkvcon has no CLI mechanism for it at all, and a
+        # prior mkvmerge-based workaround was deliberately removed in
+        # favor of leaving track curation to a later encoding pass).
         cmd = [args.makemkvcon, "-r", "--cache=1", "mkv", f"iso:{iso_path}", str(tid), str(out_dir)]
-        if track_ids:
-            cmd.append(",".join(str(t) for t in track_ids))
 
         if args.dry_run:
             logger.info(f"[DRY RUN] Would run: {' '.join(cmd)}", iso_path)
@@ -998,8 +851,7 @@ def process_iso(
         # Checked per-title, not just once per ISO, since free space keeps
         # dropping across a multi-title disc. title.size_bytes (MakeMKV's
         # own reported size for that title) is used as the required-space
-        # estimate; it's normally a conservative overestimate since we
-        # typically drop unwanted audio/subtitle tracks.
+        # estimate.
         required_bytes = title.size_bytes if title.size_bytes > 0 else iso_path.stat().st_size
         space_error = check_free_space(out_dir, output_root, required_bytes, args.free_space_margin_pct)
         if space_error:
@@ -1028,11 +880,13 @@ def process_iso(
             name for name, size in after_snapshot.items()
             if before_snapshot.get(name) != size
         ]
-        produced_output = any(
-            name.lower().endswith(".mkv") and after_snapshot[name] >= MIN_OUTPUT_FILE_BYTES
-            for name in new_or_changed
+        qualifying_new_mkvs = sorted(
+            (name for name in new_or_changed
+             if name.lower().endswith(".mkv") and after_snapshot[name] >= MIN_OUTPUT_FILE_BYTES),
+            key=lambda name: after_snapshot[name],
+            reverse=True,
         )
-        if not produced_output:
+        if not qualifying_new_mkvs:
             logger.error(
                 f"makemkvcon reported success for title {tid} but no new/updated .mkv file "
                 f"of meaningful size was found in {out_dir} - treating as a failure",
@@ -1042,6 +896,13 @@ def process_iso(
             stats.conversions_error += 1
             all_ok = False
             continue
+        if len(qualifying_new_mkvs) > 1:
+            logger.warning(
+                f"Title {tid}: expected one output .mkv file but found {len(qualifying_new_mkvs)} - "
+                f"using only the largest ({qualifying_new_mkvs[0]})",
+                iso_path,
+            )
+            stats.warnings += 1
 
         warn_line = looks_like_warning(mkv_output)
         if warn_line:
