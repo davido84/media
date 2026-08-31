@@ -363,8 +363,8 @@ class DualLogger:
     def __init__(self, log_path: Path):
         self.log_path = log_path
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._fh = open(self.log_path, "a", encoding="utf-8")
-        self._raw(f"\n==== Run started {datetime.now().isoformat(timespec='seconds')} ====")
+        self._fh = open(self.log_path, "w", encoding="utf-8")
+        self._raw(f"==== Run started {datetime.now().isoformat(timespec='seconds')} ====")
 
     def _timestamp(self) -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
