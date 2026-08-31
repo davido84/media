@@ -47,6 +47,12 @@ IMPORTANT ASSUMPTIONS / CAVEATS (please read before relying on this in prod)
         (install a JRE, or point MakeMKV at one via app_Java in
         ~/.MakeMKV/settings.conf), the latter is simply a disc that never
         needed BD-Java in the first place.
+        When this signal is what identified the title (not this script's
+        own duration-based fallback below), that title's output file is
+        named "main_title.mkv" instead of MakeMKV's default name, so other
+        tools working on the output folder afterward (organize_media.py,
+        a HandBrake batch script, etc.) can trust the filename rather than
+        re-deriving which title was the main feature themselves.
 
      b) A duration-clustering fallback, used only when no unambiguous
         FPL_MainFeature marker is found. This looks for a very large
@@ -698,6 +704,13 @@ def process_iso(
         stats.conversions_error += 1
         return ProcessResult(info_scan_failed=True)
 
+    # Set below only when MakeMKV's own (FPL_MainFeature) marker identifies
+    # a title - not when this script's own duration-based fallback picks
+    # one. That title's output gets named "main_title.mkv" (see the
+    # per-title loop) so other tools can trust the filename rather than
+    # re-deriving which title was the main feature.
+    fpl_identified_main_tid: Optional[int] = None
+
     if disc_type == DISC_TYPE_DVD:
         # Blu-ray-specific detection (BD-Java / FPL_MainFeature, and the
         # duration-clustering fallback that exists to catch Blu-ray-style
@@ -756,6 +769,7 @@ def process_iso(
                 iso_path,
             )
             candidates = [main_tid]
+            fpl_identified_main_tid = main_tid
 
         else:
             # --- Signal 2 (fallback): duration-clustering heuristic ---
@@ -845,6 +859,8 @@ def process_iso(
 
         if args.dry_run:
             logger.info(f"[DRY RUN] Would run: {' '.join(cmd)}", iso_path)
+            if tid == fpl_identified_main_tid:
+                logger.info(f"[DRY RUN] Would rename output to main_title.mkv", iso_path)
             continue
 
         # --- Free-space check (safety enhancement 3) ---
@@ -908,6 +924,31 @@ def process_iso(
         if warn_line:
             logger.warning(f"Title {tid}: {warn_line}", iso_path)
             stats.warnings += 1
+
+        # If MakeMKV's own (FPL_MainFeature) analysis identified this title
+        # as the main feature, name its output "main_title.mkv" so other
+        # scripts (organize_media.py, HandBrake batch scripts, etc.) can
+        # trust the filename instead of re-deriving which title was main.
+        # Not done for this script's own duration-based fallback guesses -
+        # only for MakeMKV's own identification.
+        if tid == fpl_identified_main_tid:
+            src_path = out_dir / qualifying_new_mkvs[0]
+            dest_path = out_dir / "main_title.mkv"
+            if src_path != dest_path:
+                if dest_path.exists():
+                    logger.warning(
+                        f"Title {tid}: wanted to name output 'main_title.mkv' but that file "
+                        f"already exists in {out_dir} - leaving it as {qualifying_new_mkvs[0]}",
+                        iso_path,
+                    )
+                    stats.warnings += 1
+                else:
+                    try:
+                        src_path.replace(dest_path)
+                        logger.info(f"Title {tid}: renamed output to main_title.mkv", iso_path)
+                    except OSError as e:
+                        logger.warning(f"Title {tid}: failed to rename output to main_title.mkv: {e}", iso_path)
+                        stats.warnings += 1
 
         stats.conversions_success += 1
 
