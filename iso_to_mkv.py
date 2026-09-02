@@ -220,7 +220,6 @@ script. See organize_media.py's own docstring for details.
 """
 
 import argparse
-import csv
 import json
 import re
 import shutil
@@ -315,12 +314,45 @@ def parse_mkv_duration(value: str) -> float:
 
 
 def csv_fields(payload: str) -> List[str]:
-    """Parse a single CSV-style line (MakeMKV robot output is CSV after the
-    leading TAG: prefix, with quoted values)."""
-    try:
-        return next(csv.reader([payload]))
-    except StopIteration:
-        return []
+    """Parse a single line of MakeMKV robot-mode output (the part after the
+    leading TAG: prefix) into fields.
+
+    This is deliberately NOT run through Python's csv module. MakeMKV's
+    robot-mode format looks CSV-like but uses its own escaping convention
+    inside quoted fields: an embedded double-quote or backslash is escaped
+    with a leading backslash (\\" and \\\\), not by doubling the quote
+    ("") the way RFC-4180 (and csv.reader) expects. A disc/title name or
+    format string containing a quote or backslash would make csv.reader
+    treat the escaped \\" as an early close-quote and mis-split everything
+    after it in that line. This parser follows MakeMKV's own convention
+    instead, so those fields come through intact."""
+    fields: List[str] = []
+    i, n = 0, len(payload)
+    while True:
+        if i < n and payload[i] == '"':
+            i += 1  # skip opening quote
+            buf: List[str] = []
+            while i < n and payload[i] != '"':
+                if payload[i] == "\\" and i + 1 < n and payload[i + 1] in ("\\", '"'):
+                    buf.append(payload[i + 1])
+                    i += 2
+                else:
+                    buf.append(payload[i])
+                    i += 1
+            i += 1  # skip closing quote (if the field was well-formed)
+            fields.append("".join(buf))
+        else:
+            # Unquoted field - not normally emitted by MakeMKV for string
+            # values, but tolerated here rather than assumed impossible.
+            j = payload.find(",", i)
+            end = n if j == -1 else j
+            fields.append(payload[i:end])
+            i = end
+        if i < n and payload[i] == ",":
+            i += 1
+            continue
+        break
+    return fields
 
 
 def classify_disc(iso_path: Path, max_dvd_bytes: float, override: Optional[str]) -> str:
