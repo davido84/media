@@ -157,11 +157,22 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        --free-space-margin-pct headroom), so a nearly-full output drive
        fails fast on one title instead of partway through a multi-hour
        extraction.
-     - Resume support: if an ISO's natural output folder already
-       contains at least as many real .mkv files as the number of
-       titles this run would extract, the ISO is skipped entirely
-       (logged, counted separately in the summary) - this is the
-       default behavior. This is whole-ISO granularity only - an
+     - Resume support: after a fully successful conversion, a small
+       manifest file (.iso_to_mkv_manifest.json) is written into the
+       ISO's output folder, recording the source ISO's size/mtime, the
+       exact set of title IDs extracted, the output filenames, and
+       every argument that could affect title selection (--min-length,
+       --disc-type, --obfuscation-threshold, the play-all settings,
+       etc.). On a later run, an ISO is skipped as "already converted"
+       only if that manifest exists AND matches this exact ISO, this
+       exact candidate-title selection, and these exact settings, AND
+       every recorded output file is still present and still looks like
+       real output. This is deliberately stricter than just counting
+       .mkv files in the folder: a folder that happens to hold the
+       "right number" of files from a *different* configuration (a
+       looser --min-length, a forced --disc-type, etc.) is no longer
+       mistaken for a completed run of the current one - it's logged
+       and redone instead. This is whole-ISO granularity only - an
        interrupted multi-title disc is safely redone in full rather
        than partially resumed. Force a redo with -f/--force.
      - Title extraction streams makemkvcon's progress output live
@@ -210,6 +221,7 @@ script. See organize_media.py's own docstring for details.
 
 import argparse
 import csv
+import json
 import re
 import shutil
 import subprocess
@@ -260,6 +272,13 @@ DISC_TYPE_BLURAY = "BLURAY"
 # floor, not a quality check - any real title clearing --min-length will
 # produce something far larger than this.
 MIN_OUTPUT_FILE_BYTES = 1_000_000  # 1 MB
+
+# Per-output-folder manifest written on a successful conversion, used by
+# resume support (workflow enhancement 4) instead of a plain .mkv file
+# *count* comparison - see selection_fingerprint()/manifest_matches() for
+# why a count alone can't tell "same titles, already done" apart from "a
+# different run left a coincidentally-equal number of files here".
+MANIFEST_FILENAME = ".iso_to_mkv_manifest.json"
 
 
 # --------------------------------------------------------------------------
@@ -330,15 +349,103 @@ def snapshot_output_dir(out_dir: Path) -> Dict[str, int]:
     return {p.name: p.stat().st_size for p in out_dir.iterdir() if p.is_file()}
 
 
-def existing_output_mkvs(out_dir: Path) -> List[Path]:
-    """.mkv files in out_dir that look like real output, not zero-byte
-    leftovers from an interrupted run."""
-    if not out_dir.is_dir():
-        return []
-    return [
-        p for p in out_dir.iterdir()
-        if p.is_file() and p.suffix.lower() == ".mkv" and p.stat().st_size >= MIN_OUTPUT_FILE_BYTES
-    ]
+def selection_fingerprint(args: argparse.Namespace) -> dict:
+    """Every argument that can change which titles get picked as candidates
+    for a given ISO (independent of the ISO's own content). Used to
+    invalidate a previous run's manifest if the command line changes in a
+    way that could produce a different candidate set - e.g. a looser
+    --min-length or a forced --disc-type could easily select a different
+    number (or identity) of titles, and a stale folder from that earlier
+    configuration should never be mistaken for a completed run of the
+    current one."""
+    return {
+        "min_length": args.min_length,
+        "obfuscation_threshold": args.obfuscation_threshold,
+        "dvd_max_size_gb": args.dvd_max_size_gb,
+        "disc_type": args.disc_type,
+        "detect_playall": args.detect_playall,
+        "playall_tolerance_sec": args.playall_tolerance_sec,
+        "playall_cluster_tolerance_pct": args.playall_cluster_tolerance_pct,
+    }
+
+
+def read_manifest(out_dir: Path) -> Optional[dict]:
+    """Best-effort read of a previous run's manifest from out_dir. Returns
+    None if there isn't one, or it can't be parsed (treated the same as
+    "no manifest" - resume just won't fire, which is the safe direction to
+    fail in)."""
+    manifest_path = out_dir / MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        return None
+    try:
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+def write_manifest(
+    out_dir: Path,
+    iso_path: Path,
+    candidate_tids: List[int],
+    output_filenames: List[str],
+    args: argparse.Namespace,
+) -> None:
+    """Record exactly what this run extracted, and under what selection
+    settings, so a future run can tell whether an existing output folder
+    really is "this ISO, fully converted with today's settings" rather
+    than just "the right number of .mkv files happen to be sitting here"."""
+    stat = iso_path.stat()
+    manifest = {
+        "iso_size": stat.st_size,
+        "iso_mtime": stat.st_mtime,
+        "candidate_title_ids": sorted(candidate_tids),
+        "output_filenames": sorted(output_filenames),
+        "selection_fingerprint": selection_fingerprint(args),
+    }
+    try:
+        (out_dir / MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    except OSError:
+        pass  # best-effort only - worst case, a future run just won't be able to resume this one
+
+
+def manifest_matches(
+    manifest: Optional[dict],
+    iso_path: Path,
+    candidate_tids: List[int],
+    out_dir: Path,
+    args: argparse.Namespace,
+) -> bool:
+    """True only if a previous run's manifest describes exactly this ISO
+    (by size + mtime), exactly this candidate title selection, exactly
+    this run's selection-relevant settings, AND every file it recorded is
+    still present and still looks like real output (not truncated/deleted
+    since). This replaces the old "count the .mkv files, compare to the
+    number of candidates" check, which couldn't distinguish a genuinely
+    completed run from a differently-configured previous run (or leftover
+    files from something else entirely) that happened to leave behind the
+    same number of files."""
+    if manifest is None:
+        return False
+    try:
+        stat = iso_path.stat()
+    except OSError:
+        return False
+    if manifest.get("iso_size") != stat.st_size:
+        return False
+    if manifest.get("iso_mtime") != stat.st_mtime:
+        return False
+    if manifest.get("candidate_title_ids") != sorted(candidate_tids):
+        return False
+    if manifest.get("selection_fingerprint") != selection_fingerprint(args):
+        return False
+    for name in manifest.get("output_filenames", []):
+        p = out_dir / name
+        try:
+            if not p.is_file() or p.stat().st_size < MIN_OUTPUT_FILE_BYTES:
+                return False
+        except OSError:
+            return False
+    return True
 
 
 def check_free_space(out_dir: Path, output_root: Path, required_bytes: int, margin_pct: float) -> Optional[str]:
@@ -688,6 +795,7 @@ class ProcessResult:
     converted: bool = False           # fully converted this run (counts toward --limit, eligible for deletion)
     skipped_already_done: bool = False  # resume: output already existed, nothing was done
     info_scan_failed: bool = False    # couldn't even read title info - used for the circuit breaker
+    unexpected_error: bool = False    # an unhandled exception was caught around this ISO - also feeds the circuit breaker
 
 
 # --------------------------------------------------------------------------
@@ -734,10 +842,7 @@ def process_iso(
     # do that safely is fragile); it will just fully redo that one ISO,
     # which is the safe default over a false "looks done" skip.
     natural_out_dir = output_root / relative_dir / iso_path.stem
-    if not args.force:
-        pre_existing_mkvs = existing_output_mkvs(natural_out_dir)
-    else:
-        pre_existing_mkvs = []
+    previous_manifest = None if args.force else read_manifest(natural_out_dir)
 
     disc_type_override = None if args.disc_type == "auto" else args.disc_type
     disc_type = classify_disc(iso_path, args.dvd_max_size_gb * 1_000_000_000, disc_type_override)
@@ -874,25 +979,35 @@ def process_iso(
         stats.warnings += 1
         return ProcessResult()
 
-    # Resume check happens here, once we know how many titles we'd
-    # actually want to extract - if a previous complete run already left
-    # at least that many real .mkv files sitting in the natural output
-    # dir, treat this ISO as already done rather than re-extracting it.
-    if pre_existing_mkvs and len(pre_existing_mkvs) >= len(candidates):
+    # Resume check happens here, once we know exactly which titles we'd
+    # extract - compared against a previous run's manifest (see
+    # manifest_matches docstring for why this is more reliable than the
+    # old "count the .mkv files" approach: it checks the ISO itself, the
+    # exact set of title IDs, and every selection-relevant argument, not
+    # just a number that could match by coincidence).
+    if manifest_matches(previous_manifest, iso_path, candidates, natural_out_dir, args):
         logger.info(
-            f"Found {len(pre_existing_mkvs)} existing .mkv file(s) in {natural_out_dir} "
-            f"(expected {len(candidates)}) - looks already converted, skipping. "
-            f"Use --force to redo.",
+            f"{natural_out_dir} already has a matching completed conversion for this exact "
+            f"title selection and these settings - skipping. Use --force to redo.",
             iso_path,
         )
         stats.already_converted_skipped += 1
         return ProcessResult(skipped_already_done=True)
+    elif previous_manifest is not None:
+        logger.warning(
+            f"{natural_out_dir} has a previous-run manifest, but it doesn't match this ISO, "
+            f"title selection, or settings (e.g. --min-length/--disc-type changed since, or "
+            f"output files went missing) - redoing rather than trusting stale output",
+            iso_path,
+        )
+        stats.warnings += 1
 
     out_dir = unique_output_dir(output_root, relative_dir, iso_path.stem, used_output_names)
     if not args.dry_run:
         out_dir.mkdir(parents=True, exist_ok=True)
 
     all_ok = True
+    output_filenames: List[str] = []  # populated on success, written into the manifest below
     for tid in sorted(candidates):
         title = titles[tid]
         logger.info(
@@ -982,6 +1097,7 @@ def process_iso(
         # trust the filename instead of re-deriving which title was main.
         # Not done for this script's own duration-based fallback guesses -
         # only for MakeMKV's own identification.
+        final_name = qualifying_new_mkvs[0]  # overwritten below only if the rename actually succeeds
         if tid == fpl_identified_main_tid:
             src_path = out_dir / qualifying_new_mkvs[0]
             dest_path = out_dir / "main_title.mkv"
@@ -997,10 +1113,12 @@ def process_iso(
                     try:
                         src_path.replace(dest_path)
                         logger.info(f"Title {tid}: renamed output to main_title.mkv", iso_path)
+                        final_name = "main_title.mkv"
                     except OSError as e:
                         logger.warning(f"Title {tid}: failed to rename output to main_title.mkv: {e}", iso_path)
                         stats.warnings += 1
 
+        output_filenames.append(final_name)
         stats.conversions_success += 1
 
     if not all_ok:
@@ -1009,6 +1127,12 @@ def process_iso(
 
     logger.info("All selected titles converted successfully", iso_path)
     stats.isos_converted += 1
+
+    if not args.dry_run:
+        # Recorded so a future run can tell "already done, same settings"
+        # apart from "coincidentally the same file count" - see
+        # manifest_matches().
+        write_manifest(out_dir, iso_path, candidates, output_filenames, args)
 
     if args.keep_source:
         logger.info("Keeping source file (--keep-source)", iso_path)
@@ -1232,26 +1356,43 @@ def main() -> int:
                 f"- estimated time remaining: {eta_str}"
             )
 
-            result = process_iso(iso_path, input_root, output_root, args, logger, stats, used_output_names)
+            # A crash while processing one ISO (a malformed robot-mode
+            # line, an unexpected filesystem error, etc.) should not take
+            # down the rest of an otherwise-fine batch. Only
+            # KeyboardInterrupt is allowed to propagate - everything else
+            # is logged against this specific ISO, counted as an error,
+            # and the batch moves on to the next file.
+            try:
+                result = process_iso(iso_path, input_root, output_root, args, logger, stats, used_output_names)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                logger.error(
+                    f"Unexpected error while processing this ISO - skipping it and continuing "
+                    f"with the rest of the batch: {e!r}",
+                    iso_path,
+                )
+                stats.conversions_error += 1
+                result = ProcessResult(unexpected_error=True)
 
             # --- Circuit breaker (safety enhancement 2, cont'd) ---
-            # A single bad disc failing to scan is normal; several in a
-            # row almost always means something systemic (expired
-            # registration key, permissions, wrong binary) rather than
-            # unlucky media, so stop instead of burning through the rest
-            # of the batch with the same failure.
-            if result.info_scan_failed:
+            # A single bad disc failing to scan (or crashing outright) is
+            # normal; several in a row almost always means something
+            # systemic (expired registration key, permissions, wrong
+            # binary) rather than unlucky media, so stop instead of
+            # burning through the rest of the batch with the same failure.
+            if result.info_scan_failed or result.unexpected_error:
                 consecutive_info_scan_failures += 1
                 if (
                     args.max_consecutive_failures > 0
                     and consecutive_info_scan_failures >= args.max_consecutive_failures
                 ):
                     logger.error(
-                        f"{consecutive_info_scan_failures} ISOs in a row failed at the title-info "
-                        f"scan step - this usually means a systemic problem (makemkvcon "
-                        f"registration/key, permissions, or a bad --makemkvcon path) rather than "
-                        f"bad discs. Stopping early; fix the underlying issue and re-run "
-                        f"(already-converted ISOs will be skipped via resume support)."
+                        f"{consecutive_info_scan_failures} ISOs in a row failed (title-info scan "
+                        f"or an unexpected error) - this usually means a systemic problem "
+                        f"(makemkvcon registration/key, permissions, or a bad --makemkvcon path) "
+                        f"rather than bad discs. Stopping early; fix the underlying issue and "
+                        f"re-run (already-converted ISOs will be skipped via resume support)."
                     )
                     break
             else:
