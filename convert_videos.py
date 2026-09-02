@@ -33,6 +33,33 @@ class ConversionError(Exception):
         super().__init__(f"{file}: {reason}")
 
 
+class ConversionTimeoutError(ConversionError):
+    """Raised when an ffprobe/ffmpeg subprocess exceeds its allotted timeout. Treated
+    as fatal for the whole run (unlike other ConversionErrors, which just skip the
+    file and continue): a timeout is unusual enough, even with a generous allowance,
+    that it's worth stopping to investigate rather than silently skipping ahead."""
+    pass
+
+
+# Minimum timeout for any single ffprobe/ffmpeg pass, regardless of file size, so
+# very small files still get a sane floor rather than a near-zero allowance.
+TIMEOUT_FLOOR_SECONDS = 30 * 60  # 30 minutes
+
+# Additional timeout allowance per GB of source file size. This is deliberately
+# generous: real encodes (even slow software x265 on modest hardware) run far
+# faster than this, so going slower than this rate for an entire pass is treated
+# as evidence the process is hung, not just slow.
+TIMEOUT_SECONDS_PER_GB = 15 * 60  # 15 minutes per GB
+
+
+def compute_timeout_seconds(src_size_bytes: int) -> float:
+    """A generous timeout for a single ffprobe/ffmpeg pass over a file this size —
+    used for probing, loudness measurement, and the main encode alike, so a hung
+    process on a corrupt or unusual file doesn't stall the batch indefinitely."""
+    size_gb = src_size_bytes / (1024 ** 3)
+    return TIMEOUT_FLOOR_SECONDS + size_gb * TIMEOUT_SECONDS_PER_GB
+
+
 def str_to_bool(value: str) -> bool:
     """argparse type function for explicit True/False style boolean options."""
     if value.lower() in ("true", "1", "yes"):
@@ -125,7 +152,7 @@ def setup_logging(output_folder: Path) -> Path:
 COVER_ART_CODECS = {"mjpeg", "png", "bmp", "gif"}
 
 
-def probe_media(path: Path) -> dict:
+def probe_media(path: Path, timeout_seconds: float) -> dict:
     """Probe a media file with a single ffprobe call, returning:
       {
         "video": {"codec_name": str, "width": int, "height": int, "duration": float|None,
@@ -136,7 +163,8 @@ def probe_media(path: Path) -> dict:
     The video stream chosen is the first one that isn't embedded cover art (an
     attached_pic, or an image-y codec like mjpeg/png/bmp/gif), so a thumbnail
     that precedes the real video stream isn't mistaken for it.
-    Raises ConversionError if ffprobe fails or no real video stream is found."""
+    Raises ConversionError if ffprobe fails or no real video stream is found, or
+    ConversionTimeoutError if it doesn't finish within timeout_seconds."""
     cmd = [
         "ffprobe", "-v", "error",
         "-show_entries",
@@ -145,8 +173,11 @@ def probe_media(path: Path) -> dict:
         str(path),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True,
+                                 timeout=timeout_seconds)
         data = json.loads(result.stdout)
+    except subprocess.TimeoutExpired:
+        raise ConversionTimeoutError(path, f"ffprobe timed out after {timeout_seconds:.0f}s")
     except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as e:
         raise ConversionError(path, f"ffprobe failed: {e}")
 
@@ -206,14 +237,18 @@ def probe_media(path: Path) -> dict:
     }
 
 
-def probe_duration(path: Path) -> float:
+def probe_duration(path: Path, timeout_seconds: float) -> float:
     """Return the duration (seconds) of a media file via a lightweight ffprobe call, or
     None if duration could not be determined. Raises ConversionError if ffprobe itself
-    fails to read the file (a strong signal of a corrupt/incomplete output)."""
+    fails to read the file (a strong signal of a corrupt/incomplete output), or
+    ConversionTimeoutError if it doesn't finish within timeout_seconds."""
     cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True,
+                                 timeout=timeout_seconds)
         data = json.loads(result.stdout)
+    except subprocess.TimeoutExpired:
+        raise ConversionTimeoutError(path, f"ffprobe timed out after {timeout_seconds:.0f}s")
     except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as e:
         raise ConversionError(path, f"ffprobe (post-encode validation) failed: {e}")
 
@@ -225,13 +260,14 @@ def probe_duration(path: Path) -> float:
 
 
 def measure_loudness(src: Path, duration: float, loudnorm_target: float,
-                      audio_stream_index: int) -> dict:
+                      audio_stream_index: int, timeout_seconds: float) -> dict:
     """Runs loudnorm's analysis pass (decode + filter, no output file written) against
     the given audio stream to measure its actual loudness stats, for feeding into a
     second, exact pass of EBU R128 normalization. Returns the parsed stats dict
     (keys include input_i, input_tp, input_lra, input_thresh, target_offset).
     Raises ConversionError if ffmpeg fails or the stats block can't be found/parsed,
-    so callers can fall back to one-pass normalization for this file."""
+    so callers can fall back to one-pass normalization for this file, or
+    ConversionTimeoutError if it doesn't finish within timeout_seconds."""
     cmd = ["ffmpeg", "-i", str(src)]
     if duration != -1:
         cmd += ["-t", str(duration)]
@@ -240,7 +276,11 @@ def measure_loudness(src: Path, duration: float, loudnorm_target: float,
         "-af", f"loudnorm=I={loudnorm_target}:TP=-1.5:LRA=11:print_format=json",
         "-f", "null", "-",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        raise ConversionTimeoutError(src, f"loudness measurement pass timed out after "
+                                           f"{timeout_seconds:.0f}s")
     if result.returncode != 0:
         raise ConversionError(src, f"loudness measurement pass failed: {result.stderr[-1000:]}")
 
@@ -376,6 +416,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     min_size_bytes = min_size_mb * 1024 * 1024
     src_stat = src.stat()
     src_size = src_stat.st_size
+    timeout_seconds = compute_timeout_seconds(src_size)
 
     if src_size < min_size_bytes:
         # Below the encode threshold, so we skip the full probe_media() call (codec,
@@ -383,7 +424,9 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         # We still grab duration with the lighter probe_duration() call so it's not
         # silently missing from the final "total video running time" summary.
         try:
-            small_file_duration = probe_duration(src)
+            small_file_duration = probe_duration(src, timeout_seconds)
+        except ConversionTimeoutError:
+            raise  # fatal: propagate up so the run stops and can be investigated
         except ConversionError as e:
             logging.warning(f"Could not determine duration for below-threshold file "
                              f"(copying anyway): {e.reason}: {src}")
@@ -403,7 +446,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                      f"{human_size(src_size)}): {src} -> {dst}")
         return (src_size, src_size, small_file_duration, "copied", False)
 
-    media = probe_media(src)
+    media = probe_media(src, timeout_seconds)
     video_info = media["video"]
     codec = video_info.get("codec_name", "")
     width = video_info.get("width", 0)
@@ -510,9 +553,11 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     if normalize_audio and keep_audio_indices:
         try:
             measured_loudness = measure_loudness(src, duration, loudnorm_target,
-                                                  keep_audio_indices[0])
+                                                  keep_audio_indices[0], timeout_seconds)
             logging.info(f"LOUDNESS MEASURED (pass 1): input {measured_loudness.get('input_i')} LUFS "
                          f"-> target {loudnorm_target} LUFS: {src}")
+        except ConversionTimeoutError:
+            raise  # fatal: propagate up so the run stops and can be investigated
         except ConversionError as e:
             logging.warning(f"Loudness measurement pass failed, falling back to "
                              f"one-pass normalization for this file: {e.reason}: {src}")
@@ -522,7 +567,14 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                             normalize_audio, loudnorm_target, keep_audio_indices,
                             keep_subtitle_indices, video_info["stream_index"],
                             measured_loudness)
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        if encode_target.exists():
+            encode_target.unlink(missing_ok=True)
+        raise ConversionTimeoutError(src, f"ffmpeg encode timed out after "
+                                          f"{timeout_seconds:.0f}s (source size "
+                                          f"{human_size(src_size)})")
 
     if result.returncode != 0:
         if encode_target.exists():
@@ -535,7 +587,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     # the original). Skipped for test/partial encodes (--duration), since those are
     # intentionally shorter than the source.
     if duration == -1 and video_duration is not None:
-        output_duration = probe_duration(encode_target)
+        output_duration = probe_duration(encode_target, timeout_seconds)
         if output_duration is None:
             if encode_target.exists():
                 encode_target.unlink(missing_ok=True)
@@ -664,6 +716,16 @@ def main():
                                    same_location, args.dry_run, args.encoding,
                                    args.normalize_audio, args.loudnorm_target, args.downscale,
                                    args.strip_no_english_audio)
+        except ConversionTimeoutError as e:
+            failed_path = e.file.resolve()
+            logging.error(f"TIMEOUT: {failed_path}\n{e.reason}")
+            logging.error("Stopping the run so this timeout can be investigated. "
+                          "Remaining files were not processed.")
+            print(f"\nTIMEOUT while processing: {failed_path}\n{e.reason}", file=sys.stderr)
+            print("Stopping so this can be investigated. Remaining files were not "
+                  "processed.", file=sys.stderr)
+            print(f"Log written to: {log_path}", file=sys.stderr)
+            sys.exit(1)
         except ConversionError as e:
             failed_path = e.file.resolve()
             logging.error(f"CONVERSION FAILED: {failed_path}\n{e.reason}")
