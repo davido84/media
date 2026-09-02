@@ -117,17 +117,28 @@ def setup_logging(output_folder: Path) -> Path:
     return log_path
 
 
+# Codecs that are almost always an embedded cover-art/thumbnail image rather than
+# real video, used as a fallback signal when a container doesn't set the
+# attached_pic disposition flag correctly.
+COVER_ART_CODECS = {"mjpeg", "png", "bmp", "gif"}
+
+
 def probe_media(path: Path) -> dict:
     """Probe a media file with a single ffprobe call, returning:
       {
-        "video": {"codec_name": str, "width": int, "height": int, "duration": float|None},
+        "video": {"codec_name": str, "width": int, "height": int, "duration": float|None,
+                   "stream_index": int},  # index i in ffmpeg's 0:v:i, for explicit mapping
         "audio_languages": [lang_or_None, ...],   # index i == ffmpeg's 0:a:i
         "subtitle_tracks": [(lang_or_None, codec_name), ...],  # index i == 0:s:i
       }
-    Raises ConversionError if ffprobe fails or no video stream is found."""
+    The video stream chosen is the first one that isn't embedded cover art (an
+    attached_pic, or an image-y codec like mjpeg/png/bmp/gif), so a thumbnail
+    that precedes the real video stream isn't mistaken for it.
+    Raises ConversionError if ffprobe fails or no real video stream is found."""
     cmd = [
         "ffprobe", "-v", "error",
-        "-show_entries", "stream=codec_name,codec_type,width,height:stream_tags=language:format=duration",
+        "-show_entries",
+        "stream=codec_name,codec_type,width,height,disposition:stream_tags=language:format=duration",
         "-of", "json",
         str(path),
     ]
@@ -137,27 +148,47 @@ def probe_media(path: Path) -> dict:
     except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as e:
         raise ConversionError(path, f"ffprobe failed: {e}")
 
-    video_info = None
+    video_candidates = []  # every non-cover-art video stream seen, in order, with its 0:v:i index
+    fallback_video_info = None  # first video stream at all, in case every one looks like cover art
     audio_languages = []
     subtitle_tracks = []
+    video_stream_count = 0
 
     for s in data.get("streams", []):
         codec_type = s.get("codec_type")
         lang = s.get("tags", {}).get("language")
         lang = lang.lower() if lang else None
 
-        if codec_type == "video" and video_info is None:
-            video_info = {
-                "codec_name": s.get("codec_name", ""),
+        if codec_type == "video":
+            stream_index = video_stream_count
+            video_stream_count += 1
+            codec_name = s.get("codec_name", "")
+            is_attached_pic = bool(s.get("disposition", {}).get("attached_pic"))
+            is_cover_art = is_attached_pic or codec_name in COVER_ART_CODECS
+
+            info = {
+                "codec_name": codec_name,
                 "width": s.get("width", 0),
                 "height": s.get("height", 0),
+                "stream_index": stream_index,
             }
+            if fallback_video_info is None:
+                fallback_video_info = info
+            if not is_cover_art:
+                video_candidates.append(info)
         elif codec_type == "audio":
             audio_languages.append(lang)
         elif codec_type == "subtitle":
             subtitle_tracks.append((lang, s.get("codec_name", "unknown")))
 
-    if video_info is None:
+    if video_candidates:
+        video_info = video_candidates[0]
+    elif fallback_video_info is not None:
+        # Every video stream looked like cover art (e.g. a file with only an
+        # embedded thumbnail and no real video track). Fall back to the first
+        # one rather than failing outright, since that matches prior behavior.
+        video_info = fallback_video_info
+    else:
         raise ConversionError(path, "no video stream found")
 
     duration_str = data.get("format", {}).get("duration")
@@ -215,7 +246,7 @@ def human_duration(seconds: float) -> str:
 def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_downscale: bool,
                       encoding: str = "software", normalize_audio: bool = True,
                       loudnorm_target: float = -16, audio_stream_indices: list = None,
-                      subtitle_stream_indices: list = None) -> list:
+                      subtitle_stream_indices: list = None, video_stream_index: int = 0) -> list:
     cmd = ["ffmpeg", "-y", "-i", str(src)]
 
     if duration != -1:
@@ -225,8 +256,11 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
     subtitle_stream_indices = subtitle_stream_indices or []
 
     # Explicit stream mapping disables ffmpeg's automatic "best stream" selection,
-    # so the video stream must always be mapped too.
-    cmd += ["-map", "0:v:0"]
+    # so the video stream must always be mapped too. video_stream_index picks out
+    # the real video track (as identified by probe_media) rather than assuming
+    # it's the first video stream, since embedded cover art is also a video
+    # stream and can precede the real one.
+    cmd += ["-map", f"0:v:{video_stream_index}"]
     for idx in audio_stream_indices:
         cmd += ["-map", f"0:a:{idx}"]
     for idx in subtitle_stream_indices:
@@ -384,7 +418,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     if dry_run:
         cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
                                 normalize_audio, loudnorm_target, keep_audio_indices,
-                                keep_subtitle_indices)
+                                keep_subtitle_indices, video_info["stream_index"])
         logging.info(f"[DRY RUN] Command: {' '.join(cmd)}")
         return None
 
@@ -398,7 +432,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     encode_target.parent.mkdir(parents=True, exist_ok=True)
     cmd = build_ffmpeg_cmd(src, encode_target, crf, duration, needs_downscale, encoding,
                             normalize_audio, loudnorm_target, keep_audio_indices,
-                            keep_subtitle_indices)
+                            keep_subtitle_indices, video_info["stream_index"])
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
