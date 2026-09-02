@@ -25,6 +25,41 @@ import time
 from pathlib import Path
 
 
+def _enable_windows_ansi_support():
+    """On Windows, ANSI/VT escape sequences are only rendered as colors if
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING is turned on for the console output
+    handle. Modern Windows Terminal (the Windows 11 default for both PowerShell
+    and Command Prompt) already enables this, but a plain conhost session or
+    some embedded terminals might not, in which case escape codes would print
+    as literal text instead of coloring anything. This turns it on explicitly
+    so colors work regardless of which console is in front. No-op elsewhere,
+    and never raises — if it can't enable the mode for any reason, colors
+    simply won't render on that console, but everything else still works."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        STD_OUTPUT_HANDLE = -11
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+    except Exception:
+        pass
+
+
+_enable_windows_ansi_support()
+
+# Highlight the current filename in the console progress line. Only enabled when
+# stdout is a real terminal, so piping/redirecting output (or the log file, which
+# uses a separate plain-text handler below) never ends up with raw escape codes.
+_SUPPORTS_COLOR = sys.stdout.isatty()
+COLOR_CURRENT_FILE = "\033[96m" if _SUPPORTS_COLOR else ""  # bright cyan
+COLOR_RESET = "\033[0m" if _SUPPORTS_COLOR else ""
+
+
 class ConversionError(Exception):
     """Raised when ffprobe or ffmpeg fails for a given file."""
     def __init__(self, file: Path, reason: str):
@@ -696,7 +731,8 @@ def main():
         print(f"Processed: {human_size(processed_bytes)} | "
               f"Remaining: {human_size(remaining_bytes)} | "
               f"ETA: {eta_str} | "
-              f"Current file ({human_size(src_size)}): {src.name}")
+              f"Current file ({human_size(src_size)}): "
+              f"{COLOR_CURRENT_FILE}{src.name}{COLOR_RESET}")
 
         if same_location:
             dst = src
