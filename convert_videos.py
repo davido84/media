@@ -313,18 +313,30 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                   downscale: bool = False, strip_non_english_audio: bool = False):
     """Returns (original_size, new_size, video_duration_seconds, action, downscaled) on
     success, or None if skipped/dry-run. action is 'encoded' or 'copied'. downscaled is
-    True if the file was scaled down from >1080p. video_duration_seconds is None if the
-    file was small enough to skip probing entirely. Raises ConversionError if ffprobe or
-    ffmpeg fails."""
+    True if the file was scaled down from >1080p. video_duration_seconds may be None if
+    duration could not be determined at all. Raises ConversionError if ffprobe or ffmpeg
+    fails on a file that must be processed (small below-threshold files are copied
+    regardless of a duration-probe failure, since they were never going to be encoded)."""
     min_size_bytes = min_size_mb * 1024 * 1024
     src_stat = src.stat()
     src_size = src_stat.st_size
 
     if src_size < min_size_bytes:
+        # Below the encode threshold, so we skip the full probe_media() call (codec,
+        # audio/subtitle tracks, etc. are irrelevant to a file we're just copying).
+        # We still grab duration with the lighter probe_duration() call so it's not
+        # silently missing from the final "total video running time" summary.
+        try:
+            small_file_duration = probe_duration(src)
+        except ConversionError as e:
+            logging.warning(f"Could not determine duration for below-threshold file "
+                             f"(copying anyway): {e.reason}: {src}")
+            small_file_duration = None
+
         if same_location:
             logging.info(f"KEPT (below {min_size_mb}MB minimum, already in place, "
                          f"{human_size(src_size)}): {src}")
-            return (src_size, src_size, None, "copied", False)
+            return (src_size, src_size, small_file_duration, "copied", False)
         if dry_run:
             logging.info(f"[DRY RUN] WOULD COPY (below {min_size_mb}MB minimum, "
                          f"{human_size(src_size)}): {src} -> {dst}")
@@ -333,7 +345,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         shutil.copy2(src, dst)
         logging.info(f"COPIED (below {min_size_mb}MB minimum, "
                      f"{human_size(src_size)}): {src} -> {dst}")
-        return (src_size, src_size, None, "copied", False)
+        return (src_size, src_size, small_file_duration, "copied", False)
 
     media = probe_media(src)
     video_info = media["video"]
