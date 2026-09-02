@@ -17,6 +17,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -67,12 +68,13 @@ def build_parser():
     parser.add_argument("--encoding", choices=["hardware", "software"], default="software",
                          help="Encoding mode. 'software' uses libx265 (CPU). 'hardware' uses "
                               "Intel Quick Sync (hevc_qsv). Default: software")
-    parser.add_argument("--normalize-audio", type=str_to_bool, default=True,
+    parser.add_argument("--normalize-audio", type=str_to_bool, default=False,
                          metavar="{True,False}",
-                         help="Apply EBU R128 loudness normalization (ffmpeg's loudnorm filter) "
-                              "to the audio track during encoding. Only affects files that are "
-                              "actually re-encoded — files copied as-is (already H.265, or below "
-                              "--min-size-mb) are left untouched. Default: True")
+                         help="Apply EBU R128 loudness normalization (ffmpeg's loudnorm filter, "
+                              "two-pass) to the audio track during encoding. Only affects files "
+                              "that are actually re-encoded — files copied as-is (already H.265, "
+                              "or below --min-size-mb) are left untouched. Adds an extra "
+                              "full-length analysis pass per re-encoded file. Default: False")
     parser.add_argument("--loudnorm-target", type=float, default=-16,
                          help="Integrated loudness target in LUFS, used with --normalize-audio. "
                               "-16 is typical for general/streaming content, -23 is the EBU "
@@ -222,6 +224,37 @@ def probe_duration(path: Path) -> float:
         return None
 
 
+def measure_loudness(src: Path, duration: float, loudnorm_target: float,
+                      audio_stream_index: int) -> dict:
+    """Runs loudnorm's analysis pass (decode + filter, no output file written) against
+    the given audio stream to measure its actual loudness stats, for feeding into a
+    second, exact pass of EBU R128 normalization. Returns the parsed stats dict
+    (keys include input_i, input_tp, input_lra, input_thresh, target_offset).
+    Raises ConversionError if ffmpeg fails or the stats block can't be found/parsed,
+    so callers can fall back to one-pass normalization for this file."""
+    cmd = ["ffmpeg", "-i", str(src)]
+    if duration != -1:
+        cmd += ["-t", str(duration)]
+    cmd += [
+        "-map", f"0:a:{audio_stream_index}",
+        "-af", f"loudnorm=I={loudnorm_target}:TP=-1.5:LRA=11:print_format=json",
+        "-f", "null", "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise ConversionError(src, f"loudness measurement pass failed: {result.stderr[-1000:]}")
+
+    # loudnorm prints its stats as a single JSON object to stderr, surrounded by
+    # ordinary log lines. There's no start/end marker, so pull out the last
+    # brace-delimited block (the filter has no nested braces of its own).
+    matches = re.findall(r"\{[^{}]+\}", result.stderr)
+    if not matches:
+        raise ConversionError(src, "loudness measurement pass produced no stats output")
+    try:
+        return json.loads(matches[-1])
+    except json.JSONDecodeError as e:
+        raise ConversionError(src, f"could not parse loudness measurement stats: {e}")
+
 
 def human_size(num_bytes: int) -> str:
     size = float(num_bytes)
@@ -246,7 +279,8 @@ def human_duration(seconds: float) -> str:
 def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_downscale: bool,
                       encoding: str = "software", normalize_audio: bool = True,
                       loudnorm_target: float = -16, audio_stream_indices: list = None,
-                      subtitle_stream_indices: list = None, video_stream_index: int = 0) -> list:
+                      subtitle_stream_indices: list = None, video_stream_index: int = 0,
+                      measured_loudness: dict = None) -> list:
     cmd = ["ffmpeg", "-y", "-i", str(src)]
 
     if duration != -1:
@@ -293,9 +327,31 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
     cmd += ["-c:a", "libopus", "-ac", "2", "-b:a", "128k"]
 
     if normalize_audio:
-        # One-pass EBU R128 loudness normalization. TP/LRA use sensible general-purpose
-        # defaults; only the integrated loudness target (I) is user-configurable.
-        cmd += ["-af", f"loudnorm=I={loudnorm_target}:TP=-1.5:LRA=11"]
+        # Scoped to output audio stream 0 (-filter:a:0) rather than the unscoped -af,
+        # which would apply this exact filter description — including the fixed
+        # measured_* gain values below, which are only valid for the primary track —
+        # identically to every kept audio stream. Only the primary/first mapped
+        # audio track is normalized; any other kept tracks are still re-encoded to
+        # Opus above, just without a loudness filter applied.
+        if measured_loudness:
+            # Two-pass EBU R128: feed the analysis pass's exact measured stats back
+            # in with linear=true, which applies a single fixed gain rather than
+            # loudnorm's single-pass dynamic (compressor-like) behavior. This is
+            # more accurate but requires measure_loudness() to have already run.
+            cmd += ["-filter:a:0", (
+                f"loudnorm=I={loudnorm_target}:TP=-1.5:LRA=11:"
+                f"measured_I={measured_loudness['input_i']}:"
+                f"measured_TP={measured_loudness['input_tp']}:"
+                f"measured_LRA={measured_loudness['input_lra']}:"
+                f"measured_thresh={measured_loudness['input_thresh']}:"
+                f"offset={measured_loudness['target_offset']}:"
+                f"linear=true"
+            )]
+        else:
+            # One-pass fallback: used for dry-run command previews (where we don't
+            # want to actually run ffmpeg just to build a preview string) and for
+            # real encodes where the measurement pass itself failed.
+            cmd += ["-filter:a:0", f"loudnorm=I={loudnorm_target}:TP=-1.5:LRA=11"]
 
     if subtitle_stream_indices:
         # Passthrough: subtitle tracks are copied as-is, not re-encoded. Since the
@@ -428,10 +484,17 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                  f"duration={'full' if duration == -1 else f'{duration}s'})")
 
     if dry_run:
+        # Dry runs never invoke ffmpeg, so there's no measured loudness stats to show
+        # here; the preview command falls back to the one-pass filter shape. The real
+        # encode (below) runs an actual two-pass measurement when normalize_audio is on.
         cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
                                 normalize_audio, loudnorm_target, keep_audio_indices,
                                 keep_subtitle_indices, video_info["stream_index"])
         logging.info(f"[DRY RUN] Command: {' '.join(cmd)}")
+        if normalize_audio and keep_audio_indices:
+            logging.info(f"[DRY RUN] Note: audio will be normalized in two passes "
+                         f"(a measurement pass, then the exact-gain encode shown above "
+                         f"reflects the one-pass shape only): {src}")
         return None
 
     # When replacing in place, ffmpeg can't read and write the same path at once,
@@ -442,9 +505,23 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         encode_target = dst
 
     encode_target.parent.mkdir(parents=True, exist_ok=True)
+
+    measured_loudness = None
+    if normalize_audio and keep_audio_indices:
+        try:
+            measured_loudness = measure_loudness(src, duration, loudnorm_target,
+                                                  keep_audio_indices[0])
+            logging.info(f"LOUDNESS MEASURED (pass 1): input {measured_loudness.get('input_i')} LUFS "
+                         f"-> target {loudnorm_target} LUFS: {src}")
+        except ConversionError as e:
+            logging.warning(f"Loudness measurement pass failed, falling back to "
+                             f"one-pass normalization for this file: {e.reason}: {src}")
+            measured_loudness = None
+
     cmd = build_ffmpeg_cmd(src, encode_target, crf, duration, needs_downscale, encoding,
                             normalize_audio, loudnorm_target, keep_audio_indices,
-                            keep_subtitle_indices, video_info["stream_index"])
+                            keep_subtitle_indices, video_info["stream_index"],
+                            measured_loudness)
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
