@@ -364,7 +364,25 @@ def human_size(num_bytes: int) -> str:
     return f"{size:.1f}TB"
 
 
-def human_duration(seconds: float) -> str:
+def human_duration(seconds: float, include_seconds: bool = False) -> str:
+    """Formats a duration for display. By default rounds to the nearest minute
+    (used for video content duration, where second-level precision isn't
+    meaningful). With include_seconds=True, keeps seconds precision instead —
+    used for the script's own wall-clock runtime, where seconds matter (e.g.
+    comparing hardware vs. software encoding speed on a short test run)."""
+    if include_seconds:
+        total_seconds = int(round(seconds))
+        days, remainder = divmod(total_seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if days:
+            return f"{days}d {hours}h {minutes}m {secs}s"
+        if hours:
+            return f"{hours}h {minutes}m {secs}s"
+        if minutes:
+            return f"{minutes}m {secs}s"
+        return f"{secs}s"
+
     total_minutes = int(round(seconds / 60))
     days, remainder = divmod(total_minutes, 1440)
     hours, minutes = divmod(remainder, 60)
@@ -432,7 +450,12 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
         # QSV. -low_power 0 forces the full-featured encode pipeline rather than the
         # fixed-function low-power path some Intel iGPUs default to, which can
         # otherwise silently ignore lookahead and other quality features.
-        cmd += ["-pix_fmt", "p010le", "-c:v", "hevc_qsv", "-global_quality", str(crf),
+        # global_quality:v (not the unscoped -global_quality) matters here: without a
+        # stream specifier, ffmpeg's per-file option resolution applies the implied
+        # "quality/CRF mode" flag to every output stream, not just the video one. QSV
+        # handles that fine, but libopus doesn't support quality-scale mode at all and
+        # refuses to open, aborting the whole encode with no output written.
+        cmd += ["-pix_fmt", "p010le", "-c:v", "hevc_qsv", "-global_quality:v", str(crf),
                 "-preset", "veryslow", "-low_power", "0",
                 "-look_ahead", "1", "-look_ahead_depth", "40"]
     else:
@@ -843,26 +866,44 @@ def main():
         logging.info(f"{len(failed_files)} file(s) failed to convert:")
         for f in failed_files:
             logging.info(f"  FAILED: {f}")
+        print(f"\n{len(failed_files)} file(s) failed to convert:")
+        for f in failed_files:
+            print(f"  - {f}")
 
     breakdown = (f"Encoded: {encoded_count} | Copied: {copied_count} | "
                  f"Skipped (existing): {skipped_existing} | Failed: {len(failed_files)}")
     logging.info(breakdown)
+    print(f"\n{breakdown}")
 
     downscale_line = f"Downscaled from >1080p: {downscaled_count} file(s)"
     logging.info(downscale_line)
+    print(downscale_line)
 
-    if not args.dry_run:
+    script_runtime = time.monotonic() - batch_start
+    script_runtime_line = f"Script runtime: {human_duration(script_runtime, include_seconds=True)}"
+
+    if args.dry_run:
+        logging.info(script_runtime_line)
+        print(script_runtime_line)
+        print(f"\n[DRY RUN] No files were modified. Log written to: {log_path}")
+    else:
         reduction_bytes = total_orig - total_new
         reduction_pct = (reduction_bytes / total_orig * 100) if total_orig else 0
         summary = (f"Total reduction: {human_size(reduction_bytes)}, "
                     f"{reduction_pct:.1f}% smaller "
                     f"({human_size(total_orig)} -> {human_size(total_new)})")
         logging.info(summary)
+        print(f"\n{summary}")
         runtime_summary = f"Total video running time: {human_duration(total_duration_seconds)}"
         logging.info(runtime_summary)
+        print(runtime_summary)
+        logging.info(script_runtime_line)
+        print(script_runtime_line)
+        print(f"Log written to: {log_path}")
 
     final_line = f"Finished with {len(failed_files)} error(s)."
     logging.info(final_line)
+    print(final_line)
 
 
 if __name__ == "__main__":
