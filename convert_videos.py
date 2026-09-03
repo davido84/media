@@ -27,36 +27,40 @@ from pathlib import Path
 
 def _enable_windows_ansi_support():
     """On Windows, ANSI/VT escape sequences are only rendered as colors if
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING is turned on for the console output
-    handle. Modern Windows Terminal (the Windows 11 default for both PowerShell
-    and Command Prompt) already enables this, but a plain conhost session or
-    some embedded terminals might not, in which case escape codes would print
-    as literal text instead of coloring anything. This turns it on explicitly
-    so colors work regardless of which console is in front. No-op elsewhere,
-    and never raises — if it can't enable the mode for any reason, colors
-    simply won't render on that console, but everything else still works."""
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING is turned on for the relevant console
+    output handle. Modern Windows Terminal (the Windows 11 default for both
+    PowerShell and Command Prompt) already enables this, but a plain conhost
+    session or some embedded terminals might not, in which case escape codes
+    would print as literal text instead of coloring anything. This turns it on
+    explicitly for both stdout and stderr, so colors work regardless of which
+    console is in front. No-op elsewhere, and never raises — if it can't enable
+    the mode for either handle, colors simply won't render there, but
+    everything else still works."""
     if os.name != "nt":
         return
     try:
         import ctypes
         kernel32 = ctypes.windll.kernel32
-        STD_OUTPUT_HANDLE = -11
         ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
-        mode = ctypes.c_uint32()
-        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-            kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+        for std_handle in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+            handle = kernel32.GetStdHandle(std_handle)
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
     except Exception:
         pass
 
 
 _enable_windows_ansi_support()
 
-# Highlight the current filename in the console progress line. Only enabled when
-# stdout is a real terminal, so piping/redirecting output (or the log file, which
-# uses a separate plain-text handler below) never ends up with raw escape codes.
-_SUPPORTS_COLOR = sys.stdout.isatty()
-COLOR_CURRENT_FILE = "\033[96m" if _SUPPORTS_COLOR else ""  # bright cyan
+# Warnings/errors are logged to the console (in addition to the log file) in
+# color, so they stand out from the plain per-file progress line. Colors are
+# only enabled when stderr is a real terminal, so piping/redirecting output (or
+# the log file, which uses a separate plain-text handler) never ends up with
+# raw escape codes.
+_SUPPORTS_COLOR = sys.stderr.isatty()
+COLOR_WARNING = "\033[93m" if _SUPPORTS_COLOR else ""  # yellow
+COLOR_ERROR = "\033[91m" if _SUPPORTS_COLOR else ""    # red
 COLOR_RESET = "\033[0m" if _SUPPORTS_COLOR else ""
 
 
@@ -167,17 +171,36 @@ def parse_args():
     return build_parser().parse_args()
 
 
+class ColorConsoleFormatter(logging.Formatter):
+    """Colors WARNING messages yellow and ERROR/CRITICAL messages red when printed
+    to the console. COLOR_WARNING/COLOR_ERROR/COLOR_RESET are empty strings when
+    stderr isn't a real terminal, so redirected/piped output stays plain text."""
+    def format(self, record):
+        message = super().format(record)
+        if record.levelno >= logging.ERROR:
+            return f"{COLOR_ERROR}{message}{COLOR_RESET}"
+        if record.levelno >= logging.WARNING:
+            return f"{COLOR_WARNING}{message}{COLOR_RESET}"
+        return message
+
+
 def setup_logging(output_folder: Path) -> Path:
     output_folder.mkdir(parents=True, exist_ok=True)
     log_path = output_folder / "conversion_log.txt"
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(log_path, encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
-        ],
-    )
+    log_format = "%(asctime)s [%(levelname)s] %(message)s"
+
+    # Full detail (INFO and up) goes to the log file, plain text.
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter(log_format))
+
+    # Only WARNING and above are echoed to the console, in color, so they stand
+    # out from the plain per-file progress line without cluttering it with the
+    # full per-file INFO detail (which stays log-file only).
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(ColorConsoleFormatter(log_format))
+
+    logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
     return log_path
 
 
@@ -311,6 +334,7 @@ def measure_loudness(src: Path, duration: float, loudnorm_target: float,
         "-af", f"loudnorm=I={loudnorm_target}:TP=-1.5:LRA=11:print_format=json",
         "-f", "null", "-",
     ]
+    logging.info(f"Command: {format_cmd_for_log(cmd)}")
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
@@ -349,6 +373,25 @@ def human_duration(seconds: float) -> str:
     if hours:
         return f"{hours}h {minutes}m"
     return f"{minutes}m"
+
+
+def format_cmd_for_log(cmd: list) -> str:
+    """Join a subprocess argv list into a loggable command string, wrapping file/
+    folder path arguments — the input path after -i, and a real output path at
+    the end — in double quotes, so paths containing spaces are unambiguous when
+    read back from the log (and the line can be copy-pasted into a shell as-is).
+    Flags and their non-path values are left unquoted. The trailing "-" ffmpeg
+    uses for a null/pipe output (as in the loudness measurement pass) is left
+    unquoted too, since it isn't actually a path."""
+    parts = []
+    for i, token in enumerate(cmd):
+        is_input_path = i > 0 and cmd[i - 1] == "-i"
+        is_output_path = (i == len(cmd) - 1) and token not in ("-", "pipe:", "pipe:1")
+        if is_input_path or is_output_path:
+            parts.append(f'"{token}"')
+        else:
+            parts.append(token)
+    return " ".join(parts)
 
 
 def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_downscale: bool,
@@ -568,7 +611,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
                                 normalize_audio, loudnorm_target, keep_audio_indices,
                                 keep_subtitle_indices, video_info["stream_index"])
-        logging.info(f"[DRY RUN] Command: {' '.join(cmd)}")
+        logging.info(f"[DRY RUN] Command: {format_cmd_for_log(cmd)}")
         if normalize_audio and keep_audio_indices:
             logging.info(f"[DRY RUN] Note: audio will be normalized in two passes "
                          f"(a measurement pass, then the exact-gain encode shown above "
@@ -602,6 +645,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                             normalize_audio, loudnorm_target, keep_audio_indices,
                             keep_subtitle_indices, video_info["stream_index"],
                             measured_loudness)
+    logging.info(f"Command: {format_cmd_for_log(cmd)}")
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
@@ -731,8 +775,7 @@ def main():
         print(f"Processed: {human_size(processed_bytes)} | "
               f"Remaining: {human_size(remaining_bytes)} | "
               f"ETA: {eta_str} | "
-              f"Current file ({human_size(src_size)}): "
-              f"{COLOR_CURRENT_FILE}{src.name}{COLOR_RESET}")
+              f"Current file ({human_size(src_size)}): {src.name}")
 
         if same_location:
             dst = src
@@ -757,10 +800,6 @@ def main():
             logging.error(f"TIMEOUT: {failed_path}\n{e.reason}")
             logging.error("Stopping the run so this timeout can be investigated. "
                           "Remaining files were not processed.")
-            print(f"\nTIMEOUT while processing: {failed_path}\n{e.reason}", file=sys.stderr)
-            print("Stopping so this can be investigated. Remaining files were not "
-                  "processed.", file=sys.stderr)
-            print(f"Log written to: {log_path}", file=sys.stderr)
             sys.exit(1)
         except ConversionError as e:
             failed_path = e.file.resolve()
@@ -788,8 +827,6 @@ def main():
                 limit_reached = True
                 logging.info(f"Data limit of {args.limit}GB reached "
                              f"({human_size(total_orig)} processed). Stopping.")
-                print(f"\nData limit of {args.limit}GB reached "
-                     f"({human_size(total_orig)} processed). Stopping.")
                 break
 
     if skipped_existing:
@@ -806,37 +843,26 @@ def main():
         logging.info(f"{len(failed_files)} file(s) failed to convert:")
         for f in failed_files:
             logging.info(f"  FAILED: {f}")
-        print(f"\n{len(failed_files)} file(s) failed to convert:")
-        for f in failed_files:
-            print(f"  - {f}")
 
     breakdown = (f"Encoded: {encoded_count} | Copied: {copied_count} | "
                  f"Skipped (existing): {skipped_existing} | Failed: {len(failed_files)}")
     logging.info(breakdown)
-    print(f"\n{breakdown}")
 
     downscale_line = f"Downscaled from >1080p: {downscaled_count} file(s)"
     logging.info(downscale_line)
-    print(downscale_line)
 
-    if args.dry_run:
-        print(f"\n[DRY RUN] No files were modified. Log written to: {log_path}")
-    else:
+    if not args.dry_run:
         reduction_bytes = total_orig - total_new
         reduction_pct = (reduction_bytes / total_orig * 100) if total_orig else 0
         summary = (f"Total reduction: {human_size(reduction_bytes)}, "
                     f"{reduction_pct:.1f}% smaller "
                     f"({human_size(total_orig)} -> {human_size(total_new)})")
         logging.info(summary)
-        print(f"\n{summary}")
         runtime_summary = f"Total video running time: {human_duration(total_duration_seconds)}"
         logging.info(runtime_summary)
-        print(runtime_summary)
-        print(f"Log written to: {log_path}")
 
     final_line = f"Finished with {len(failed_files)} error(s)."
     logging.info(final_line)
-    print(final_line)
 
 
 if __name__ == "__main__":
