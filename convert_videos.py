@@ -886,6 +886,9 @@ def main():
     encoded_count = 0
     copied_count = 0
     downscaled_count = 0
+    grew_files = []  # (path, orig_size, new_size) for encoded files that ended up
+                     # larger than the source — always empty in dry-run mode, since
+                     # new_size there is a same-as-source placeholder, not a real encode.
     limit_bytes = float("inf") if args.limit == -1 else args.limit * 1024 ** 3
     limit_reached = False
 
@@ -951,6 +954,8 @@ def main():
                 total_duration_seconds += video_duration
             if action == "encoded":
                 encoded_count += 1
+                if new_size > orig_size:
+                    grew_files.append((src, orig_size, new_size))
             else:
                 copied_count += 1
             if downscaled:
@@ -985,6 +990,14 @@ def main():
                  f"Skipped (existing): {skipped_existing} | Failed: {len(failed_files)}")
     logging.info(breakdown)
     print(f"\n{breakdown}")
+
+    if grew_files:
+        logging.info(f"{len(grew_files)} file(s) grew instead of shrinking after encoding:")
+        for f, orig, new in grew_files:
+            logging.info(f"  GREW: {f} ({human_size(orig)} -> {human_size(new)})")
+        print(f"\n{len(grew_files)} file(s) grew instead of shrinking after encoding:")
+        for f, orig, new in grew_files:
+            print(f"  - {f} ({human_size(orig)} -> {human_size(new)})")
 
     downscale_line = f"Downscaled from >1080p: {downscaled_count} file(s)"
     logging.info(downscale_line)
