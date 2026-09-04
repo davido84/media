@@ -99,20 +99,15 @@ def compute_timeout_seconds(src_size_bytes: int) -> float:
     return TIMEOUT_FLOOR_SECONDS + size_gb * TIMEOUT_SECONDS_PER_GB
 
 
-def str_to_bool(value: str) -> bool:
-    """argparse type function for explicit True/False style boolean options."""
-    if value.lower() in ("true", "1", "yes"):
-        return True
-    if value.lower() in ("false", "0", "no"):
-        return False
-    raise argparse.ArgumentTypeError(f"expected True or False, got: {value!r}")
-
-
 def build_parser():
     parser = argparse.ArgumentParser(
         description="Recursively re-encode .mp4/.mkv files to H.265 (hardware via Intel "
-                    "Quick Sync by default; use --encoding=software for libx265), "
-                    "downscaling to 1080p if larger, skipping files already in H.265."
+                    "Quick Sync by default; use --encoding=software for libx265). Files "
+                    "already in H.265 are copied through unchanged, not re-encoded. "
+                    "Optional flags add 1080p downscaling (-w), non-English audio "
+                    "stripping (-e), and EBU R128 loudness normalization "
+                    "(--normalize-audio). See --compare-crf to test-encode a single file "
+                    "at multiple CRF values side by side."
     )
     parser.add_argument("-i", "--input", dest="input_folder", type=Path, default=Path("."),
                          help="Folder to scan recursively for .mp4/.mkv files. Default: current folder")
@@ -121,9 +116,9 @@ def build_parser():
                               "If this is the same as the input folder, converted files replace "
                               "the originals in place. Required when --duration is set (test encodes "
                               "must not overwrite your source files).")
-    parser.add_argument("--crf", type=int, default=22,
+    parser.add_argument("-q", "--crf", type=int, default=22,
                          help="x265 CRF value (lower = higher quality/larger file). Default: 22")
-    parser.add_argument("--duration", type=float, default=-1,
+    parser.add_argument("-t", "--duration", type=float, default=-1,
                          help="Encode only the first N seconds of each file. "
                               "Default: -1 (encode the full file)")
     parser.add_argument("--dry-run", action="store_true",
@@ -135,13 +130,12 @@ def build_parser():
     parser.add_argument("--encoding", choices=["hardware", "software"], default="hardware",
                          help="Encoding mode. 'software' uses libx265 (CPU). 'hardware' uses "
                               "Intel Quick Sync (hevc_qsv). Default: hardware")
-    parser.add_argument("--normalize-audio", type=str_to_bool, default=False,
-                         metavar="{True,False}",
+    parser.add_argument("-a", "--normalize-audio", action="store_true",
                          help="Apply EBU R128 loudness normalization (ffmpeg's loudnorm filter, "
                               "two-pass) to the audio track during encoding. Only affects files "
                               "that are actually re-encoded — files copied as-is (already H.265, "
                               "or below --min-size-mb) are left untouched. Adds an extra "
-                              "full-length analysis pass per re-encoded file. Default: False")
+                              "full-length analysis pass per re-encoded file. Default: off")
     parser.add_argument("--loudnorm-target", type=float, default=-16,
                          help="Integrated loudness target in LUFS, used with --normalize-audio. "
                               "-16 is typical for general/streaming content, -23 is the EBU "
