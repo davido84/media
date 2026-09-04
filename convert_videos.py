@@ -742,7 +742,8 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
     of --crf alone is easy to read off, whether encoding is hardware or software. Also
     copies the unmodified original into output_folder (trimmed to match via lossless
     stream copy when duration is set) so it can be compared side by side with every
-    CRF variant.
+    CRF variant — skipped if that copy already exists from a previous run, since it's
+    identical regardless of encoding/CRF and doesn't need to be redone.
     Called once per file by main() when --compare-crf covers a whole folder; output
     filenames include src.stem and the encoding type, so multiple files' test encodes
     (and a hardware vs. software re-run of the same file) coexist in the same output
@@ -770,24 +771,28 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
     # doesn't depend on it.
     original_dst = output_folder / f"{src.stem}_original{src.suffix}"
     original_copied = False
-    try:
-        if duration == -1:
-            shutil.copy2(src, original_dst)
-        else:
-            copy_cmd = ["ffmpeg", "-y", "-i", str(src), "-t", str(duration),
-                        "-c", "copy", str(original_dst)]
-            logging.info(f"Command: {format_cmd_for_log(copy_cmd)}")
-            copy_result = subprocess.run(copy_cmd, capture_output=True, text=True,
-                                          timeout=timeout_seconds)
-            if copy_result.returncode != 0 or not original_dst.exists():
-                raise RuntimeError(f"ffmpeg exited with code {copy_result.returncode}: "
-                                    f"{copy_result.stderr[-500:]}")
-        logging.info(f"COPIED (original, unmodified): {src} -> {original_dst}")
+    if original_dst.exists():
+        logging.info(f"Original comparison copy already exists, skipping: {original_dst}")
         original_copied = True
-    except subprocess.TimeoutExpired:
-        logging.warning(f"Timed out creating original-comparison copy, skipping it: {src}")
-    except (OSError, RuntimeError) as e:
-        logging.warning(f"Could not create original-comparison copy, skipping it: {e}: {src}")
+    else:
+        try:
+            if duration == -1:
+                shutil.copy2(src, original_dst)
+            else:
+                copy_cmd = ["ffmpeg", "-y", "-i", str(src), "-t", str(duration),
+                            "-c", "copy", str(original_dst)]
+                logging.info(f"Command: {format_cmd_for_log(copy_cmd)}")
+                copy_result = subprocess.run(copy_cmd, capture_output=True, text=True,
+                                              timeout=timeout_seconds)
+                if copy_result.returncode != 0 or not original_dst.exists():
+                    raise RuntimeError(f"ffmpeg exited with code {copy_result.returncode}: "
+                                        f"{copy_result.stderr[-500:]}")
+            logging.info(f"COPIED (original, unmodified): {src} -> {original_dst}")
+            original_copied = True
+        except subprocess.TimeoutExpired:
+            logging.warning(f"Timed out creating original-comparison copy, skipping it: {src}")
+        except (OSError, RuntimeError) as e:
+            logging.warning(f"Could not create original-comparison copy, skipping it: {e}: {src}")
 
     media = probe_media(src, timeout_seconds)
     video_info = media["video"]
@@ -836,7 +841,7 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
     table = "\n".join(lines)
     print(table)
     if original_copied:
-        print(f"Original (unmodified) copied to: {original_dst}")
+        print(f"Original (unmodified) available at: {original_dst}")
     print(f"\nTest files written to: {output_folder}")
     for line in lines:
         logging.info(line)
