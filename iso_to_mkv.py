@@ -175,6 +175,17 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        and redone instead. This is whole-ISO granularity only - an
        interrupted multi-title disc is safely redone in full rather
        than partially resumed. Force a redo with -f/--force.
+     - Runaway-output failsafe: the running total size of everything
+       extracted from an ISO so far is checked after each title. If it
+       ever exceeds the input ISO's own size - which should never
+       legitimately happen, since MKV remuxing doesn't meaningfully
+       inflate size and titles are non-overlapping subsets of the same
+       disc - extraction of that ISO stops immediately, a warning is
+       logged, and the source ISO is left in place (not deleted). This
+       catches things like a duplicate/looping extraction or a
+       title-selection bug pulling near-identical playlists, before it
+       can eat through the rest of the disc's titles or the output
+       drive's free space.
      - Title extraction streams makemkvcon's progress output live
        (parsing PRGT/PRGV robot-mode lines) instead of going silent for
        the whole extraction; only shown when stdout is a real terminal.
@@ -1039,7 +1050,10 @@ def process_iso(
         out_dir.mkdir(parents=True, exist_ok=True)
 
     all_ok = True
+    stop_reason: Optional[str] = None  # set when all_ok is False for a reason other than a title outright failing
     output_filenames: List[str] = []  # populated on success, written into the manifest below
+    iso_size_bytes = iso_path.stat().st_size
+    total_extracted_bytes = 0  # running total across titles - see size failsafe below
     for tid in sorted(candidates):
         title = titles[tid]
         logger.info(
@@ -1153,8 +1167,37 @@ def process_iso(
         output_filenames.append(final_name)
         stats.conversions_success += 1
 
+        # --- Runaway-output failsafe ---
+        # The combined size of everything extracted from this ISO should
+        # never exceed the ISO itself (MKV remuxing doesn't meaningfully
+        # inflate size, and this script's own titles are non-overlapping
+        # subsets of the same disc). If it does, something is badly wrong
+        # (e.g. a duplicate/looping extraction, or a title-selection bug
+        # pulling near-identical playlists) - stop pulling more titles
+        # from this ISO and leave the source alone rather than silently
+        # deleting it once the run finishes.
+        total_extracted_bytes += after_snapshot[qualifying_new_mkvs[0]]
+        if total_extracted_bytes > iso_size_bytes:
+            stop_reason = (
+                f"extracted output so far ({human_bytes(total_extracted_bytes)}) exceeds the "
+                f"input ISO's own size ({human_bytes(iso_size_bytes)})"
+            )
+            logger.warning(
+                f"{stop_reason} - this points to something wrong with the extraction rather "
+                f"than genuinely larger output. Stopping further titles for this ISO; source "
+                f"file will be retained.",
+                iso_path,
+            )
+            stats.warnings += 1
+            stats.conversions_error += 1
+            all_ok = False
+            break
+
     if not all_ok:
-        logger.error("One or more titles failed to convert; source file retained", iso_path)
+        if stop_reason:
+            logger.error(f"Stopped converting this ISO: {stop_reason}; source file retained", iso_path)
+        else:
+            logger.error("One or more titles failed to convert; source file retained", iso_path)
         return ProcessResult()
 
     logger.info("All selected titles converted successfully", iso_path)
