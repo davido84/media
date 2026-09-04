@@ -160,27 +160,13 @@ def build_parser():
                               "language tag at all, all audio tracks are kept regardless. "
                               "Default: off (all audio tracks are kept)")
     parser.add_argument("--compare-crf", type=str, default=None, metavar="CRF1,CRF2,...",
-                         help="Comparison mode: instead of a normal batch run, test-encode "
-                              "every .mp4/.mkv file found in the input folder (recursively) "
-                              "at each comma-separated CRF value given here (e.g. "
-                              "--compare-crf 18,22,28,35), printing a table of output size "
-                              "and encode time per value for each file, plus one aggregate "
-                              "table across all files (when more than one is found) showing "
-                              "total size, % reduction, and average encode time per CRF, so "
-                              "the best CRF for the whole batch is easy to read off. Point "
-                              "-i at a folder with just one test file if you only want a "
-                              "single comparison. Uses --duration as the test clip length if "
-                              "set, otherwise encodes the entire file (which can be slow "
-                              "across several CRF values for a large or multi-file folder — "
-                              "pass --duration for a quicker test). Keeps all audio/subtitle "
-                              "tracks and disables --normalize-audio, so the only thing "
-                              "varying between rows is CRF. Requires -o/--output, which must "
-                              "be different from -i/--input (test files are written "
-                              "directly there, named <name>_crf<value><ext>, alongside an "
-                              "unmodified copy of the original named <name>_original<ext> "
-                              "(trimmed to match via lossless stream copy when --duration is "
-                              "set, so it's a fair comparison) so every variant plus the "
-                              "source sit side by side).")
+                         help="Comparison mode: test-encode every file at each given CRF "
+                              "(e.g. 18,22,28,35), printing a size/time table per file plus "
+                              "an aggregate table across files. Uses --duration for a quick "
+                              "clip test if set, otherwise encodes full files. Requires "
+                              "-o/--output different from -i/--input. Writes "
+                              "<name>_crf<value><ext> plus an unmodified <name>_original<ext> "
+                              "for side-by-side comparison.")
     return parser
 
 
