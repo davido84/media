@@ -516,11 +516,18 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                   normalize_audio: bool = True, loudnorm_target: float = -16,
                   downscale: bool = False, strip_non_english_audio: bool = False):
     """Returns (original_size, new_size, video_duration_seconds, action, downscaled) on
-    success, or None if skipped/dry-run. action is 'encoded' or 'copied'. downscaled is
-    True if the file was scaled down from >1080p. video_duration_seconds may be None if
-    duration could not be determined at all. Raises ConversionError if ffprobe or ffmpeg
-    fails on a file that must be processed (small below-threshold files are copied
-    regardless of a duration-probe failure, since they were never going to be encoded)."""
+    success or dry-run preview, or None only when the caller already decided to skip the
+    file entirely before calling this (not used internally here; reserved for callers).
+    action is 'encoded' or 'copied'. downscaled is True if the file was scaled down from
+    >1080p. video_duration_seconds may be None if duration could not be determined at
+    all. In dry-run mode, new_size is a placeholder equal to original_size (no actual
+    encode happens, so the real output size is unknown) — safe because dry-run never
+    prints the "Total reduction" summary that would otherwise misuse it; it's only used
+    for the Encoded/Copied/Failed breakdown and --limit accounting, both of which need
+    original_size and action/downscaled, not a real new_size. Raises ConversionError if
+    ffprobe or ffmpeg fails on a file that must be processed (small below-threshold files
+    are copied regardless of a duration-probe failure, since they were never going to be
+    encoded)."""
     min_size_bytes = min_size_mb * 1024 * 1024
     src_stat = src.stat()
     src_size = src_stat.st_size
@@ -547,7 +554,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         if dry_run:
             logging.info(f"[DRY RUN] WOULD COPY (below {min_size_mb}MB minimum, "
                          f"{human_size(src_size)}): {src} -> {dst}")
-            return None
+            return (src_size, src_size, small_file_duration, "copied", False)
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
         logging.info(f"COPIED (below {min_size_mb}MB minimum, "
@@ -567,7 +574,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
             return (src_size, src_size, video_duration, "copied", False)
         if dry_run:
             logging.info(f"[DRY RUN] WOULD COPY (already H.265): {src} -> {dst}")
-            return None
+            return (src_size, src_size, video_duration, "copied", False)
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
         logging.info(f"COPIED (already H.265): {src} -> {dst}")
@@ -646,7 +653,12 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
             logging.info(f"[DRY RUN] Note: audio will be normalized in two passes "
                          f"(a measurement pass, then the exact-gain encode shown above "
                          f"reflects the one-pass shape only): {src}")
-        return None
+        # new_size is unknown without actually encoding, so src_size is reported as a
+        # placeholder (no reduction assumed). This is safe because the "Total
+        # reduction" summary is never printed in dry-run mode, only the
+        # Encoded/Copied/Failed breakdown and --limit accounting, which need orig_size
+        # and action/downscaled, not a real new_size.
+        return (src_size, src_size, video_duration, "encoded", needs_downscale)
 
     # When replacing in place, ffmpeg can't read and write the same path at once,
     # so encode to a temp file alongside it, then swap it in on success.
@@ -946,8 +958,9 @@ def main():
 
             if total_orig >= limit_bytes:
                 limit_reached = True
+                verb = "would be processed" if args.dry_run else "processed"
                 logging.info(f"Data limit of {args.limit}GB reached "
-                             f"({human_size(total_orig)} processed). Stopping.")
+                             f"({human_size(total_orig)} {verb}). Stopping.")
                 break
 
     if skipped_existing:
