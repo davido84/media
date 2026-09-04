@@ -104,7 +104,7 @@ def build_parser():
         description="Recursively re-encode .mp4/.mkv files to H.265 (hardware via Intel "
                     "Quick Sync by default; use --encoding=software for libx265). Files "
                     "already in H.265 are copied through unchanged, not re-encoded. "
-                    "Optional flags add 1080p downscaling (-w), non-English audio "
+                    "Optional flags add 1080p downscaling (-d), non-English audio "
                     "stripping (-e), and EBU R128 loudness normalization "
                     "(--normalize-audio). See --compare-crf to test-encode a single file "
                     "at multiple CRF values side by side."
@@ -130,7 +130,7 @@ def build_parser():
     parser.add_argument("--encoding", choices=["hardware", "software"], default="hardware",
                          help="Encoding mode. 'software' uses libx265 (CPU). 'hardware' uses "
                               "Intel Quick Sync (hevc_qsv). Default: hardware")
-    parser.add_argument("-a", "--normalize-audio", action="store_true",
+    parser.add_argument("-n", "--normalize-audio", action="store_true",
                          help="Apply EBU R128 loudness normalization (ffmpeg's loudnorm filter, "
                               "two-pass) to the audio track during encoding. Only affects files "
                               "that are actually re-encoded — files copied as-is (already H.265, "
@@ -148,7 +148,7 @@ def build_parser():
                          help="Stop processing once this many GB of files have been "
                               "converted or copied (cumulative original size). "
                               "Default: -1 (no limit)")
-    parser.add_argument("-w", "--downscale", action="store_true",
+    parser.add_argument("-d", "--downscale", action="store_true",
                          help="Downscale video to fit within 1920x1080 if the source is "
                               "larger, when re-encoding. Without this flag, files are "
                               "encoded at their original resolution regardless of size. "
