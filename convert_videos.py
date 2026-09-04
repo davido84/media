@@ -164,6 +164,18 @@ def build_parser():
                               "track is tagged as a different language, or has no "
                               "language tag at all, all audio tracks are kept regardless. "
                               "Default: off (all audio tracks are kept)")
+    parser.add_argument("--compare-crf", type=str, default=None, metavar="CRF1,CRF2,...",
+                         help="Comparison mode: instead of a normal batch run, test-encode a "
+                              "single file (the first one found) at each comma-separated CRF "
+                              "value given here (e.g. --compare-crf 18,22,28,35), and print a "
+                              "table of output size and encode time per value. Uses --duration "
+                              "as the test clip length if set, otherwise encodes the entire "
+                              "file (which can be slow for a large file across several CRF "
+                              "values — pass --duration for a quicker test). Keeps all "
+                              "audio/subtitle tracks and disables --normalize-audio, so the "
+                              "only thing varying between rows is CRF. Requires -o/--output. "
+                              "Test files are written directly to -o/--output, named "
+                              "<name>_crf<value><ext> so all variants sit side by side.")
     return parser
 
 
@@ -719,6 +731,74 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     return (orig_size, new_size, video_duration, "encoded", needs_downscale)
 
 
+def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duration: float,
+                        encoding: str, downscale: bool) -> None:
+    """Comparison mode: test-encodes a single source file once per CRF value in
+    crf_values, all other settings held fixed (audio normalization off, all audio/
+    subtitle tracks kept), and prints/logs a size + encode-time table so the effect
+    of --crf alone is easy to read off, whether encoding is hardware or software."""
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    src_size = src.stat().st_size
+    timeout_seconds = compute_timeout_seconds(src_size)
+
+    clip_label = "full file" if duration == -1 else \
+        f"{human_duration(duration, include_seconds=True)} test clip"
+    header = f"CRF comparison for: {src.name}  ({clip_label}, {encoding} encoding)"
+    print(f"\n{header}")
+    logging.info(header)
+
+    media = probe_media(src, timeout_seconds)
+    video_info = media["video"]
+    width, height = video_info.get("width", 0), video_info.get("height", 0)
+    needs_downscale = downscale and (width > 1920 or height > 1080)
+    keep_audio_indices = list(range(len(media["audio_languages"])))
+    keep_subtitle_indices = list(range(len(media["subtitle_tracks"])))
+
+    rows = []  # (crf, size_bytes_or_None, elapsed_seconds, error_or_None)
+    for crf in crf_values:
+        dst = output_folder / f"{src.stem}_crf{crf}{src.suffix}"
+        cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
+                                False, -16, keep_audio_indices, keep_subtitle_indices,
+                                video_info["stream_index"], None)
+        logging.info(f"Command: {format_cmd_for_log(cmd)}")
+
+        start = time.monotonic()
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                     timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            elapsed = time.monotonic() - start
+            logging.error(f"CRF {crf}: ffmpeg timed out after {timeout_seconds:.0f}s")
+            rows.append((crf, None, elapsed, "timed out"))
+            continue
+        elapsed = time.monotonic() - start
+
+        if result.returncode != 0 or not dst.exists():
+            logging.error(f"CRF {crf}: ffmpeg failed (exit {result.returncode}): "
+                          f"{result.stderr[-500:]}")
+            rows.append((crf, None, elapsed, "failed"))
+            continue
+
+        rows.append((crf, dst.stat().st_size, elapsed, None))
+
+    lines = [f"{'CRF':>5}  {'Size':>10}  {'% Reduction':>13}  {'Time':>8}"]
+    for crf, size, elapsed, err in rows:
+        if err is not None:
+            lines.append(f"{crf:>5}  {err:>10}  {'--':>13}  "
+                         f"{human_duration(elapsed, include_seconds=True):>8}")
+        else:
+            pct = f"{(src_size - size) / src_size * 100:.1f}%" if src_size else "--"
+            lines.append(f"{crf:>5}  {human_size(size):>10}  {pct:>13}  "
+                         f"{human_duration(elapsed, include_seconds=True):>8}")
+
+    table = "\n".join(lines)
+    print(table)
+    print(f"\nTest files written to: {output_folder}")
+    for line in lines:
+        logging.info(line)
+
+
 def main():
     args = parse_args()
 
@@ -740,6 +820,23 @@ def main():
               "files are never overwritten with a partial encode.", file=sys.stderr)
         sys.exit(1)
 
+    crf_values = None
+    if args.compare_crf is not None:
+        if args.output_folder is None:
+            print("Error: -o/--output is required when --compare-crf is set.",
+                  file=sys.stderr)
+            sys.exit(1)
+        try:
+            crf_values = sorted({int(v.strip()) for v in args.compare_crf.split(",") if v.strip()})
+        except ValueError:
+            print(f"Error: --compare-crf must be a comma-separated list of integers, "
+                  f"got: {args.compare_crf!r}", file=sys.stderr)
+            sys.exit(1)
+        if len(crf_values) < 2:
+            print("Error: --compare-crf needs at least two distinct CRF values to compare.",
+                  file=sys.stderr)
+            sys.exit(1)
+
     if args.output_folder is None:
         args.output_folder = Path(".")
 
@@ -754,6 +851,12 @@ def main():
         sys.exit(1)
 
     log_path = setup_logging(args.output_folder)
+
+    if crf_values is not None:
+        run_crf_comparison(mp4_files[0], args.output_folder, crf_values, args.duration,
+                            args.encoding, args.downscale)
+        sys.exit(0)
+
     mode = "DRY RUN" if args.dry_run else "LIVE"
     logging.info(f"Starting batch conversion [{mode}]. Input: {input_resolved} "
                  f"Output: {output_resolved} "
