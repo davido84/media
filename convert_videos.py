@@ -110,7 +110,8 @@ def str_to_bool(value: str) -> bool:
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Recursively re-encode .mp4/.mkv files to H.265 (software), "
+        description="Recursively re-encode .mp4/.mkv files to H.265 (hardware via Intel "
+                    "Quick Sync by default; use --encoding=software for libx265), "
                     "downscaling to 1080p if larger, skipping files already in H.265."
     )
     parser.add_argument("-i", "--input", dest="input_folder", type=Path, default=Path("."),
@@ -131,9 +132,9 @@ def build_parser():
     parser.add_argument("--min-size-mb", type=float, default=50,
                          help="Files smaller than this size (in MB) are skipped and just "
                               "copied to the output folder as-is. Default: 50")
-    parser.add_argument("--encoding", choices=["hardware", "software"], default="software",
+    parser.add_argument("--encoding", choices=["hardware", "software"], default="hardware",
                          help="Encoding mode. 'software' uses libx265 (CPU). 'hardware' uses "
-                              "Intel Quick Sync (hevc_qsv). Default: software")
+                              "Intel Quick Sync (hevc_qsv). Default: hardware")
     parser.add_argument("--normalize-audio", type=str_to_bool, default=False,
                          metavar="{True,False}",
                          help="Apply EBU R128 loudness normalization (ffmpeg's loudnorm filter, "
