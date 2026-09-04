@@ -511,22 +511,25 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                   same_location: bool, dry_run: bool = False, encoding: str = "software",
                   normalize_audio: bool = True, loudnorm_target: float = -16,
                   downscale: bool = False, strip_non_english_audio: bool = False):
-    """Returns (original_size, new_size, video_duration_seconds, action, downscaled) on
-    success or dry-run preview, or None only when the caller already decided to skip the
-    file entirely before calling this (not used internally here; reserved for callers).
-    action is 'encoded' or 'copied'. downscaled is True if the file was scaled down from
-    >1080p. video_duration_seconds may be None if duration could not be determined at
-    all. In dry-run mode, new_size is a placeholder equal to original_size (no actual
-    encode happens, so the real output size is unknown) — safe because dry-run never
-    prints the "Total reduction" summary that would otherwise misuse it; it's only used
-    for the Encoded/Copied/Failed breakdown and --limit accounting, both of which need
-    original_size and action/downscaled, not a real new_size. If a real encode ends up
-    larger than the source, it's discarded and the original is copied through instead
-    (action='copied', new_size==original_size) — this only applies to the normal batch
-    path, not run_crf_comparison's test encodes, where seeing every CRF's actual size
-    is the point. Raises ConversionError if ffprobe or ffmpeg fails on a file that must
-    be processed (small below-threshold files are copied regardless of a duration-probe
-    failure, since they were never going to be encoded)."""
+    """Returns (original_size, new_size, video_duration_seconds, action, downscaled,
+    grew_larger) on success or dry-run preview, or None only when the caller already
+    decided to skip the file entirely before calling this (not used internally here;
+    reserved for callers). action is 'encoded' or 'copied'. downscaled is True if the
+    file was scaled down from >1080p. video_duration_seconds may be None if duration
+    could not be determined at all. In dry-run mode, new_size is a placeholder equal to
+    original_size (no actual encode happens, so the real output size is unknown) — safe
+    because dry-run never prints the "Total reduction" summary that would otherwise
+    misuse it; it's only used for the Encoded/Copied/Failed breakdown and --limit
+    accounting, both of which need original_size and action/downscaled, not a real
+    new_size. grew_larger is True only when a real encode came out bigger than the
+    source and was discarded in favor of copying the original through instead
+    (action='copied', new_size==original_size in that case) — always False in dry-run
+    mode, since no real encode happened to compare against. This discard-and-fall-back
+    behavior, and grew_larger, only apply to the normal batch path, not
+    run_crf_comparison's test encodes, where seeing every CRF's actual size (including
+    growth) is the point. Raises ConversionError if ffprobe or ffmpeg fails on a file
+    that must be processed (small below-threshold files are copied regardless of a
+    duration-probe failure, since they were never going to be encoded)."""
     min_size_bytes = min_size_mb * 1024 * 1024
     src_stat = src.stat()
     src_size = src_stat.st_size
@@ -549,16 +552,16 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         if same_location:
             logging.info(f"KEPT (below {min_size_mb}MB minimum, already in place, "
                          f"{human_size(src_size)}): {src}")
-            return (src_size, src_size, small_file_duration, "copied", False)
+            return (src_size, src_size, small_file_duration, "copied", False, False)
         if dry_run:
             logging.info(f"[DRY RUN] WOULD COPY (below {min_size_mb}MB minimum, "
                          f"{human_size(src_size)}): {src} -> {dst}")
-            return (src_size, src_size, small_file_duration, "copied", False)
+            return (src_size, src_size, small_file_duration, "copied", False, False)
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
         logging.info(f"COPIED (below {min_size_mb}MB minimum, "
                      f"{human_size(src_size)}): {src} -> {dst}")
-        return (src_size, src_size, small_file_duration, "copied", False)
+        return (src_size, src_size, small_file_duration, "copied", False, False)
 
     media = probe_media(src, timeout_seconds)
     video_info = media["video"]
@@ -570,14 +573,14 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     if codec == "hevc":
         if same_location:
             logging.info(f"KEPT (already H.265, already in place): {src}")
-            return (src_size, src_size, video_duration, "copied", False)
+            return (src_size, src_size, video_duration, "copied", False, False)
         if dry_run:
             logging.info(f"[DRY RUN] WOULD COPY (already H.265): {src} -> {dst}")
-            return (src_size, src_size, video_duration, "copied", False)
+            return (src_size, src_size, video_duration, "copied", False, False)
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
         logging.info(f"COPIED (already H.265): {src} -> {dst}")
-        return (src_size, src_size, video_duration, "copied", False)
+        return (src_size, src_size, video_duration, "copied", False, False)
 
     needs_downscale = downscale and (width > 1920 or height > 1080)
 
@@ -657,7 +660,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         # reduction" summary is never printed in dry-run mode, only the
         # Encoded/Copied/Failed breakdown and --limit accounting, which need orig_size
         # and action/downscaled, not a real new_size.
-        return (src_size, src_size, video_duration, "encoded", needs_downscale)
+        return (src_size, src_size, video_duration, "encoded", needs_downscale, False)
 
     # When replacing in place, ffmpeg can't read and write the same path at once,
     # so encode to a temp file alongside it, then swap it in on success. The real
@@ -738,16 +741,16 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         growth_pct = (candidate_size / src_size - 1) * 100 if src_size else 0
         if same_location:
             encode_target.unlink(missing_ok=True)
-            logging.info(f"DISCARDED (encode grew {human_size(src_size)} -> "
-                         f"{human_size(candidate_size)}, +{growth_pct:.1f}%); "
-                         f"original kept unchanged: {src}")
+            logging.warning(f"DISCARDED (encode grew {human_size(src_size)} -> "
+                            f"{human_size(candidate_size)}, +{growth_pct:.1f}%); "
+                            f"original kept unchanged: {src}")
         else:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)  # overwrites the too-large candidate at dst
-            logging.info(f"DISCARDED (encode grew {human_size(src_size)} -> "
-                         f"{human_size(candidate_size)}, +{growth_pct:.1f}%); "
-                         f"copied original instead: {src} -> {dst}")
-        return (src_size, src_size, video_duration, "copied", False)
+            logging.warning(f"DISCARDED (encode grew {human_size(src_size)} -> "
+                            f"{human_size(candidate_size)}, +{growth_pct:.1f}%); "
+                            f"copied original instead: {src} -> {dst}")
+        return (src_size, src_size, video_duration, "copied", False, True)
 
     if same_location:
         os.replace(encode_target, dst)  # dst == src here; atomic swap-in
@@ -760,7 +763,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     saved_pct = (1 - new_size / orig_size) * 100 if orig_size else 0
     logging.info(f"DONE: {src} -> {dst} "
                  f"({human_size(orig_size)} -> {human_size(new_size)}, {saved_pct:.1f}% smaller)")
-    return (orig_size, new_size, video_duration, "encoded", needs_downscale)
+    return (orig_size, new_size, video_duration, "encoded", needs_downscale, False)
 
 
 def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duration: float,
@@ -1056,6 +1059,7 @@ def main():
     encoded_count = 0
     copied_count = 0
     downscaled_count = 0
+    grew_larger_count = 0
     limit_bytes = float("inf") if args.limit == -1 else args.limit * 1024 ** 3
     limit_reached = False
 
@@ -1114,7 +1118,7 @@ def main():
         processed_bytes += src_size
 
         if result is not None:
-            orig_size, new_size, video_duration, action, downscaled = result
+            orig_size, new_size, video_duration, action, downscaled, grew_larger = result
             total_orig += orig_size
             total_new += new_size
             if video_duration is not None:
@@ -1125,6 +1129,8 @@ def main():
                 copied_count += 1
             if downscaled:
                 downscaled_count += 1
+            if grew_larger:
+                grew_larger_count += 1
 
             if total_orig >= limit_bytes:
                 limit_reached = True
@@ -1159,6 +1165,10 @@ def main():
     downscale_line = f"Downscaled from >1080p: {downscaled_count} file(s)"
     logging.info(downscale_line)
     print(downscale_line)
+
+    grew_larger_line = f"Larger after encoding (discarded, original kept): {grew_larger_count} file(s)"
+    logging.info(grew_larger_line)
+    print(grew_larger_line)
 
     script_runtime = time.monotonic() - batch_start
     script_runtime_line = f"Script runtime: {human_duration(script_runtime, include_seconds=True)}"
