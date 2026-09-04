@@ -165,8 +165,8 @@ def build_parser():
                               "an aggregate table across files. Uses --duration for a quick "
                               "clip test if set, otherwise encodes full files. Requires "
                               "-o/--output different from -i/--input. Writes "
-                              "<name>_crf<value><ext> plus an unmodified <name>_original<ext> "
-                              "for side-by-side comparison.")
+                              "<name>_crf<value>_<hardware|software><ext> plus an unmodified "
+                              "<name>_original<ext> for side-by-side comparison.")
     return parser
 
 
@@ -744,8 +744,9 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
     stream copy when duration is set) so it can be compared side by side with every
     CRF variant.
     Called once per file by main() when --compare-crf covers a whole folder; output
-    filenames include src.stem, so multiple files' test encodes coexist in the same
-    output folder without colliding.
+    filenames include src.stem and the encoding type, so multiple files' test encodes
+    (and a hardware vs. software re-run of the same file) coexist in the same output
+    folder without colliding.
     Returns (src_size, rows), where rows is the same (crf, size_bytes_or_None,
     elapsed_seconds, error_or_None) list used for this file's own table, so main() can
     fold every file's rows together into one aggregate table across the whole batch."""
@@ -797,7 +798,7 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
 
     rows = []  # (crf, size_bytes_or_None, elapsed_seconds, error_or_None)
     for crf in crf_values:
-        dst = output_folder / f"{src.stem}_crf{crf}{src.suffix}"
+        dst = output_folder / f"{src.stem}_crf{crf}_{encoding}{src.suffix}"
         cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
                                 False, -16, keep_audio_indices, keep_subtitle_indices,
                                 video_info["stream_index"], None)
