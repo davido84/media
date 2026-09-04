@@ -520,10 +520,13 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     encode happens, so the real output size is unknown) — safe because dry-run never
     prints the "Total reduction" summary that would otherwise misuse it; it's only used
     for the Encoded/Copied/Failed breakdown and --limit accounting, both of which need
-    original_size and action/downscaled, not a real new_size. Raises ConversionError if
-    ffprobe or ffmpeg fails on a file that must be processed (small below-threshold files
-    are copied regardless of a duration-probe failure, since they were never going to be
-    encoded)."""
+    original_size and action/downscaled, not a real new_size. If a real encode ends up
+    larger than the source, it's discarded and the original is copied through instead
+    (action='copied', new_size==original_size) — this only applies to the normal batch
+    path, not run_crf_comparison's test encodes, where seeing every CRF's actual size
+    is the point. Raises ConversionError if ffprobe or ffmpeg fails on a file that must
+    be processed (small below-threshold files are copied regardless of a duration-probe
+    failure, since they were never going to be encoded)."""
     min_size_bytes = min_size_mb * 1024 * 1024
     src_stat = src.stat()
     src_size = src_stat.st_size
@@ -657,9 +660,12 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         return (src_size, src_size, video_duration, "encoded", needs_downscale)
 
     # When replacing in place, ffmpeg can't read and write the same path at once,
-    # so encode to a temp file alongside it, then swap it in on success.
+    # so encode to a temp file alongside it, then swap it in on success. The real
+    # extension must stay last (".converting.tmp.mp4", not "....mp4.converting.tmp"),
+    # since ffmpeg picks its output container by the final suffix and can't infer one
+    # from ".tmp".
     if same_location:
-        encode_target = dst.parent / f".{dst.name}.converting.tmp"
+        encode_target = dst.parent / f".{dst.stem}.converting.tmp{dst.suffix}"
     else:
         encode_target = dst
 
@@ -720,6 +726,29 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         logging.info(f"VALIDATED: output duration {output_duration:.1f}s matches source "
                      f"{video_duration:.1f}s: {src}")
 
+    # Check the candidate output's size before committing it, so a converted file that
+    # ended up larger than the source is never kept — growing storage instead of
+    # shrinking it defeats the point of this script. This check happens before the
+    # in-place swap below, so for same_location the original at dst/src is never
+    # touched if the encode is discarded. --compare-crf deliberately doesn't apply
+    # this: seeing every CRF's real size, including ones that grew, is the whole point
+    # of that comparison.
+    candidate_size = encode_target.stat().st_size
+    if candidate_size > src_size:
+        growth_pct = (candidate_size / src_size - 1) * 100 if src_size else 0
+        if same_location:
+            encode_target.unlink(missing_ok=True)
+            logging.info(f"DISCARDED (encode grew {human_size(src_size)} -> "
+                         f"{human_size(candidate_size)}, +{growth_pct:.1f}%); "
+                         f"original kept unchanged: {src}")
+        else:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)  # overwrites the too-large candidate at dst
+            logging.info(f"DISCARDED (encode grew {human_size(src_size)} -> "
+                         f"{human_size(candidate_size)}, +{growth_pct:.1f}%); "
+                         f"copied original instead: {src} -> {dst}")
+        return (src_size, src_size, video_duration, "copied", False)
+
     if same_location:
         os.replace(encode_target, dst)  # dst == src here; atomic swap-in
 
@@ -739,18 +768,21 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
     """Comparison mode for a single source file: test-encodes src once per CRF value in
     crf_values, all other settings held fixed (audio normalization off, all audio/
     subtitle tracks kept), and prints/logs a size + encode-time table so the effect
-    of --crf alone is easy to read off, whether encoding is hardware or software. Also
-    copies the unmodified original into output_folder (trimmed to match via lossless
-    stream copy when duration is set) so it can be compared side by side with every
-    CRF variant — skipped if that copy already exists from a previous run, since it's
-    identical regardless of encoding/CRF and doesn't need to be redone.
+    of --crf alone is easy to read off, whether encoding is hardware or software. A CRF
+    value whose output file already exists is not re-encoded; its existing size is
+    reused instead. Also copies the unmodified original into output_folder (trimmed to
+    match via lossless stream copy when duration is set) so it can be compared side by
+    side with every CRF variant — skipped if that copy already exists from a previous
+    run, since it's identical regardless of encoding/CRF and doesn't need to be redone.
     Called once per file by main() when --compare-crf covers a whole folder; output
     filenames include src.stem and the encoding type, so multiple files' test encodes
     (and a hardware vs. software re-run of the same file) coexist in the same output
     folder without colliding.
     Returns (src_size, rows), where rows is the same (crf, size_bytes_or_None,
-    elapsed_seconds, error_or_None) list used for this file's own table, so main() can
-    fold every file's rows together into one aggregate table across the whole batch."""
+    elapsed_seconds, error_or_None, skipped) list used for this file's own table, so
+    main() can fold every file's rows together into one aggregate table across the
+    whole batch. skipped is True when that CRF's output already existed and wasn't
+    re-encoded (elapsed is 0.0 in that case, excluded from the aggregate's avg time)."""
     output_folder.mkdir(parents=True, exist_ok=True)
 
     src_size = src.stat().st_size
@@ -801,9 +833,15 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
     keep_audio_indices = list(range(len(media["audio_languages"])))
     keep_subtitle_indices = list(range(len(media["subtitle_tracks"])))
 
-    rows = []  # (crf, size_bytes_or_None, elapsed_seconds, error_or_None)
+    rows = []  # (crf, size_bytes_or_None, elapsed_seconds, error_or_None, skipped)
     for crf in crf_values:
         dst = output_folder / f"{src.stem}_crf{crf}_{encoding}{src.suffix}"
+
+        if dst.exists():
+            logging.info(f"CRF {crf}: output already exists, skipping encode: {dst}")
+            rows.append((crf, dst.stat().st_size, 0.0, None, True))
+            continue
+
         cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
                                 False, -16, keep_audio_indices, keep_subtitle_indices,
                                 video_info["stream_index"], None)
@@ -816,27 +854,27 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
         except subprocess.TimeoutExpired:
             elapsed = time.monotonic() - start
             logging.error(f"CRF {crf}: ffmpeg timed out after {timeout_seconds:.0f}s")
-            rows.append((crf, None, elapsed, "timed out"))
+            rows.append((crf, None, elapsed, "timed out", False))
             continue
         elapsed = time.monotonic() - start
 
         if result.returncode != 0 or not dst.exists():
             logging.error(f"CRF {crf}: ffmpeg failed (exit {result.returncode}): "
                           f"{result.stderr[-500:]}")
-            rows.append((crf, None, elapsed, "failed"))
+            rows.append((crf, None, elapsed, "failed", False))
             continue
 
-        rows.append((crf, dst.stat().st_size, elapsed, None))
+        rows.append((crf, dst.stat().st_size, elapsed, None, False))
 
     lines = [f"{'CRF':>5}  {'Size':>10}  {'% Reduction':>13}  {'Time':>8}"]
-    for crf, size, elapsed, err in rows:
+    for crf, size, elapsed, err, skipped in rows:
         if err is not None:
             lines.append(f"{crf:>5}  {err:>10}  {'--':>13}  "
                          f"{human_duration(elapsed, include_seconds=True):>8}")
         else:
             pct = f"{(src_size - size) / src_size * 100:.1f}%" if src_size else "--"
-            lines.append(f"{crf:>5}  {human_size(size):>10}  {pct:>13}  "
-                         f"{human_duration(elapsed, include_seconds=True):>8}")
+            time_col = "existing" if skipped else human_duration(elapsed, include_seconds=True)
+            lines.append(f"{crf:>5}  {human_size(size):>10}  {pct:>13}  {time_col:>8}")
 
     table = "\n".join(lines)
     print(table)
@@ -853,10 +891,12 @@ def print_crf_aggregate_summary(aggregate: dict, crf_values: list, files_compare
     """Prints/logs one summary table folding every file's CRF comparison together, so
     the best CRF for a whole batch of varied content is easy to read off in one place
     rather than eyeballing each file's individual table. aggregate maps crf -> {orig,
-    new, time, ok, failed} as accumulated by main(); % reduction and avg time are
-    computed only over files where that CRF succeeded (failed/timed-out attempts are
+    new, time, ok, failed, timed_ok} as accumulated by main(); % reduction is computed
+    over every success (ok), while avg time is computed only over timed_ok (freshly
+    encoded files, excluding ones that reused an existing output) so a skipped-existing
+    file's elapsed=0 doesn't drag the average down. failed/timed-out attempts are
     reported as a count, not folded into the size/time totals, since they contributed
-    no size or a meaningless partial time)."""
+    no size or a meaningless partial time."""
     header = f"\nAggregate CRF comparison across {files_compared} file(s):"
     print(header)
     logging.info(header.strip())
@@ -870,9 +910,12 @@ def print_crf_aggregate_summary(aggregate: dict, crf_values: list, files_compare
             lines.append(f"{crf:>5}  {files_str:>8}  {'--':>11}  {'--':>13}  {'--':>9}")
             continue
         pct = f"{(stats['orig'] - stats['new']) / stats['orig'] * 100:.1f}%" if stats["orig"] else "--"
-        avg_time = stats["time"] / stats["ok"]
+        if stats["timed_ok"] > 0:
+            avg_time = human_duration(stats["time"] / stats["timed_ok"], include_seconds=True)
+        else:
+            avg_time = "--"  # every success for this CRF reused an existing output
         lines.append(f"{crf:>5}  {files_str:>8}  {human_size(stats['new']):>11}  "
-                     f"{pct:>13}  {human_duration(avg_time, include_seconds=True):>9}")
+                     f"{pct:>13}  {avg_time:>9}")
 
     table = "\n".join(lines)
     print(table)
@@ -949,9 +992,11 @@ def main():
                      f"{input_resolved}, values: {crf_values}")
         # Per-CRF totals across every file, so a batch of files can be compared as a
         # whole rather than only reading each file's own table individually. Only
-        # successful encodes (err is None) contribute to orig/new/time/ok; a CRF value
-        # that fails or times out on a file still gets counted in "failed" for that CRF.
-        aggregate = {crf: {"orig": 0, "new": 0, "time": 0.0, "ok": 0, "failed": 0}
+        # successful encodes (err is None) contribute to orig/new/ok; a CRF value that
+        # fails or times out on a file still gets counted in "failed" for that CRF.
+        # "timed_ok" tracks only freshly-encoded successes (not reused existing output),
+        # so a skipped-existing file's elapsed=0 doesn't drag down the avg-time column.
+        aggregate = {crf: {"orig": 0, "new": 0, "time": 0.0, "ok": 0, "failed": 0, "timed_ok": 0}
                      for crf in crf_values}
         files_compared = 0
         for src in mp4_files:
@@ -969,12 +1014,14 @@ def main():
                 continue
 
             files_compared += 1
-            for crf, size, elapsed, err in rows:
+            for crf, size, elapsed, err, skipped in rows:
                 if err is None:
                     aggregate[crf]["orig"] += src_size
                     aggregate[crf]["new"] += size
-                    aggregate[crf]["time"] += elapsed
                     aggregate[crf]["ok"] += 1
+                    if not skipped:
+                        aggregate[crf]["time"] += elapsed
+                        aggregate[crf]["timed_ok"] += 1
                 else:
                     aggregate[crf]["failed"] += 1
 
@@ -1005,9 +1052,6 @@ def main():
     encoded_count = 0
     copied_count = 0
     downscaled_count = 0
-    grew_files = []  # (path, orig_size, new_size) for encoded files that ended up
-                     # larger than the source — always empty in dry-run mode, since
-                     # new_size there is a same-as-source placeholder, not a real encode.
     limit_bytes = float("inf") if args.limit == -1 else args.limit * 1024 ** 3
     limit_reached = False
 
@@ -1073,8 +1117,6 @@ def main():
                 total_duration_seconds += video_duration
             if action == "encoded":
                 encoded_count += 1
-                if new_size > orig_size:
-                    grew_files.append((src, orig_size, new_size))
             else:
                 copied_count += 1
             if downscaled:
@@ -1109,14 +1151,6 @@ def main():
                  f"Skipped (existing): {skipped_existing} | Failed: {len(failed_files)}")
     logging.info(breakdown)
     print(f"\n{breakdown}")
-
-    if grew_files:
-        logging.info(f"{len(grew_files)} file(s) grew instead of shrinking after encoding:")
-        for f, orig, new in grew_files:
-            logging.info(f"  GREW: {f} ({human_size(orig)} -> {human_size(new)})")
-        print(f"\n{len(grew_files)} file(s) grew instead of shrinking after encoding:")
-        for f, orig, new in grew_files:
-            print(f"  - {f} ({human_size(orig)} -> {human_size(new)})")
 
     downscale_line = f"Downscaled from >1080p: {downscaled_count} file(s)"
     logging.info(downscale_line)
