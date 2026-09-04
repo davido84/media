@@ -106,7 +106,7 @@ def build_parser():
                     "already in H.265 are copied through unchanged, not re-encoded. "
                     "Optional flags add 1080p downscaling (-d), non-English audio "
                     "stripping (-e), and EBU R128 loudness normalization "
-                    "(--normalize-audio). See --compare-crf to test-encode a single file "
+                    "(--normalize-audio). See --compare-crf to test-encode files "
                     "at multiple CRF values side by side."
     )
     parser.add_argument("-i", "--input", dest="input_folder", type=Path, default=Path("."),
@@ -160,17 +160,27 @@ def build_parser():
                               "language tag at all, all audio tracks are kept regardless. "
                               "Default: off (all audio tracks are kept)")
     parser.add_argument("--compare-crf", type=str, default=None, metavar="CRF1,CRF2,...",
-                         help="Comparison mode: instead of a normal batch run, test-encode a "
-                              "single file (the first one found) at each comma-separated CRF "
-                              "value given here (e.g. --compare-crf 18,22,28,35), and print a "
-                              "table of output size and encode time per value. Uses --duration "
-                              "as the test clip length if set, otherwise encodes the entire "
-                              "file (which can be slow for a large file across several CRF "
-                              "values — pass --duration for a quicker test). Keeps all "
-                              "audio/subtitle tracks and disables --normalize-audio, so the "
-                              "only thing varying between rows is CRF. Requires -o/--output. "
-                              "Test files are written directly to -o/--output, named "
-                              "<name>_crf<value><ext> so all variants sit side by side.")
+                         help="Comparison mode: instead of a normal batch run, test-encode "
+                              "every .mp4/.mkv file found in the input folder (recursively) "
+                              "at each comma-separated CRF value given here (e.g. "
+                              "--compare-crf 18,22,28,35), printing a table of output size "
+                              "and encode time per value for each file, plus one aggregate "
+                              "table across all files (when more than one is found) showing "
+                              "total size, % reduction, and average encode time per CRF, so "
+                              "the best CRF for the whole batch is easy to read off. Point "
+                              "-i at a folder with just one test file if you only want a "
+                              "single comparison. Uses --duration as the test clip length if "
+                              "set, otherwise encodes the entire file (which can be slow "
+                              "across several CRF values for a large or multi-file folder — "
+                              "pass --duration for a quicker test). Keeps all audio/subtitle "
+                              "tracks and disables --normalize-audio, so the only thing "
+                              "varying between rows is CRF. Requires -o/--output, which must "
+                              "be different from -i/--input (test files are written "
+                              "directly there, named <name>_crf<value><ext>, alongside an "
+                              "unmodified copy of the original named <name>_original<ext> "
+                              "(trimmed to match via lossless stream copy when --duration is "
+                              "set, so it's a fair comparison) so every variant plus the "
+                              "source sit side by side).")
     return parser
 
 
@@ -739,11 +749,20 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
 
 
 def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duration: float,
-                        encoding: str, downscale: bool) -> None:
-    """Comparison mode: test-encodes a single source file once per CRF value in
+                        encoding: str, downscale: bool) -> tuple:
+    """Comparison mode for a single source file: test-encodes src once per CRF value in
     crf_values, all other settings held fixed (audio normalization off, all audio/
     subtitle tracks kept), and prints/logs a size + encode-time table so the effect
-    of --crf alone is easy to read off, whether encoding is hardware or software."""
+    of --crf alone is easy to read off, whether encoding is hardware or software. Also
+    copies the unmodified original into output_folder (trimmed to match via lossless
+    stream copy when duration is set) so it can be compared side by side with every
+    CRF variant.
+    Called once per file by main() when --compare-crf covers a whole folder; output
+    filenames include src.stem, so multiple files' test encodes coexist in the same
+    output folder without colliding.
+    Returns (src_size, rows), where rows is the same (crf, size_bytes_or_None,
+    elapsed_seconds, error_or_None) list used for this file's own table, so main() can
+    fold every file's rows together into one aggregate table across the whole batch."""
     output_folder.mkdir(parents=True, exist_ok=True)
 
     src_size = src.stat().st_size
@@ -754,6 +773,34 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
     header = f"CRF comparison for: {src.name}  ({clip_label}, {encoding} encoding)"
     print(f"\n{header}")
     logging.info(header)
+
+    # Also place the unmodified original alongside the CRF variants, so all of them can
+    # be compared side by side (visually and by size). When --duration trims the CRF
+    # test encodes to a short clip, the original is trimmed to match via a lossless
+    # stream copy (no re-encode) rather than copying the full multi-GB source, which
+    # would defeat the point of a quick test; with no --duration, it's a plain byte-for-
+    # byte copy. Failure here is a warning, not fatal — the CRF comparison itself
+    # doesn't depend on it.
+    original_dst = output_folder / f"{src.stem}_original{src.suffix}"
+    original_copied = False
+    try:
+        if duration == -1:
+            shutil.copy2(src, original_dst)
+        else:
+            copy_cmd = ["ffmpeg", "-y", "-i", str(src), "-t", str(duration),
+                        "-c", "copy", str(original_dst)]
+            logging.info(f"Command: {format_cmd_for_log(copy_cmd)}")
+            copy_result = subprocess.run(copy_cmd, capture_output=True, text=True,
+                                          timeout=timeout_seconds)
+            if copy_result.returncode != 0 or not original_dst.exists():
+                raise RuntimeError(f"ffmpeg exited with code {copy_result.returncode}: "
+                                    f"{copy_result.stderr[-500:]}")
+        logging.info(f"COPIED (original, unmodified): {src} -> {original_dst}")
+        original_copied = True
+    except subprocess.TimeoutExpired:
+        logging.warning(f"Timed out creating original-comparison copy, skipping it: {src}")
+    except (OSError, RuntimeError) as e:
+        logging.warning(f"Could not create original-comparison copy, skipping it: {e}: {src}")
 
     media = probe_media(src, timeout_seconds)
     video_info = media["video"]
@@ -801,9 +848,50 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
 
     table = "\n".join(lines)
     print(table)
+    if original_copied:
+        print(f"Original (unmodified) copied to: {original_dst}")
     print(f"\nTest files written to: {output_folder}")
     for line in lines:
         logging.info(line)
+
+    return (src_size, rows)
+
+
+def print_crf_aggregate_summary(aggregate: dict, crf_values: list, files_compared: int) -> None:
+    """Prints/logs one summary table folding every file's CRF comparison together, so
+    the best CRF for a whole batch of varied content is easy to read off in one place
+    rather than eyeballing each file's individual table. aggregate maps crf -> {orig,
+    new, time, ok, failed} as accumulated by main(); % reduction and avg time are
+    computed only over files where that CRF succeeded (failed/timed-out attempts are
+    reported as a count, not folded into the size/time totals, since they contributed
+    no size or a meaningless partial time)."""
+    header = f"\nAggregate CRF comparison across {files_compared} file(s):"
+    print(header)
+    logging.info(header.strip())
+
+    lines = [f"{'CRF':>5}  {'Files OK':>8}  {'Total Size':>11}  "
+             f"{'% Reduction':>13}  {'Avg Time':>9}"]
+    for crf in crf_values:
+        stats = aggregate[crf]
+        files_str = f"{stats['ok']}/{files_compared}"
+        if stats["ok"] == 0:
+            lines.append(f"{crf:>5}  {files_str:>8}  {'--':>11}  {'--':>13}  {'--':>9}")
+            continue
+        pct = f"{(stats['orig'] - stats['new']) / stats['orig'] * 100:.1f}%" if stats["orig"] else "--"
+        avg_time = stats["time"] / stats["ok"]
+        lines.append(f"{crf:>5}  {files_str:>8}  {human_size(stats['new']):>11}  "
+                     f"{pct:>13}  {human_duration(avg_time, include_seconds=True):>9}")
+
+    table = "\n".join(lines)
+    print(table)
+    for line in lines:
+        logging.info(line)
+
+    if any(aggregate[crf]["failed"] for crf in crf_values):
+        note = ("Note: 'Files OK' excludes failed/timed-out encodes at that CRF; see "
+                "the per-file tables above and the log for details.")
+        print(f"\n{note}")
+        logging.info(note)
 
 
 def main():
@@ -857,11 +945,50 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
+    if crf_values is not None and same_location:
+        print("Error: output folder must be different from the input folder when "
+              "--compare-crf is set.", file=sys.stderr)
+        sys.exit(1)
+
     log_path = setup_logging(args.output_folder)
 
     if crf_values is not None:
-        run_crf_comparison(mp4_files[0], args.output_folder, crf_values, args.duration,
-                            args.encoding, args.downscale)
+        logging.info(f"CRF comparison mode: {len(mp4_files)} file(s) found in "
+                     f"{input_resolved}, values: {crf_values}")
+        # Per-CRF totals across every file, so a batch of files can be compared as a
+        # whole rather than only reading each file's own table individually. Only
+        # successful encodes (err is None) contribute to orig/new/time/ok; a CRF value
+        # that fails or times out on a file still gets counted in "failed" for that CRF.
+        aggregate = {crf: {"orig": 0, "new": 0, "time": 0.0, "ok": 0, "failed": 0}
+                     for crf in crf_values}
+        files_compared = 0
+        for src in mp4_files:
+            try:
+                src_size, rows = run_crf_comparison(src, args.output_folder, crf_values,
+                                                     args.duration, args.encoding,
+                                                     args.downscale)
+            except ConversionTimeoutError as e:
+                logging.error(f"TIMEOUT: {e.file.resolve()}\n{e.reason}")
+                logging.error("Stopping the run so this timeout can be investigated. "
+                              "Remaining files were not processed.")
+                sys.exit(1)
+            except ConversionError as e:
+                logging.error(f"CRF comparison skipped for {e.file.resolve()}: {e.reason}")
+                continue
+
+            files_compared += 1
+            for crf, size, elapsed, err in rows:
+                if err is None:
+                    aggregate[crf]["orig"] += src_size
+                    aggregate[crf]["new"] += size
+                    aggregate[crf]["time"] += elapsed
+                    aggregate[crf]["ok"] += 1
+                else:
+                    aggregate[crf]["failed"] += 1
+
+        if files_compared > 1:
+            print_crf_aggregate_summary(aggregate, crf_values, files_compared)
+
         sys.exit(0)
 
     mode = "DRY RUN" if args.dry_run else "LIVE"
