@@ -524,10 +524,11 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     new_size. grew_larger is True only when a real encode came out bigger than the
     source and was discarded in favor of copying the original through instead
     (action='copied', new_size==original_size in that case) — always False in dry-run
-    mode, since no real encode happened to compare against. This discard-and-fall-back
-    behavior, and grew_larger, only apply to the normal batch path, not
-    run_crf_comparison's test encodes, where seeing every CRF's actual size (including
-    growth) is the point. Raises ConversionError if ffprobe or ffmpeg fails on a file
+    mode, since no real encode happened to compare against, and always False when
+    duration != -1, since a partial clip's size isn't comparable to the full source's.
+    This discard-and-fall-back behavior, and grew_larger, only apply to the normal
+    batch path, not run_crf_comparison's test encodes, where seeing every CRF's actual
+    size (including growth) is the point. Raises ConversionError if ffprobe or ffmpeg fails on a file
     that must be processed (small below-threshold files are copied regardless of a
     duration-probe failure, since they were never going to be encoded)."""
     min_size_bytes = min_size_mb * 1024 * 1024
@@ -733,11 +734,15 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     # ended up larger than the source is never kept — growing storage instead of
     # shrinking it defeats the point of this script. This check happens before the
     # in-place swap below, so for same_location the original at dst/src is never
-    # touched if the encode is discarded. --compare-crf deliberately doesn't apply
-    # this: seeing every CRF's real size, including ones that grew, is the whole point
-    # of that comparison.
+    # touched if the encode is discarded. Skipped when --duration is set: the candidate
+    # is only the first N seconds, so comparing its size against the full source's is
+    # meaningless (a short clip of a big file always "shrinks"; a clip of a tiny source
+    # could spuriously "grow" and get replaced by a full-length copy of the original,
+    # which isn't the test output the user asked for). --compare-crf deliberately
+    # doesn't apply this either: seeing every CRF's real size, including ones that grew,
+    # is the whole point of that comparison.
     candidate_size = encode_target.stat().st_size
-    if candidate_size > src_size:
+    if duration == -1 and candidate_size > src_size:
         growth_pct = (candidate_size / src_size - 1) * 100 if src_size else 0
         if same_location:
             encode_target.unlink(missing_ok=True)
