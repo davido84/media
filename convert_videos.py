@@ -145,8 +145,9 @@ def build_parser():
                               "if a file already exists at the output path, it is silently "
                               "skipped.")
     parser.add_argument("--limit", type=float, default=-1,
-                         help="Stop processing once this many GB of files have been "
-                              "converted or copied (cumulative original size). "
+                         help="Stop before processing a file that would push the "
+                              "cumulative original size past this many GB, so the "
+                              "limit acts as a ceiling rather than being overshot. "
                               "Default: -1 (no limit)")
     parser.add_argument("-d", "--downscale", action="store_true",
                          help="Downscale video to fit within 1920x1080 if the source is "
@@ -694,6 +695,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                             keep_subtitle_indices, video_info["stream_index"],
                             measured_loudness)
     logging.info(f"Command: {format_cmd_for_log(cmd)}")
+    encode_start = time.monotonic()
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
@@ -708,6 +710,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
             encode_target.unlink(missing_ok=True)
         raise ConversionError(src, f"ffmpeg exited with code {result.returncode}: "
                                     f"{result.stderr[-2000:]}")
+
+    encode_elapsed = time.monotonic() - encode_start
 
     # Post-encode validation: confirm the output's duration roughly matches the
     # source's before trusting it (and, for in-place mode, before it ever overwrites
@@ -766,8 +770,20 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     orig_size = src_size
     new_size = dst.stat().st_size if dst.exists() else 0
     saved_pct = (1 - new_size / orig_size) * 100 if orig_size else 0
+
+    # Realtime factor: how many seconds of video were encoded per second of wall clock.
+    # Uses the encoded span (the --duration clip length when set, else the full source
+    # duration), so a partial encode isn't credited with the whole file's runtime. Only
+    # shown when both numbers are known and the encode took measurable time.
+    encoded_span = video_duration if duration == -1 else min(duration, video_duration or duration)
+    if encoded_span and encode_elapsed > 0:
+        speed_str = f", {human_duration(encode_elapsed, include_seconds=True)} @ {encoded_span / encode_elapsed:.1f}x realtime"
+    else:
+        speed_str = f", {human_duration(encode_elapsed, include_seconds=True)}"
+
     logging.info(f"DONE: {src} -> {dst} "
-                 f"({human_size(orig_size)} -> {human_size(new_size)}, {saved_pct:.1f}% smaller)")
+                 f"({human_size(orig_size)} -> {human_size(new_size)}, {saved_pct:.1f}% smaller"
+                 f"{speed_str})")
     return (orig_size, new_size, video_duration, "encoded", needs_downscale, False)
 
 
@@ -1077,6 +1093,19 @@ def main():
         src_size = src.stat().st_size
         remaining_bytes = total_size_bytes - processed_bytes
 
+        # Check the limit BEFORE starting this file, so it acts as a true ceiling
+        # rather than being overshot by up to one file's size. total_orig only counts
+        # files actually processed (not ones skipped for an existing output), matching
+        # what --limit is meant to cap.
+        if total_orig + src_size > limit_bytes:
+            limit_reached = True
+            verb = "would be processed" if args.dry_run else "processed"
+            logging.info(f"Data limit of {args.limit}GB reached: next file "
+                         f"({human_size(src_size)}) would exceed it "
+                         f"({human_size(total_orig)} {verb} so far). Stopping.")
+            index -= 1  # this file wasn't started, so it counts as unprocessed below
+            break
+
         elapsed_so_far = time.monotonic() - batch_start
         if processed_bytes > 0 and elapsed_so_far > 0:
             rate = processed_bytes / elapsed_so_far  # bytes/sec
@@ -1136,13 +1165,6 @@ def main():
                 downscaled_count += 1
             if grew_larger:
                 grew_larger_count += 1
-
-            if total_orig >= limit_bytes:
-                limit_reached = True
-                verb = "would be processed" if args.dry_run else "processed"
-                logging.info(f"Data limit of {args.limit}GB reached "
-                             f"({human_size(total_orig)} {verb}). Stopping.")
-                break
 
     if skipped_existing:
         logging.info(f"{skipped_existing} file(s) skipped because the output file already existed.")
