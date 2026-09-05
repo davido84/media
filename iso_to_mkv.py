@@ -238,7 +238,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -1071,7 +1071,7 @@ def process_iso(
         if args.dry_run:
             logger.info(f"[DRY RUN] Would run: {' '.join(cmd)}", iso_path)
             if tid == fpl_identified_main_tid:
-                logger.info(f"[DRY RUN] Would rename output to main_title.mkv", iso_path)
+                logger.info("[DRY RUN] Would rename output to main_title.mkv", iso_path)
             continue
 
         # --- Free-space check (safety enhancement 3) ---
@@ -1189,7 +1189,6 @@ def process_iso(
                 iso_path,
             )
             stats.warnings += 1
-            stats.conversions_error += 1
             all_ok = False
             break
 
