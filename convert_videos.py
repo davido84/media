@@ -1026,9 +1026,7 @@ def main():
         files_compared = 0
         total_files = len(mp4_files)
         for index, src in enumerate(mp4_files, start=1):
-            progress = f"[{index}/{total_files}] Processing: {src.name}"
-            print(f"\n{progress}")
-            logging.info(progress)
+            logging.info(f"[{index}/{total_files}] Processing: {src.name}")
             try:
                 src_size, rows = run_crf_comparison(src, args.output_folder, crf_values,
                                                      args.duration, args.encoding,
