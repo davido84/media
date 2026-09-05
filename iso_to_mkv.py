@@ -186,6 +186,27 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        title-selection bug pulling near-identical playlists, before it
        can eat through the rest of the disc's titles or the output
        drive's free space.
+     - Post-extraction track-count/duration cross-check: after each
+       title is extracted, its actual audio/subtitle track counts and
+       duration (via mkvmerge, or ffprobe if mkvmerge isn't installed)
+       are compared against what MakeMKV itself reported for that title.
+       This catches a class of silent partial failure the size/existence
+       check above can't: a file that's missing tracks or truncated but
+       still comfortably clears MIN_OUTPUT_FILE_BYTES. It's best-effort
+       (silently skipped for the whole run if neither tool is found -
+       see the warning logged at startup) and warning-level rather than
+       a hard stop, since a mismatch isn't as rock-solid an invariant as
+       the size failsafe above. Tune the duration slack with
+       --duration-tolerance-sec (default 5s); disable entirely with
+       --no-verify-tracks.
+     - Non-zero process exit status: the script exits 1 if any real
+       conversion error occurred during the run (a title that failed to
+       extract, a disc whose title info couldn't be read, an unexpected
+       exception), 130 if interrupted with Ctrl+C, and 0 otherwise -
+       including runs where discs were legitimately skipped (ambiguous
+       obfuscation, no qualifying titles, etc.), since those are normal
+       outcomes, not failures. This makes the run's success/failure
+       visible to cron, systemd, or any other wrapper via $?.
      - Title extraction streams makemkvcon's progress output live
        (parsing PRGT/PRGV robot-mode lines) instead of going silent for
        the whole extraction; only shown when stdout is a real terminal.
@@ -250,6 +271,7 @@ from typing import Dict, List, Optional, Tuple
 DEFAULT_LOG = "./convert.log"
 
 # MakeMKV robot-mode attribute IDs (see module docstring, point 1)
+ATTR_TYPE = 1  # stream "Type" attribute on SINFO lines - text value "Video"/"Audio"/"Subtitles"
 ATTR_NAME = 2
 ATTR_DURATION = 9
 ATTR_DISKSIZE_BYTES = 11
@@ -491,6 +513,63 @@ def manifest_matches(
     return True
 
 
+def resolve_probe_tool() -> Optional[str]:
+    """Which external tool (if any) is available to verify an extracted
+    .mkv file's actual audio/subtitle track counts and duration against
+    what MakeMKV reported for the source title (workflow enhancement 7).
+    Resolved once per run rather than once per file. mkvmerge is
+    preferred (it's the most directly applicable tool for an .mkv file,
+    and commonly already installed alongside MakeMKV/MKVToolNix);
+    ffprobe is used as a fallback."""
+    if shutil.which("mkvmerge"):
+        return "mkvmerge"
+    if shutil.which("ffprobe"):
+        return "ffprobe"
+    return None
+
+
+def probe_output_tracks_and_duration(mkv_path: Path, tool: str) -> Optional[Tuple[int, int, float]]:
+    """Best-effort probe of an already-extracted .mkv file's audio track
+    count, subtitle track count, and duration (seconds), using whichever
+    external tool resolve_probe_tool() found. Returns None on any
+    failure (tool not found, bad/unparseable output, timeout) - the
+    cross-check is then simply skipped for that title rather than
+    treated as a failure in its own right, since this is a best-effort
+    extra check layered on top of the file-existence/size check that
+    already gates source deletion."""
+    try:
+        if tool == "mkvmerge":
+            proc = subprocess.run(
+                ["mkvmerge", "-J", str(mkv_path)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=60,
+            )
+            data = json.loads(proc.stdout)
+            tracks = data.get("tracks", [])
+            audio = sum(1 for t in tracks if t.get("type") == "audio")
+            subs = sum(1 for t in tracks if t.get("type") == "subtitles")
+            duration_ns = data.get("container", {}).get("properties", {}).get("duration")
+            duration_sec = (duration_ns / 1_000_000_000.0) if duration_ns else 0.0
+            return audio, subs, duration_sec
+
+        if tool == "ffprobe":
+            proc = subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-print_format", "json",
+                    "-show_entries", "stream=codec_type:format=duration", str(mkv_path),
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=60,
+            )
+            data = json.loads(proc.stdout)
+            streams = data.get("streams", [])
+            audio = sum(1 for s in streams if s.get("codec_type") == "audio")
+            subs = sum(1 for s in streams if s.get("codec_type") == "subtitle")
+            duration_sec = float(data.get("format", {}).get("duration", 0.0) or 0.0)
+            return audio, subs, duration_sec
+    except (subprocess.SubprocessError, ValueError, TypeError, json.JSONDecodeError, OSError):
+        pass
+    return None
+
+
 def check_free_space(out_dir: Path, output_root: Path, required_bytes: int, margin_pct: float) -> Optional[str]:
     """Return None if there's enough free space on the output volume for
     an extraction of about required_bytes (plus a safety margin), else an
@@ -659,6 +738,8 @@ class Title:
     size_bytes: int = 0
     name: Optional[str] = None
     info_text: Optional[str] = None  # attribute 30; may contain "(FPL_MainFeature)"
+    audio_track_count: int = 0       # from SINFO lines - used by the post-extraction cross-check
+    subtitle_track_count: int = 0    # from SINFO lines - used by the post-extraction cross-check
 
 
 def get_disc_titles(
@@ -704,6 +785,27 @@ def get_disc_titles(
                 t.name = value
             elif code == ATTR_INFO:
                 t.info_text = value
+        elif line.startswith("SINFO:"):
+            # SINFO:title_id,stream_id,attribute_id,code,"value" - same
+            # attribute-id/code/value shape as TINFO, with a stream_id
+            # inserted after title_id. Only the Type attribute is used
+            # here, to count audio/subtitle tracks per title for the
+            # post-extraction cross-check (workflow enhancement 7).
+            fields = csv_fields(line[len("SINFO:"):])
+            if len(fields) < 5:
+                continue
+            try:
+                tid, attr_id = int(fields[0]), int(fields[2])
+            except ValueError:
+                continue
+            if attr_id != ATTR_TYPE:
+                continue
+            value = fields[4]
+            t = titles.setdefault(tid, Title(title_id=tid))
+            if value == "Audio":
+                t.audio_track_count += 1
+            elif value == "Subtitles":
+                t.subtitle_track_count += 1
 
     return rc, output, titles, jre_engaged, jre_required_missing
 
@@ -853,6 +955,7 @@ def process_iso(
     logger: DualLogger,
     stats: Stats,
     used_output_names: set,
+    probe_tool: Optional[str],
 ) -> ProcessResult:
     """Returns a ProcessResult describing what happened, so main() can
     drive --limit accounting, source deletion, and the info-scan
@@ -1167,6 +1270,45 @@ def process_iso(
         output_filenames.append(final_name)
         stats.conversions_success += 1
 
+        # --- Post-extraction track-count/duration cross-check (workflow enhancement 7) ---
+        # The size/existence check above only confirms *something* real-
+        # sized landed on disk - it wouldn't catch a file that's missing
+        # half its audio tracks but is still well over MIN_OUTPUT_FILE_BYTES.
+        # This compares the actual output file's audio/subtitle track
+        # counts and duration against what MakeMKV itself reported for the
+        # source title. Best-effort only (skipped entirely if neither
+        # mkvmerge nor ffprobe is installed) and warning-level rather than
+        # a hard stop: unlike the size failsafe below, a mismatch here
+        # isn't a rock-solid invariant - it can occasionally have benign
+        # explanations - so it's surfaced for a manual look rather than
+        # treated as certain corruption.
+        if probe_tool is not None:
+            probe = probe_output_tracks_and_duration(out_dir / final_name, probe_tool)
+            if probe is not None:
+                out_audio, out_subs, out_duration = probe
+                mismatches = []
+                if out_audio != title.audio_track_count:
+                    mismatches.append(
+                        f"audio tracks: expected {title.audio_track_count}, found {out_audio}"
+                    )
+                if out_subs != title.subtitle_track_count:
+                    mismatches.append(
+                        f"subtitle tracks: expected {title.subtitle_track_count}, found {out_subs}"
+                    )
+                if abs(out_duration - title.duration_sec) > args.duration_tolerance_sec:
+                    mismatches.append(
+                        f"duration: expected {format_duration(title.duration_sec)}, "
+                        f"found {format_duration(out_duration)}"
+                    )
+                if mismatches:
+                    logger.warning(
+                        f"Title {tid}: post-extraction cross-check found a mismatch against what "
+                        f"MakeMKV reported for this title ({'; '.join(mismatches)}) - the output "
+                        f"may be missing tracks or truncated; worth a manual look",
+                        iso_path,
+                    )
+                    stats.warnings += 1
+
         # --- Runaway-output failsafe ---
         # The combined size of everything extracted from this ISO should
         # never exceed the ISO itself (MKV remuxing doesn't meaningfully
@@ -1328,6 +1470,17 @@ def parse_args() -> argparse.Namespace:
         "--makemkvcon", default="makemkvcon", metavar="PATH",
         help="Path to the makemkvcon executable",
     )
+    p.add_argument(
+        "--no-verify-tracks", dest="verify_tracks", action="store_false", default=True,
+        help="Disable the post-extraction audio/subtitle track-count and duration cross-check "
+             "against what MakeMKV reported for the title (requires mkvmerge or ffprobe to be "
+             "installed; silently skipped if neither is found). On by default",
+    )
+    p.add_argument(
+        "--duration-tolerance-sec", type=float, default=5.0, metavar="SECONDS",
+        help="Allowed difference between a title's MakeMKV-reported duration and the extracted "
+             "file's actual duration before the track/duration cross-check flags it",
+    )
     return p.parse_args()
 
 
@@ -1356,6 +1509,19 @@ def main() -> int:
         logger.error("Aborting before processing any files - check --makemkvcon or your PATH")
         logger.close()
         return 1
+
+    # --- Post-extraction verification tool (workflow enhancement 7) ---
+    # Resolved once for the whole run rather than per-file. If neither
+    # tool is installed, the cross-check is simply skipped for every
+    # title - logged once here so it's clear why, rather than silently
+    # never firing.
+    probe_tool = resolve_probe_tool() if args.verify_tracks else None
+    if args.verify_tracks and probe_tool is None:
+        logger.warning(
+            "Neither mkvmerge nor ffprobe was found - the post-extraction track-count/duration "
+            "cross-check will be skipped for this entire run. Install MKVToolNix or ffmpeg to "
+            "enable it, or pass --no-verify-tracks to silence this message."
+        )
 
     if not input_root.is_dir():
         logger.error(f"Input folder does not exist: {input_root}")
@@ -1437,7 +1603,9 @@ def main() -> int:
             # is logged against this specific ISO, counted as an error,
             # and the batch moves on to the next file.
             try:
-                result = process_iso(iso_path, input_root, output_root, args, logger, stats, used_output_names)
+                result = process_iso(
+                    iso_path, input_root, output_root, args, logger, stats, used_output_names, probe_tool
+                )
             except KeyboardInterrupt:
                 raise
             except Exception as e:
@@ -1498,7 +1666,15 @@ def main() -> int:
         logger.append_raw_to_file(line)
 
     logger.close()
-    return 130 if interrupted else 0
+
+    # Non-zero exit lets an unattended run (cron, systemd timer, etc.)
+    # actually be noticed as failed - previously this returned 0 even if
+    # every single ISO in the batch failed to convert. Ctrl+C still wins
+    # (130), matching normal shell conventions; a run with zero real
+    # conversion errors (skips/warnings alone don't count) still exits 0.
+    if interrupted:
+        return 130
+    return 1 if stats.conversions_error > 0 else 0
 
 
 if __name__ == "__main__":
