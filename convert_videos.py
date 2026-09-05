@@ -526,14 +526,16 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     because dry-run never prints the "Total reduction" summary that would otherwise
     misuse it; it's only used for the Encoded/Copied/Failed breakdown and --limit
     accounting, both of which need original_size and action/downscaled, not a real
-    new_size. grew_larger is True only when a real encode came out bigger than the
-    source and was discarded in favor of copying the original through instead
-    (action='copied', new_size==original_size in that case) — always False in dry-run
-    mode, since no real encode happened to compare against, and always False when
-    duration != -1, since a partial clip's size isn't comparable to the full source's.
-    This discard-and-fall-back behavior, and grew_larger, only apply to the normal
-    batch path, not run_crf_comparison's test encodes, where seeing every CRF's actual
-    size (including growth) is the point. Raises ConversionError if ffprobe or ffmpeg fails on a file
+    new_size. grew_larger is True whenever a real encode came out bigger than the
+    source. Normally that encode is discarded in favor of copying the original through
+    instead (action='copied', new_size==original_size), but when the file was
+    downscaled the larger encode is KEPT (action='encoded', new_size>original_size),
+    since falling back to the original would silently restore the >1080p resolution
+    the user asked to reduce. Always False in dry-run mode, since no real encode
+    happened to compare against, and always False when duration != -1, since a partial
+    clip's size isn't comparable to the full source's. This whole check only applies
+    to the normal batch path, not run_crf_comparison's test encodes, where seeing
+    every CRF's actual size (including growth) is the point. Raises ConversionError if ffprobe or ffmpeg fails on a file
     that must be processed (small below-threshold files are copied regardless of a
     duration-probe failure, since they were never going to be encoded)."""
     min_size_bytes = min_size_mb * 1024 * 1024
@@ -737,11 +739,14 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     # is only the first N seconds, so comparing its size against the full source's is
     # meaningless (a short clip of a big file always "shrinks"; a clip of a tiny source
     # could spuriously "grow" and get replaced by a full-length copy of the original,
-    # which isn't the test output the user asked for). --compare-crf deliberately
-    # doesn't apply this either: seeing every CRF's real size, including ones that grew,
-    # is the whole point of that comparison.
+    # which isn't the test output the user asked for). Also skipped when the file was
+    # downscaled: falling back to the original would silently restore the >1080p
+    # resolution the user explicitly asked to reduce, so a size regression is the
+    # lesser surprise there. --compare-crf deliberately doesn't apply this either:
+    # seeing every CRF's real size, including ones that grew, is the whole point of
+    # that comparison.
     candidate_size = encode_target.stat().st_size
-    if duration == -1 and candidate_size > src_size:
+    if duration == -1 and not needs_downscale and candidate_size > src_size:
         growth_pct = (candidate_size / src_size - 1) * 100 if src_size else 0
         if same_location:
             encode_target.unlink(missing_ok=True)
@@ -766,6 +771,14 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     new_size = dst.stat().st_size if dst.exists() else 0
     saved_pct = (1 - new_size / orig_size) * 100 if orig_size else 0
 
+    # A downscaled encode is exempt from the discard-on-growth check above, but a size
+    # regression is still worth surfacing rather than passing silently.
+    grew_larger = new_size > orig_size
+    if grew_larger:
+        logging.warning(f"LARGER AFTER ENCODING (kept anyway — file was downscaled to "
+                        f"1080p, so falling back to the original would undo that): "
+                        f"{human_size(orig_size)} -> {human_size(new_size)}: {dst}")
+
     # Realtime factor: how many seconds of video were encoded per second of wall clock.
     # Uses the encoded span (the --duration clip length when set, else the full source
     # duration), so a partial encode isn't credited with the whole file's runtime. Only
@@ -779,7 +792,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     logging.info(f"DONE: {src} -> {dst} "
                  f"({human_size(orig_size)} -> {human_size(new_size)}, {saved_pct:.1f}% smaller"
                  f"{speed_str})")
-    return (orig_size, new_size, video_duration, "encoded", needs_downscale, False)
+    return (orig_size, new_size, video_duration, "encoded", needs_downscale, grew_larger)
 
 
 def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duration: float,
@@ -1181,7 +1194,7 @@ def main():
     logging.info(downscale_line)
     print(downscale_line)
 
-    grew_larger_line = f"Larger after encoding (discarded, original kept): {grew_larger_count} file(s)"
+    grew_larger_line = f"Larger after encoding: {grew_larger_count} file(s)"
     logging.info(grew_larger_line)
     print(grew_larger_line)
 
