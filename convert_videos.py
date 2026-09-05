@@ -73,28 +73,31 @@ class ConversionError(Exception):
 
 
 class ConversionTimeoutError(ConversionError):
-    """Raised when an ffprobe/ffmpeg subprocess exceeds its allotted timeout. Treated
-    as fatal for the whole run (unlike other ConversionErrors, which just skip the
-    file and continue): a timeout is unusual enough, even with a generous allowance,
-    that it's worth stopping to investigate rather than silently skipping ahead."""
+    """Raised when an ffprobe subprocess exceeds its allotted timeout. Treated as fatal
+    for the whole run (unlike other ConversionErrors, which just skip the file and
+    continue): a metadata probe that stalls this long points at a genuinely stuck
+    process or unreadable file, so it's worth stopping to investigate rather than
+    silently skipping ahead. Note that ffmpeg encode/decode passes deliberately run
+    without a timeout — see measure_loudness and process_file."""
     pass
 
 
-# Minimum timeout for any single ffprobe/ffmpeg pass, regardless of file size, so
-# very small files still get a sane floor rather than a near-zero allowance.
+# Minimum timeout for any single ffprobe call, regardless of file size, so very small
+# files still get a sane floor rather than a near-zero allowance.
 TIMEOUT_FLOOR_SECONDS = 30 * 60  # 30 minutes
 
-# Additional timeout allowance per GB of source file size. This is deliberately
-# generous: real encodes (even slow software x265 on modest hardware) run far
-# faster than this, so going slower than this rate for an entire pass is treated
-# as evidence the process is hung, not just slow.
+# Additional timeout allowance per GB of source file size, covering slow reads on
+# large files over network mounts or spinning disks. Deliberately generous: ffprobe
+# only reads container metadata, so taking longer than this points at a stuck process
+# rather than merely slow work.
 TIMEOUT_SECONDS_PER_GB = 15 * 60  # 15 minutes per GB
 
 
 def compute_timeout_seconds(src_size_bytes: int) -> float:
-    """A generous timeout for a single ffprobe/ffmpeg pass over a file this size —
-    used for probing, loudness measurement, and the main encode alike, so a hung
-    process on a corrupt or unusual file doesn't stall the batch indefinitely."""
+    """A generous timeout for a single ffprobe metadata read over a file this size, so
+    a hung probe on a corrupt or unusual file doesn't stall the batch indefinitely.
+    Not applied to ffmpeg encode or decode passes, which are unbounded — capping those
+    by wall clock produced false positives on slow-but-healthy encodes."""
     size_gb = src_size_bytes / (1024 ** 3)
     return TIMEOUT_FLOOR_SECONDS + size_gb * TIMEOUT_SECONDS_PER_GB
 
@@ -188,9 +191,13 @@ class ColorConsoleFormatter(logging.Formatter):
         return message
 
 
-def setup_logging(output_folder: Path) -> Path:
+def setup_logging(output_folder: Path, name_suffix: str = "") -> Path:
+    """Configures file + console logging and returns the log file's path. name_suffix,
+    when given, is appended to the log filename (e.g. "_software" ->
+    conversion_log_software.txt) so --compare-crf runs of the same folder with
+    different encoders don't append to a single shared log."""
     output_folder.mkdir(parents=True, exist_ok=True)
-    log_path = output_folder / "conversion_log.txt"
+    log_path = output_folder / f"conversion_log{name_suffix}.txt"
     log_format = "%(asctime)s [%(levelname)s] %(message)s"
 
     # Full detail (INFO and up) goes to the log file, plain text.
@@ -322,14 +329,15 @@ def probe_duration(path: Path, timeout_seconds: float) -> float:
 
 
 def measure_loudness(src: Path, duration: float, loudnorm_target: float,
-                      audio_stream_index: int, timeout_seconds: float) -> dict:
+                      audio_stream_index: int) -> dict:
     """Runs loudnorm's analysis pass (decode + filter, no output file written) against
     the given audio stream to measure its actual loudness stats, for feeding into a
     second, exact pass of EBU R128 normalization. Returns the parsed stats dict
     (keys include input_i, input_tp, input_lra, input_thresh, target_offset).
     Raises ConversionError if ffmpeg fails or the stats block can't be found/parsed,
-    so callers can fall back to one-pass normalization for this file, or
-    ConversionTimeoutError if it doesn't finish within timeout_seconds."""
+    so callers can fall back to one-pass normalization for this file. No timeout is
+    applied: a full decode pass on a large file can legitimately run a long time, and
+    a wall-clock cap produced false positives on slow-but-healthy work."""
     cmd = ["ffmpeg", "-i", str(src)]
     if duration != -1:
         cmd += ["-t", str(duration)]
@@ -339,11 +347,7 @@ def measure_loudness(src: Path, duration: float, loudnorm_target: float,
         "-f", "null", "-",
     ]
     logging.info(f"Command: {format_cmd_for_log(cmd)}")
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        raise ConversionTimeoutError(src, f"loudness measurement pass timed out after "
-                                           f"{timeout_seconds:.0f}s")
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise ConversionError(src, f"loudness measurement pass failed: {result.stderr[-1000:]}")
 
@@ -680,11 +684,9 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     if normalize_audio and keep_audio_indices:
         try:
             measured_loudness = measure_loudness(src, duration, loudnorm_target,
-                                                  keep_audio_indices[0], timeout_seconds)
+                                                  keep_audio_indices[0])
             logging.info(f"LOUDNESS MEASURED (pass 1): input {measured_loudness.get('input_i')} LUFS "
                          f"-> target {loudnorm_target} LUFS: {src}")
-        except ConversionTimeoutError:
-            raise  # fatal: propagate up so the run stops and can be investigated
         except ConversionError as e:
             logging.warning(f"Loudness measurement pass failed, falling back to "
                              f"one-pass normalization for this file: {e.reason}: {src}")
@@ -696,14 +698,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                             measured_loudness)
     logging.info(f"Command: {format_cmd_for_log(cmd)}")
     encode_start = time.monotonic()
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        if encode_target.exists():
-            encode_target.unlink(missing_ok=True)
-        raise ConversionTimeoutError(src, f"ffmpeg encode timed out after "
-                                          f"{timeout_seconds:.0f}s (source size "
-                                          f"{human_size(src_size)})")
+    result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
         if encode_target.exists():
@@ -838,15 +833,12 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
                 copy_cmd = ["ffmpeg", "-y", "-i", str(src), "-t", str(duration),
                             "-c", "copy", str(original_dst)]
                 logging.info(f"Command: {format_cmd_for_log(copy_cmd)}")
-                copy_result = subprocess.run(copy_cmd, capture_output=True, text=True,
-                                              timeout=timeout_seconds)
+                copy_result = subprocess.run(copy_cmd, capture_output=True, text=True)
                 if copy_result.returncode != 0 or not original_dst.exists():
                     raise RuntimeError(f"ffmpeg exited with code {copy_result.returncode}: "
                                         f"{copy_result.stderr[-500:]}")
             logging.info(f"COPIED (original, unmodified): {src} -> {original_dst}")
             original_copied = True
-        except subprocess.TimeoutExpired:
-            logging.warning(f"Timed out creating original-comparison copy, skipping it: {src}")
         except (OSError, RuntimeError) as e:
             logging.warning(f"Could not create original-comparison copy, skipping it: {e}: {src}")
 
@@ -872,14 +864,7 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
         logging.info(f"Command: {format_cmd_for_log(cmd)}")
 
         start = time.monotonic()
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True,
-                                     timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            elapsed = time.monotonic() - start
-            logging.error(f"CRF {crf}: ffmpeg timed out after {timeout_seconds:.0f}s")
-            rows.append((crf, None, elapsed, "timed out", False))
-            continue
+        result = subprocess.run(cmd, capture_output=True, text=True)
         elapsed = time.monotonic() - start
 
         if result.returncode != 0 or not dst.exists():
@@ -1009,7 +994,10 @@ def main():
               "--compare-crf is set.", file=sys.stderr)
         sys.exit(1)
 
-    log_path = setup_logging(args.output_folder)
+    # Comparison runs get an encoder-tagged log, so a hardware and a software run over
+    # the same output folder produce separate logs rather than interleaving in one.
+    log_suffix = f"_{args.encoding}" if crf_values is not None else ""
+    log_path = setup_logging(args.output_folder, log_suffix)
 
     if crf_values is not None:
         logging.info(f"CRF comparison mode: {len(mp4_files)} file(s) found in "
