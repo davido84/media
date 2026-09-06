@@ -200,8 +200,12 @@ def setup_logging(output_folder: Path, name_suffix: str = "") -> Path:
     log_path = output_folder / f"conversion_log{name_suffix}.txt"
     log_format = "%(asctime)s [%(levelname)s] %(message)s"
 
-    # Full detail (INFO and up) goes to the log file, plain text.
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    # Full detail (INFO and up) goes to the log file, plain text. Opened in append
+    # mode (FileHandler's default, stated explicitly here so it can't be changed by
+    # accident) so repeated runs against the same output folder — e.g. --compare-crf
+    # re-runs adding new CRF values — accumulate in one log rather than each run
+    # wiping the previous run's record.
+    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
     file_handler.setFormatter(logging.Formatter(log_format))
 
     # Only WARNING and above are echoed to the console, in color, so they stand
@@ -1017,6 +1021,7 @@ def main():
     log_path = setup_logging(args.output_folder, log_suffix)
 
     if crf_values is not None:
+        compare_start = time.monotonic()
         logging.info(f"CRF comparison mode: {len(mp4_files)} file(s) found in "
                      f"{input_resolved}, values: {crf_values}")
         # Per-CRF totals across every file, so a batch of files can be compared as a
@@ -1058,6 +1063,13 @@ def main():
 
         if files_compared > 1:
             print_crf_aggregate_summary(aggregate, crf_values, files_compared)
+
+        compare_runtime = time.monotonic() - compare_start
+        runtime_line = (f"Script runtime: "
+                        f"{human_duration(compare_runtime, include_seconds=True)}")
+        logging.info(runtime_line)
+        print(f"\n{runtime_line}")
+        print(f"Log written to: {log_path}")
 
         sys.exit(0)
 
