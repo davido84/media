@@ -807,9 +807,11 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
     side with every CRF variant — skipped if that copy already exists from a previous
     run, since it's identical regardless of encoding/CRF and doesn't need to be redone.
     Called once per file by main() when --compare-crf covers a whole folder; output
-    filenames include src.stem and the encoding type, so multiple files' test encodes
-    (and a hardware vs. software re-run of the same file) coexist in the same output
-    folder without colliding.
+    filenames use src.stem and include the encoding type, so hardware vs. software
+    re-runs of the same file coexist in one output folder without colliding. Note that
+    two sources sharing a basename in different subfolders WOULD collide here, and the
+    second would be silently treated as already-encoded; comparison mode is intended
+    for a flat folder of test files, where that can't arise.
     Returns (src_size, rows), where rows is the same (crf, size_bytes_or_None,
     elapsed_seconds, error_or_None, skipped) list used for this file's own table, so
     main() can fold every file's rows together into one aggregate table across the
@@ -836,6 +838,7 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
     original_dst = output_folder / f"{src.stem}_original{src.suffix}"
     original_copied = False
     if original_dst.exists():
+        print(f"  Skipping original copy: already exists ({original_dst.name})")
         logging.info(f"Original comparison copy already exists, skipping: {original_dst}")
         original_copied = True
     else:
@@ -867,6 +870,7 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
         dst = output_folder / f"{src.stem}_crf{crf}_{encoding}{src.suffix}"
 
         if dst.exists():
+            print(f"  Skipping CRF {crf}: output already exists ({dst.name})")
             logging.info(f"CRF {crf}: output already exists, skipping encode: {dst}")
             rows.append((crf, dst.stat().st_size, 0.0, None, True))
             continue
