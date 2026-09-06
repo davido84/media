@@ -1221,10 +1221,17 @@ def main():
         print(f"\n[DRY RUN] No files were modified. Log written to: {log_path}")
     else:
         reduction_bytes = total_orig - total_new
-        reduction_pct = (reduction_bytes / total_orig * 100) if total_orig else 0
-        summary = (f"Total reduction: {human_size(reduction_bytes)}, "
-                    f"{reduction_pct:.1f}% smaller "
-                    f"({human_size(total_orig)} -> {human_size(total_new)})")
+        reduction_pct = (abs(reduction_bytes) / total_orig * 100) if total_orig else 0
+        if reduction_bytes >= 0:
+            summary = (f"Total reduction: {human_size(reduction_bytes)}, "
+                        f"{reduction_pct:.1f}% smaller "
+                        f"({human_size(total_orig)} -> {human_size(total_new)})")
+        else:
+            # Net growth can happen when downscaled files (exempt from the
+            # discard-on-growth check) grow enough to outweigh savings elsewhere.
+            summary = (f"Total size INCREASED by {human_size(-reduction_bytes)}, "
+                        f"{reduction_pct:.1f}% larger "
+                        f"({human_size(total_orig)} -> {human_size(total_new)})")
         logging.info(summary)
         print(f"\n{summary}")
         runtime_summary = f"Total video running time: {human_duration(total_duration_seconds)}"
