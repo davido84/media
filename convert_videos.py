@@ -4,11 +4,11 @@ Batch-convert .mp4 and .mkv files in a folder (recursively) to H.265/HEVC using 
 running software encoding. Files already encoded in H.265 are copied as-is.
 
 Usage:
-    python convert_videos.py [-i input_folder] [-o output_folder] [--crf 22] [--duration -1]
+    python convert_videos.py -i input_folder -o output_folder [--crf 22] [--duration -1]
 
-If -i/-o are omitted, both default to the current folder. If the output folder
-is the same as the input folder, converted files replace the originals in place
-after a successful conversion.
+-i/--input defaults to the current folder if omitted. -o/--output is required
+and must be a different folder from the input (converted/copied files are
+always written there, never back over the originals).
 
 Requires: ffmpeg and ffprobe available on PATH.
 """
@@ -114,11 +114,10 @@ def build_parser():
     )
     parser.add_argument("-i", "--input", dest="input_folder", type=Path, default=Path("."),
                          help="Folder to scan recursively for .mp4/.mkv files. Default: current folder")
-    parser.add_argument("-o", "--output", dest="output_folder", type=Path, default=None,
-                         help="Folder to write converted/copied files to. Default: current folder. "
-                              "If this is the same as the input folder, converted files replace "
-                              "the originals in place. Required when --duration is set (test encodes "
-                              "must not overwrite your source files).")
+    parser.add_argument("-o", "--output", dest="output_folder", type=Path, required=True,
+                         help="Folder to write converted/copied files to. Required, and must be "
+                              "different from the input folder — converted files are never written "
+                              "back over the originals.")
     parser.add_argument("-q", "--crf", type=int, default=22,
                          help="x265 CRF value (lower = higher quality/larger file). Default: 22")
     parser.add_argument("-t", "--duration", type=float, default=-1,
@@ -517,7 +516,7 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
 
 
 def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: float,
-                  same_location: bool, dry_run: bool = False, encoding: str = "software",
+                  dry_run: bool = False, encoding: str = "software",
                   normalize_audio: bool = True, loudnorm_target: float = -16,
                   downscale: bool = False, strip_non_english_audio: bool = False):
     """Returns (original_size, new_size, video_duration_seconds, action, downscaled,
@@ -561,10 +560,6 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                              f"(copying anyway): {e.reason}: {src}")
             small_file_duration = None
 
-        if same_location:
-            logging.info(f"KEPT (below {min_size_mb}MB minimum, already in place, "
-                         f"{human_size(src_size)}): {src}")
-            return (src_size, src_size, small_file_duration, "copied", False, False)
         if dry_run:
             logging.info(f"[DRY RUN] WOULD COPY (below {min_size_mb}MB minimum, "
                          f"{human_size(src_size)}): {src} -> {dst}")
@@ -583,9 +578,6 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     video_duration = video_info.get("duration")
 
     if codec == "hevc":
-        if same_location:
-            logging.info(f"KEPT (already H.265, already in place): {src}")
-            return (src_size, src_size, video_duration, "copied", False, False)
         if dry_run:
             logging.info(f"[DRY RUN] WOULD COPY (already H.265): {src} -> {dst}")
             return (src_size, src_size, video_duration, "copied", False, False)
@@ -674,17 +666,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         # and action/downscaled, not a real new_size.
         return (src_size, src_size, video_duration, "encoded", needs_downscale, False)
 
-    # When replacing in place, ffmpeg can't read and write the same path at once,
-    # so encode to a temp file alongside it, then swap it in on success. The real
-    # extension must stay last (".converting.tmp.mp4", not "....mp4.converting.tmp"),
-    # since ffmpeg picks its output container by the final suffix and can't infer one
-    # from ".tmp".
-    if same_location:
-        encode_target = dst.parent / f".{dst.stem}.converting.tmp{dst.suffix}"
-    else:
-        encode_target = dst
-
-    encode_target.parent.mkdir(parents=True, exist_ok=True)
+    dst.parent.mkdir(parents=True, exist_ok=True)
 
     measured_loudness = None
     if normalize_audio and keep_audio_indices:
@@ -698,7 +680,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                              f"one-pass normalization for this file: {e.reason}: {src}")
             measured_loudness = None
 
-    cmd = build_ffmpeg_cmd(src, encode_target, crf, duration, needs_downscale, encoding,
+    cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
                             normalize_audio, loudnorm_target, keep_audio_indices,
                             keep_subtitle_indices, video_info["stream_index"],
                             measured_loudness)
@@ -707,40 +689,37 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
-        if encode_target.exists():
-            encode_target.unlink(missing_ok=True)
+        if dst.exists():
+            dst.unlink(missing_ok=True)
         raise ConversionError(src, f"ffmpeg exited with code {result.returncode}: "
                                     f"{result.stderr[-2000:]}")
 
     encode_elapsed = time.monotonic() - encode_start
 
     # Post-encode validation: confirm the output's duration roughly matches the
-    # source's before trusting it (and, for in-place mode, before it ever overwrites
-    # the original). Skipped for test/partial encodes (--duration), since those are
-    # intentionally shorter than the source.
+    # source's before trusting it. Skipped for test/partial encodes (--duration),
+    # since those are intentionally shorter than the source.
     if duration == -1 and video_duration is not None:
-        output_duration = probe_duration(encode_target, timeout_seconds)
+        output_duration = probe_duration(dst, timeout_seconds)
         if output_duration is None:
-            if encode_target.exists():
-                encode_target.unlink(missing_ok=True)
+            if dst.exists():
+                dst.unlink(missing_ok=True)
             raise ConversionError(src, "post-encode validation failed: could not "
                                         "determine output duration")
         tolerance = max(2.0, 0.02 * video_duration)
         if abs(output_duration - video_duration) > tolerance:
-            if encode_target.exists():
-                encode_target.unlink(missing_ok=True)
+            if dst.exists():
+                dst.unlink(missing_ok=True)
             raise ConversionError(src, f"post-encode validation failed: source duration "
                                         f"{video_duration:.1f}s vs output duration "
                                         f"{output_duration:.1f}s (tolerance {tolerance:.1f}s)")
         logging.info(f"VALIDATED: output duration {output_duration:.1f}s matches source "
                      f"{video_duration:.1f}s: {src}")
 
-    # Check the candidate output's size before committing it, so a converted file that
-    # ended up larger than the source is never kept — growing storage instead of
-    # shrinking it defeats the point of this script. This check happens before the
-    # in-place swap below, so for same_location the original at dst/src is never
-    # touched if the encode is discarded. Skipped when --duration is set: the candidate
-    # is only the first N seconds, so comparing its size against the full source's is
+    # Check the output's size before keeping it, so a converted file that ended up
+    # larger than the source is never kept — growing storage instead of shrinking it
+    # defeats the point of this script. Skipped when --duration is set: the output is
+    # only the first N seconds, so comparing its size against the full source's is
     # meaningless (a short clip of a big file always "shrinks"; a clip of a tiny source
     # could spuriously "grow" and get replaced by a full-length copy of the original,
     # which isn't the test output the user asked for). Also skipped when the file was
@@ -749,24 +728,14 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     # lesser surprise there. --compare-crf deliberately doesn't apply this either:
     # seeing every CRF's real size, including ones that grew, is the whole point of
     # that comparison.
-    candidate_size = encode_target.stat().st_size
+    candidate_size = dst.stat().st_size
     if duration == -1 and not needs_downscale and candidate_size > src_size:
         growth_pct = (candidate_size / src_size - 1) * 100 if src_size else 0
-        if same_location:
-            encode_target.unlink(missing_ok=True)
-            logging.warning(f"DISCARDED (encode grew {human_size(src_size)} -> "
-                            f"{human_size(candidate_size)}, +{growth_pct:.1f}%); "
-                            f"original kept unchanged: {src}")
-        else:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)  # overwrites the too-large candidate at dst
-            logging.warning(f"DISCARDED (encode grew {human_size(src_size)} -> "
-                            f"{human_size(candidate_size)}, +{growth_pct:.1f}%); "
-                            f"copied original instead: {src} -> {dst}")
+        shutil.copy2(src, dst)  # overwrites the too-large candidate at dst
+        logging.warning(f"DISCARDED (encode grew {human_size(src_size)} -> "
+                        f"{human_size(candidate_size)}, +{growth_pct:.1f}%); "
+                        f"copied original instead: {src} -> {dst}")
         return (src_size, src_size, video_duration, "copied", False, True)
-
-    if same_location:
-        os.replace(encode_target, dst)  # dst == src here; atomic swap-in
 
     # Preserve the source file's modification/access time on the newly encoded output.
     os.utime(dst, (src_stat.st_atime, src_stat.st_mtime))
@@ -974,18 +943,8 @@ def main():
         build_parser().print_help()
         sys.exit(1)
 
-    if args.duration != -1 and args.output_folder is None:
-        print("Error: -o/--output is required when --duration is set. "
-              "Test encodes must be written to a separate folder so your source "
-              "files are never overwritten with a partial encode.", file=sys.stderr)
-        sys.exit(1)
-
     crf_values = None
     if args.compare_crf is not None:
-        if args.output_folder is None:
-            print("Error: -o/--output is required when --compare-crf is set.",
-                  file=sys.stderr)
-            sys.exit(1)
         try:
             crf_values = sorted({int(v.strip()) for v in args.compare_crf.split(",") if v.strip()})
         except ValueError:
@@ -997,22 +956,12 @@ def main():
                   file=sys.stderr)
             sys.exit(1)
 
-    if args.output_folder is None:
-        args.output_folder = Path(".")
-
     input_resolved = args.input_folder.resolve()
     output_resolved = args.output_folder.resolve()
-    same_location = input_resolved == output_resolved
-
-    if args.duration != -1 and same_location:
-        print("Error: output folder must be different from the input folder when "
-              "--duration is set. Test encodes must not overwrite your source files.",
+    if input_resolved == output_resolved:
+        print("Error: output folder must be different from the input folder. "
+              "Converted/copied files are never written back over the originals.",
               file=sys.stderr)
-        sys.exit(1)
-
-    if crf_values is not None and same_location:
-        print("Error: output folder must be different from the input folder when "
-              "--compare-crf is set.", file=sys.stderr)
         sys.exit(1)
 
     # Comparison runs get an encoder-tagged log, so a hardware and a software run over
@@ -1076,7 +1025,7 @@ def main():
     mode = "DRY RUN" if args.dry_run else "LIVE"
     logging.info(f"Starting batch conversion [{mode}]. Input: {input_resolved} "
                  f"Output: {output_resolved} "
-                 f"({'in-place' if same_location else 'separate output'}) CRF: {args.crf} "
+                 f"CRF: {args.crf} "
                  f"Encoding: {args.encoding} "
                  f"Normalize audio: {'yes (' + str(args.loudnorm_target) + ' LUFS)' if args.normalize_audio else 'no'} "
                  f"Duration limit: {'none' if args.duration == -1 else f'{args.duration}s'} "
@@ -1133,13 +1082,10 @@ def main():
               f"ETA: {eta_str} | "
               f"Current file ({human_size(src_size)}): {src.name}")
 
-        if same_location:
-            dst = src
-        else:
-            rel_path = src.relative_to(args.input_folder)
-            dst = args.output_folder / rel_path
+        rel_path = src.relative_to(args.input_folder)
+        dst = args.output_folder / rel_path
 
-        if not same_location and dst.exists() and not args.force:
+        if dst.exists() and not args.force:
             prefix = "[DRY RUN] WOULD SKIP" if args.dry_run else "SKIPPED"
             logging.info(f"{prefix} (output file already exists): {dst}")
             skipped_existing += 1
@@ -1148,7 +1094,7 @@ def main():
 
         try:
             result = process_file(src, dst, args.crf, args.duration, args.min_size_mb,
-                                   same_location, args.dry_run, args.encoding,
+                                   args.dry_run, args.encoding,
                                    args.normalize_audio, args.loudnorm_target, args.downscale,
                                    args.strip_no_english_audio)
         except ConversionTimeoutError as e:
