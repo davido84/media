@@ -298,7 +298,7 @@ from typing import Dict, List, Optional, Tuple
 # Constants
 # --------------------------------------------------------------------------
 
-DEFAULT_LOG = "./convert.log"
+DEFAULT_LOG_NAME = "convert.log"  # default log filename; placed in the output folder unless --log overrides
 
 # MakeMKV robot-mode attribute IDs (see module docstring, point 1)
 ATTR_TYPE = 1  # stream "Type" attribute on SINFO lines - text value "Video"/"Audio"/"Subtitles"
@@ -633,7 +633,9 @@ class DualLogger:
     def __init__(self, log_path: Path):
         self.log_path = log_path
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._fh = open(self.log_path, "w", encoding="utf-8")
+        # Append mode: successive runs accumulate in one log rather than
+        # overwriting. The "Run started" banner below separates runs.
+        self._fh = open(self.log_path, "a", encoding="utf-8")
         self._raw(f"==== Run started {datetime.now().isoformat(timespec='seconds')} ====")
 
     def _timestamp(self) -> str:
@@ -1568,8 +1570,9 @@ def parse_args() -> argparse.Namespace:
         help="Minimum title length (in minutes) to extract",
     )
     p.add_argument(
-        "-l", "--log", nargs="?", const=DEFAULT_LOG, default=DEFAULT_LOG, metavar="LOGFILE",
-        help="Log file path",
+        "-l", "--log", nargs="?", const=None, default=None, metavar="LOGFILE",
+        help="Log file path. Defaults to 'convert.log' inside the output folder (-o). Pass an "
+             "explicit path to place it elsewhere",
     )
     p.add_argument(
         "-k", "--keep-source", action="store_true",
@@ -1686,7 +1689,9 @@ def main() -> int:
 
     input_root = Path(args.input).resolve()
     output_root = Path(args.output).resolve()
-    log_path = Path(args.log).resolve()
+    # Default the log into the output folder; an explicit --log path (if
+    # given) is honored as-is, relative to the current directory.
+    log_path = (output_root / DEFAULT_LOG_NAME) if args.log is None else Path(args.log).resolve()
 
     logger = DualLogger(log_path)
 
