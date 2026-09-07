@@ -79,6 +79,24 @@ IMPORTANT ASSUMPTIONS / CAVEATS (please read before relying on this in prod)
         remains, we cannot safely guess, so a WARNING is logged and the
         disc is skipped entirely (source file left untouched).
 
+     c) Manual override (--main-playlist), for the case where BOTH signals
+        above fail - i.e. MakeMKV (even with a working JRE) can't identify
+        the main title, so the disc would otherwise be skipped by (b). If
+        you research the correct playlist for your specific disc (community
+        forums post these per release) you can pass its source playlist
+        filename, e.g. --main-playlist 00610.mpls. This bypasses all
+        automatic detection for that disc and forces that title as the main
+        feature (named main_title.mkv), additionally keeping every title
+        clearly SHORTER than it as extras (deleted scenes, featurettes)
+        while excluding the same-length decoys. Matching is on the source
+        PLAYLIST name - reported by MakeMKV as each title's "Source file
+        name" (attribute 16) - and NOT on MakeMKV's title index, which
+        isn't stable across versions or --min-length settings. Because a
+        playlist name only makes sense for one specific disc, the run must
+        resolve to exactly one ISO - either point --input at a folder
+        containing a single ISO, or narrow a larger folder with
+        --include/--exclude; the script aborts up front otherwise.
+
    In both cases, makemkvcon is NEVER invoked with "all" - only explicit
    title numbers are ever passed.
 
@@ -283,6 +301,7 @@ ATTR_TYPE = 1  # stream "Type" attribute on SINFO lines - text value "Video"/"Au
 ATTR_NAME = 2
 ATTR_DURATION = 9
 ATTR_DISKSIZE_BYTES = 11
+ATTR_SOURCE_FILENAME = 16  # title "Source file name" - the source playlist (e.g. "00610.mpls") on Blu-ray
 ATTR_INFO = 30  # title "info/comment" text; carries "(FPL_MainFeature)" when JRE identifies it
 
 # Exact marker MakeMKV writes into a title's info text when its BD-Java
@@ -435,6 +454,7 @@ def selection_fingerprint(args: argparse.Namespace) -> dict:
         "min_length": args.min_length,
         "obfuscation_threshold": args.obfuscation_threshold,
         "obfuscation_tolerance_sec": args.obfuscation_tolerance_sec,
+        "main_playlist": args.main_playlist,
         "dvd_max_size_gb": args.dvd_max_size_gb,
         "disc_type": args.disc_type,
         "detect_playall": args.detect_playall,
@@ -747,6 +767,7 @@ class Title:
     size_bytes: int = 0
     name: Optional[str] = None
     info_text: Optional[str] = None  # attribute 30; may contain "(FPL_MainFeature)"
+    source_filename: Optional[str] = None  # attribute 16; the source playlist e.g. "00610.mpls" on Blu-ray
     audio_track_count: int = 0       # from SINFO lines - used by the post-extraction cross-check
     subtitle_track_count: int = 0    # from SINFO lines - used by the post-extraction cross-check
 
@@ -792,6 +813,8 @@ def get_disc_titles(
                     pass
             elif code == ATTR_NAME:
                 t.name = value
+            elif code == ATTR_SOURCE_FILENAME:
+                t.source_filename = value
             elif code == ATTR_INFO:
                 t.info_text = value
         elif line.startswith("SINFO:"):
@@ -832,6 +855,33 @@ def looks_like_warning(output: str) -> Optional[str]:
 # --------------------------------------------------------------------------
 # Title / track selection logic
 # --------------------------------------------------------------------------
+
+def normalize_playlist_name(name: str) -> str:
+    """Normalize a Blu-ray source-playlist identifier for comparison, so a
+    user-supplied --main-playlist matches MakeMKV's reported "Source file
+    name" regardless of superficial differences. Lowercases, strips
+    surrounding whitespace and any directory part, and drops a trailing
+    ".mpls" so "00610.mpls", "00610", "00610.MPLS", and "PLAYLIST/00610.mpls"
+    all compare equal."""
+    n = name.strip().lower().replace("\\", "/")
+    n = n.rsplit("/", 1)[-1]  # keep only the basename
+    if n.endswith(".mpls"):
+        n = n[: -len(".mpls")]
+    return n
+
+
+def find_title_by_playlist(titles: Dict[int, Title], requested: str) -> List[int]:
+    """Return the title IDs whose source playlist filename matches
+    `requested` (normalized). Normally exactly one; more than one would
+    mean two titles share a source playlist (unusual), which the caller
+    treats as ambiguous. Titles with no reported source filename can't
+    match and are skipped."""
+    want = normalize_playlist_name(requested)
+    return [
+        tid for tid, t in titles.items()
+        if t.source_filename and normalize_playlist_name(t.source_filename) == want
+    ]
+
 
 def detect_obfuscation(
     titles: Dict[int, Title], threshold: int, tolerance_sec: float
@@ -1043,7 +1093,66 @@ def process_iso(
     # re-deriving which title was the main feature.
     fpl_identified_main_tid: Optional[int] = None
 
-    if disc_type == DISC_TYPE_DVD:
+    if args.main_playlist:
+        # --- Manual main-title override (one-off for unresolvable obfuscation) ---
+        # The user has researched the correct source playlist (e.g. via a
+        # community post) for a disc MakeMKV couldn't resolve, and passed it
+        # as --main-playlist. This deliberately bypasses all automatic
+        # detection (FPL marker, duration clustering, the "ambiguous ->
+        # skip" guard) - the human has resolved the ambiguity. We match on
+        # the source PLAYLIST filename, not a MakeMKV title index, because
+        # title indices aren't stable across versions or --min-length
+        # settings, whereas the playlist name is exactly what gets looked
+        # up. main() guarantees the run resolved to a single ISO before we
+        # get here, so the disc-specific playlist name can't be misapplied
+        # across discs.
+        matches = find_title_by_playlist(titles, args.main_playlist)
+        if not matches:
+            available = ", ".join(
+                f"{t.source_filename or '?'} ({format_duration(t.duration_sec)})"
+                for _, t in sorted(titles.items())
+            )
+            logger.error(
+                f"--main-playlist '{args.main_playlist}' did not match any title's source "
+                f"playlist on this disc. Available titles: {available}",
+                iso_path,
+            )
+            stats.conversions_error += 1
+            return ProcessResult()
+        if len(matches) > 1:
+            logger.error(
+                f"--main-playlist '{args.main_playlist}' matched {len(matches)} titles "
+                f"{sorted(matches)} - ambiguous, not proceeding",
+                iso_path,
+            )
+            stats.conversions_error += 1
+            return ProcessResult()
+
+        main_tid = matches[0]
+        main_duration = titles[main_tid].duration_sec
+        # Keep genuine extras (deleted scenes, featurettes) but exclude the
+        # decoy cluster: decoys sit at the main feature's own duration, so
+        # anything NOT clearly shorter than the chosen title (by more than
+        # the duration-equality tolerance) is treated as a same-length
+        # decoy and dropped. Longer titles are dropped too - the user asked
+        # for shorter extras only.
+        extras = sorted(
+            tid for tid, t in titles.items()
+            if tid != main_tid
+            and t.duration_sec >= min_length_sec
+            and (main_duration - t.duration_sec) > args.obfuscation_tolerance_sec
+        )
+        candidates = [main_tid] + extras
+        fpl_identified_main_tid = main_tid  # human-verified pick -> named main_title.mkv
+        logger.info(
+            f"Manual override: title {main_tid} (playlist "
+            f"{titles[main_tid].source_filename}, {format_duration(main_duration)}) selected as "
+            f"the main title; also keeping {len(extras)} shorter title(s) {extras} as extras "
+            f"(same-length decoys excluded)",
+            iso_path,
+        )
+
+    elif disc_type == DISC_TYPE_DVD:
         # Blu-ray-specific detection (BD-Java / FPL_MainFeature, and the
         # duration-clustering fallback that exists to catch Blu-ray-style
         # ScreenPass decoys) doesn't apply to DVDs - see docstring point
@@ -1141,7 +1250,12 @@ def process_iso(
         stats.warnings += 1
         return ProcessResult()
 
-    if args.detect_playall:
+    # Play-all detection is skipped under a manual override: the candidate
+    # set is a hand-picked main title plus deliberately-kept shorter
+    # extras, and the play-all heuristic (which tests the longest candidate
+    # as a concatenation of the shorter ones) could otherwise wrongly
+    # discard the very title the user selected.
+    if args.detect_playall and not args.main_playlist:
         result = detect_playall_title(
             candidates, titles, args.playall_tolerance_sec, args.playall_cluster_tolerance_pct
         )
@@ -1476,6 +1590,18 @@ def parse_args() -> argparse.Namespace:
              "buckets. 0 requires (near-)exact duration matches",
     )
     p.add_argument(
+        "--main-playlist", default=None, metavar="MPLS",
+        help="Manually force the main title by its source playlist filename (e.g. '00610.mpls' "
+             "or just '00610'), for a one-off conversion of a disc whose obfuscation MakeMKV "
+             "couldn't resolve and whose correct playlist you've researched. Bypasses all "
+             "automatic main-title detection for that disc. The chosen title is named "
+             "main_title.mkv, and every title clearly SHORTER than it (genuine extras) is also "
+             "extracted, while same-length decoys are excluded. Because a playlist name is "
+             "disc-specific, the run must resolve to exactly one ISO - point --input at a "
+             "folder with a single ISO, or narrow a larger one with --include/--exclude; "
+             "otherwise the script aborts before processing anything",
+    )
+    p.add_argument(
         "--dvd-max-size-gb", type=float, default=DVD_MAX_SIZE_GB_DEFAULT, metavar="GB",
         help="ISOs at or below this size (decimal GB) are classified as DVD; larger ones as Blu-ray",
     )
@@ -1602,6 +1728,22 @@ def main() -> int:
         logger.info(f"No .iso files found under {input_root}")
         logger.close()
         return 0
+
+    # A --main-playlist name is disc-specific (playlist 00610.mpls means
+    # something different, or nothing, on another disc), so applying it
+    # across a multi-ISO run would be wrong. Require the run to resolve to
+    # exactly one ISO - the user narrows with --include/--exclude - and
+    # abort loudly otherwise rather than silently forcing the wrong title
+    # on the wrong disc.
+    if args.main_playlist and len(iso_files) != 1:
+        logger.error(
+            f"--main-playlist is a one-off, single-disc override but this run matched "
+            f"{len(iso_files)} ISO files. Narrow it to exactly one - point --input at a "
+            f"folder with a single ISO, or filter with --include/--exclude - and re-run. "
+            f"Not processing anything."
+        )
+        logger.close()
+        return 1
 
     total_bytes_all = sum(p.stat().st_size for p in iso_files)
     total_count = len(iso_files)
