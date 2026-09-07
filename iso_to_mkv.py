@@ -223,9 +223,13 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        (silently skipped for the whole run if neither tool is found -
        see the warning logged at startup) and warning-level rather than
        a hard stop, since a mismatch isn't as rock-solid an invariant as
-       the size failsafe above. Tune the duration slack with
-       --duration-tolerance-sec (default 5s); disable entirely with
-       --no-verify-tracks.
+       the size failsafe above. The duration comparison is one-sided:
+       only an output SHORTER than the reported duration (the truncation
+       direction) is flagged; an output slightly longer is a routine
+       measurement discrepancy (MakeMKV reports the playlist duration,
+       the probe measures the muxed stream) and is ignored. Tune the
+       shortfall slack with --duration-tolerance-sec (default 15s);
+       disable the whole cross-check with --no-verify-tracks.
      - Non-zero process exit status: the script exits 1 if any real
        conversion error occurred during the run (a title that failed to
        extract, a disc whose title info couldn't be read, an unexpected
@@ -1446,10 +1450,23 @@ def process_iso(
                     mismatches.append(
                         f"subtitle tracks: expected {title.subtitle_track_count}, found {out_subs}"
                     )
-                if abs(out_duration - title.duration_sec) > args.duration_tolerance_sec:
+                # Duration is checked ASYMMETRICALLY: only an output that
+                # is meaningfully SHORTER than MakeMKV's reported duration
+                # is a truncation signal. An output slightly LONGER is a
+                # routine, benign discrepancy - MakeMKV reports the
+                # playlist's declared duration, while the probe measures
+                # the muxed stream, and the two commonly differ by several
+                # seconds (trailing frames, last-segment rounding), with
+                # the file usually the longer of the two. Flagging the
+                # longer direction produced false positives on normal discs
+                # (e.g. TV episode playlists routinely ~10s longer) without
+                # ever indicating missing content.
+                shortfall = title.duration_sec - out_duration
+                if shortfall > args.duration_tolerance_sec:
                     mismatches.append(
                         f"duration: expected {format_duration(title.duration_sec)}, "
-                        f"found {format_duration(out_duration)}"
+                        f"found {format_duration(out_duration)} "
+                        f"({shortfall:.0f}s shorter than expected)"
                     )
                 if mismatches:
                     logger.warning(
@@ -1651,9 +1668,11 @@ def parse_args() -> argparse.Namespace:
              "installed; silently skipped if neither is found). On by default",
     )
     p.add_argument(
-        "--duration-tolerance-sec", type=float, default=5.0, metavar="SECONDS",
-        help="Allowed difference between a title's MakeMKV-reported duration and the extracted "
-             "file's actual duration before the track/duration cross-check flags it",
+        "--duration-tolerance-sec", type=float, default=15.0, metavar="SECONDS",
+        help="How many seconds SHORTER than MakeMKV's reported duration the extracted file may "
+             "be before the cross-check flags it as possibly truncated. The check is one-sided: "
+             "an output longer than reported is a normal measurement discrepancy and is never "
+             "flagged; only a shortfall beyond this many seconds is",
     )
     return p.parse_args()
 
