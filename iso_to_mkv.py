@@ -1547,7 +1547,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("-i", "--input", default=".", help="Input folder to search recursively for .iso files")
     p.add_argument("-o", "--output", default=".", help="Output root folder")
     p.add_argument(
-        "-m", "--min-length", type=float, default=6.0, metavar="MINUTES",
+        "-m", "--min-length", type=float, default=10.0, metavar="MINUTES",
         help="Minimum title length (in minutes) to extract",
     )
     p.add_argument(
