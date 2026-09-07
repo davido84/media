@@ -163,6 +163,16 @@ def build_parser():
                               "track is tagged as a different language, or has no "
                               "language tag at all, all audio tracks are kept regardless. "
                               "Default: off (all audio tracks are kept)")
+    parser.add_argument("-x", "--delete-source", action="store_true",
+                         help="Delete the source file once it has been successfully "
+                              "copied or encoded to the output folder (files skipped "
+                              "due to --limit or an existing output file are left "
+                              "alone, as is anything that fails). No effect for "
+                              "in-place runs (-o same as -i), since those already "
+                              "replace the original with the encoded output instead "
+                              "of leaving a separate source file around. Has no "
+                              "effect combined with --dry-run or --compare-crf. "
+                              "Default: off")
     parser.add_argument("--compare-crf", type=str, default=None, metavar="CRF1,CRF2,...",
                          help="Comparison mode: test-encode every file at each given CRF "
                               "(e.g. 18,22,28,35), printing a size/time table per file plus "
@@ -1020,6 +1030,12 @@ def main():
     log_suffix = f"_{args.encoding}" if crf_values is not None else ""
     log_path = setup_logging(args.output_folder, log_suffix)
 
+    if args.delete_source and same_location:
+        logging.info("--delete-source has no effect for in-place runs (input and "
+                     "output folders match): the source is already replaced by the "
+                     "encoded output, so there is never a separate original left to "
+                     "delete.")
+
     if crf_values is not None:
         compare_start = time.monotonic()
         logging.info(f"CRF comparison mode: {len(mp4_files)} file(s) found in "
@@ -1096,6 +1112,7 @@ def main():
     copied_count = 0
     downscaled_count = 0
     grew_larger_count = 0
+    deleted_source_count = 0
     limit_bytes = float("inf") if args.limit == -1 else args.limit * 1024 ** 3
     limit_reached = False
 
@@ -1181,6 +1198,20 @@ def main():
             if grew_larger:
                 grew_larger_count += 1
 
+            # Only delete when there's a genuinely separate source file to remove:
+            # in-place runs already overwrote src via the atomic swap inside
+            # process_file, so src and dst are the same path there and deleting
+            # would just destroy the output that was just written.
+            if args.delete_source and not same_location and not args.dry_run:
+                try:
+                    src.unlink()
+                    deleted_source_count += 1
+                    logging.info(f"DELETED SOURCE (after successful {action}): {src}")
+                except OSError as e:
+                    logging.warning(f"Could not delete source file after successful "
+                                     f"{action} (output at {dst} is unaffected): "
+                                     f"{src}: {e}")
+
     if skipped_existing:
         logging.info(f"{skipped_existing} file(s) skipped because the output file already existed.")
 
@@ -1211,6 +1242,11 @@ def main():
     grew_larger_line = f"Larger after encoding: {grew_larger_count} file(s)"
     logging.info(grew_larger_line)
     print(grew_larger_line)
+
+    if args.delete_source and not same_location:
+        deleted_line = f"Source files deleted: {deleted_source_count} file(s)"
+        logging.info(deleted_line)
+        print(deleted_line)
 
     script_runtime = time.monotonic() - batch_start
     script_runtime_line = f"Script runtime: {human_duration(script_runtime, include_seconds=True)}"
