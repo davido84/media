@@ -49,10 +49,14 @@ IMPORTANT ASSUMPTIONS / CAVEATS (please read before relying on this in prod)
         needed BD-Java in the first place.
         When this signal is what identified the title (not this script's
         own duration-based fallback below), that title's output file is
-        named "main_title.mkv" instead of MakeMKV's default name, so other
-        tools working on the output folder afterward (organize_media.py,
-        a HandBrake batch script, etc.) can trust the filename rather than
-        re-deriving which title was the main feature themselves.
+        named "main_title.mkv", so other tools working on the output folder
+        afterward (organize_media.py, a HandBrake batch script, etc.) can
+        trust the filename rather than re-deriving which title was the main
+        feature themselves. Every other extracted title is named
+        "title_NN.mkv", where NN is its MakeMKV title number - a stable,
+        sortable, standardized name (important for TV discs, where each
+        title is an episode) rather than MakeMKV's disc-label-derived
+        default.
 
      b) A duration-clustering fallback, used only when no unambiguous
         FPL_MainFeature marker is found. This looks for a large cluster
@@ -1330,8 +1334,8 @@ def process_iso(
 
         if args.dry_run:
             logger.info(f"[DRY RUN] Would run: {' '.join(cmd)}", iso_path)
-            if tid == fpl_identified_main_tid:
-                logger.info("[DRY RUN] Would rename output to main_title.mkv", iso_path)
+            desired_name = "main_title.mkv" if tid == fpl_identified_main_tid else f"title_{tid:02d}.mkv"
+            logger.info(f"[DRY RUN] Would name output {desired_name}", iso_path)
             continue
 
         # --- Free-space check (safety enhancement 3) ---
@@ -1397,32 +1401,36 @@ def process_iso(
             logger.warning(f"Title {tid}: {warn_line}", iso_path)
             stats.warnings += 1
 
-        # If MakeMKV's own (FPL_MainFeature) analysis identified this title
-        # as the main feature, name its output "main_title.mkv" so other
-        # scripts (organize_media.py, HandBrake batch scripts, etc.) can
-        # trust the filename instead of re-deriving which title was main.
-        # Not done for this script's own duration-based fallback guesses -
-        # only for MakeMKV's own identification.
+        # Standardize the output filename so downstream tooling can rely
+        # on it instead of parsing MakeMKV's disc-label-derived default.
+        # The MakeMKV-identified (or manually overridden) main feature
+        # becomes main_title.mkv; every other extracted title becomes
+        # title_NN.mkv, where NN is its MakeMKV title number - stable,
+        # sortable, and important for TV discs where each title is an
+        # episode and the number is how you tell episodes apart. On a name
+        # collision (e.g. a leftover file from a previous run) or a rename
+        # error, we keep MakeMKV's original filename and warn rather than
+        # clobbering anything.
+        desired_name = "main_title.mkv" if tid == fpl_identified_main_tid else f"title_{tid:02d}.mkv"
         final_name = qualifying_new_mkvs[0]  # overwritten below only if the rename actually succeeds
-        if tid == fpl_identified_main_tid:
-            src_path = out_dir / qualifying_new_mkvs[0]
-            dest_path = out_dir / "main_title.mkv"
-            if src_path != dest_path:
-                if dest_path.exists():
-                    logger.warning(
-                        f"Title {tid}: wanted to name output 'main_title.mkv' but that file "
-                        f"already exists in {out_dir} - leaving it as {qualifying_new_mkvs[0]}",
-                        iso_path,
-                    )
+        src_path = out_dir / qualifying_new_mkvs[0]
+        dest_path = out_dir / desired_name
+        if src_path != dest_path:
+            if dest_path.exists():
+                logger.warning(
+                    f"Title {tid}: wanted to name output '{desired_name}' but that file "
+                    f"already exists in {out_dir} - leaving it as {qualifying_new_mkvs[0]}",
+                    iso_path,
+                )
+                stats.warnings += 1
+            else:
+                try:
+                    src_path.replace(dest_path)
+                    logger.info(f"Title {tid}: named output {desired_name}", iso_path)
+                    final_name = desired_name
+                except OSError as e:
+                    logger.warning(f"Title {tid}: failed to name output {desired_name}: {e}", iso_path)
                     stats.warnings += 1
-                else:
-                    try:
-                        src_path.replace(dest_path)
-                        logger.info(f"Title {tid}: renamed output to main_title.mkv", iso_path)
-                        final_name = "main_title.mkv"
-                    except OSError as e:
-                        logger.warning(f"Title {tid}: failed to rename output to main_title.mkv: {e}", iso_path)
-                        stats.warnings += 1
 
         output_filenames.append(final_name)
         stats.conversions_success += 1
