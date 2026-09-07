@@ -55,15 +55,24 @@ IMPORTANT ASSUMPTIONS / CAVEATS (please read before relying on this in prod)
         re-deriving which title was the main feature themselves.
 
      b) A duration-clustering fallback, used only when no unambiguous
-        FPL_MainFeature marker is found. This looks for a very large
-        number of titles that all share (almost) the same duration - the
-        classic signature of ScreenPass/UOPs discs presenting hundreds of
-        decoy playlists. The threshold defaults to 100 titles sharing a
-        duration (--obfuscation-threshold); a low threshold like 5 is NOT
-        used here on purpose, since it's common for perfectly ordinary
-        discs (TV box sets, multi-angle features, bonus loops) to have a
-        handful of titles at the same length with no obfuscation involved
-        at all - only a "hundreds of titles" pattern is a reliable tell.
+        FPL_MainFeature marker is found. This looks for a large cluster
+        of titles that all share (almost) the same duration - the classic
+        signature of ScreenPass/UOPs discs presenting many decoy
+        playlists. Rather than exact round-to-second bucketing, titles are
+        clustered with a sliding tolerance window
+        (--obfuscation-tolerance-sec, default 2s), because decoys are
+        frequently only *similar* in length, not frame-identical, and
+        exact rounding would split one logical cluster across adjacent
+        buckets and undercount it. The threshold defaults to 30 titles
+        sharing a duration (--obfuscation-threshold): a very low threshold
+        like 5 is NOT used, since perfectly ordinary discs (TV box sets,
+        multi-angle features, bonus loops) can have a handful of titles at
+        the same length with no obfuscation at all; but 30 sits well above
+        that normal clustering while still catching the dozens-scale
+        obfuscation that real ScreenPass/Lionsgate discs (especially DVDs,
+        where the BD-Java FPL_MainFeature signal isn't available at all)
+        commonly use - reported counts range from dozens to hundreds of
+        same/similar-length decoys.
         When this fallback fires, and after filtering by --min-length
         there is exactly ONE title left that could be the main feature,
         that title is extracted. If more than one plausible candidate
@@ -258,7 +267,6 @@ import shutil
 import subprocess
 import sys
 import time
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -426,6 +434,7 @@ def selection_fingerprint(args: argparse.Namespace) -> dict:
     return {
         "min_length": args.min_length,
         "obfuscation_threshold": args.obfuscation_threshold,
+        "obfuscation_tolerance_sec": args.obfuscation_tolerance_sec,
         "dvd_max_size_gb": args.dvd_max_size_gb,
         "disc_type": args.disc_type,
         "detect_playall": args.detect_playall,
@@ -824,16 +833,42 @@ def looks_like_warning(output: str) -> Optional[str]:
 # Title / track selection logic
 # --------------------------------------------------------------------------
 
-def detect_obfuscation(titles: Dict[int, Title], threshold: int) -> Tuple[bool, float, int]:
-    """Bucket ALL titles by duration; if any bucket is huge, suspect
-    playlist obfuscation. Returns (suspected, duration_of_bucket, bucket_size)."""
-    buckets: Dict[int, List[int]] = defaultdict(list)
-    for tid, t in titles.items():
-        buckets[int(round(t.duration_sec))].append(tid)
-    if not buckets:
+def detect_obfuscation(
+    titles: Dict[int, Title], threshold: int, tolerance_sec: float
+) -> Tuple[bool, float, int]:
+    """Find the largest cluster of titles whose durations all fall within
+    a single tolerance_sec-wide window; if that cluster is at least
+    `threshold` titles, suspect playlist obfuscation. Returns
+    (suspected, representative_duration, cluster_size).
+
+    A sliding tolerance window is used rather than exact round-to-second
+    bucketing because obfuscation decoys are frequently only *similar* in
+    length, not frame-identical (per MakeMKV/AVS forum reports of discs
+    with "same or similar" length playlists). Exact-second bucketing
+    would split one logical cluster across adjacent buckets and undercount
+    it - e.g. durations of 89.4s and 89.6s round to 89 and 90 and would be
+    counted as two clusters of one instead of one cluster of two. Sorting
+    the durations and sweeping a window of width tolerance_sec over them
+    groups "close enough" decoys together, so the threshold is compared
+    against the true cluster size. tolerance_sec = 0 reproduces the old
+    exact-match behavior (modulo float equality)."""
+    if not titles:
         return False, 0.0, 0
-    biggest_duration, biggest_ids = max(buckets.items(), key=lambda kv: len(kv[1]))
-    return len(biggest_ids) >= threshold, float(biggest_duration), len(biggest_ids)
+    durations = sorted(t.duration_sec for t in titles.values())
+    best_count = 0
+    best_center = 0.0
+    left = 0
+    # Classic "largest set of sorted points spanning <= W" two-pointer
+    # sweep: for each right edge, advance left until the window span fits
+    # within tolerance_sec, then record the widest count seen.
+    for right in range(len(durations)):
+        while durations[right] - durations[left] > tolerance_sec:
+            left += 1
+        count = right - left + 1
+        if count > best_count:
+            best_count = count
+            best_center = (durations[left] + durations[right]) / 2.0
+    return best_count >= threshold, best_center, best_count
 
 
 MIN_CANDIDATES_FOR_PLAYALL_DETECTION = 3  # need the concat title plus >= 2 episodes
@@ -1028,7 +1063,9 @@ def process_iso(
             )
             stats.warnings += 1
 
-        suspected, dup_duration, dup_count = detect_obfuscation(titles, args.obfuscation_threshold)
+        suspected, dup_duration, dup_count = detect_obfuscation(
+            titles, args.obfuscation_threshold, args.obfuscation_tolerance_sec
+        )
 
         # --- Signal 1 (preferred): MakeMKV's own JRE/BD-Java main-feature marker ---
         fpl_exact = [tid for tid, t in titles.items() if t.info_text and FPL_MAIN_FEATURE_RE.search(t.info_text)]
@@ -1424,8 +1461,19 @@ def parse_args() -> argparse.Namespace:
              "Mutually exclusive with --include",
     )
     p.add_argument(
-        "--obfuscation-threshold", type=int, default=100, metavar="N",
-        help="Number of same-duration titles that triggers Playlist Obfuscation suspicion",
+        "--obfuscation-threshold", type=int, default=30, metavar="N",
+        help="Number of titles sharing (almost) the same duration that triggers Playlist "
+             "Obfuscation suspicion. Legitimate discs rarely have more than a handful of "
+             "same-length titles, while obfuscated (ScreenPass/Lionsgate) discs present dozens "
+             "to hundreds, so this sits well above normal clustering but low enough to catch "
+             "dozens-scale obfuscation",
+    )
+    p.add_argument(
+        "--obfuscation-tolerance-sec", type=float, default=2.0, metavar="SECONDS",
+        help="Width of the duration window within which titles are treated as sharing a duration "
+             "for obfuscation detection. Decoy playlists are often only *similar* in length, not "
+             "frame-identical; this groups them instead of splitting near-equal durations across "
+             "buckets. 0 requires (near-)exact duration matches",
     )
     p.add_argument(
         "--dvd-max-size-gb", type=float, default=DVD_MAX_SIZE_GB_DEFAULT, metavar="GB",
