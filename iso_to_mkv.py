@@ -1396,7 +1396,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("-i", "--input", default=".", help="Input folder to search recursively for .iso files")
     p.add_argument("-o", "--output", default=".", help="Output root folder")
     p.add_argument(
-        "--min-length", type=float, default=6.0, metavar="MINUTES",
+        "-m", "--min-length", type=float, default=6.0, metavar="MINUTES",
         help="Minimum title length (in minutes) to extract",
     )
     p.add_argument(
@@ -1404,22 +1404,22 @@ def parse_args() -> argparse.Namespace:
         help="Log file path",
     )
     p.add_argument(
-        "--keep-source", action="store_true",
+        "-k", "--keep-source", action="store_true",
         help="Keep the source ISO after a successful conversion instead of deleting it",
     )
-    p.add_argument("--dry-run", action="store_true", help="Show what would happen without changing anything")
+    p.add_argument("-n", "--dry-run", action="store_true", help="Show what would happen without changing anything")
     p.add_argument(
-        "--limit", type=float, default=-1, metavar="GB",
+        "-L", "--limit", type=float, default=-1, metavar="GB",
         help="Stop once this many GB of ISO source data have been converted (-1 = no limit)",
     )
     filter_group = p.add_mutually_exclusive_group()
     filter_group.add_argument(
-        "--include", type=compile_regex_arg, default=None, metavar="REGEX",
+        "-I", "--include", type=compile_regex_arg, default=None, metavar="REGEX",
         help="Only process ISOs whose full path matches this regex; all others are skipped. "
              "Mutually exclusive with --exclude",
     )
     filter_group.add_argument(
-        "--exclude", type=compile_regex_arg, default=None, metavar="REGEX",
+        "-X", "--exclude", type=compile_regex_arg, default=None, metavar="REGEX",
         help="Skip any ISO whose full path matches this regex; all others are processed. "
              "Mutually exclusive with --include",
     )
@@ -1432,7 +1432,7 @@ def parse_args() -> argparse.Namespace:
         help="ISOs at or below this size (decimal GB) are classified as DVD; larger ones as Blu-ray",
     )
     p.add_argument(
-        "--disc-type", choices=["auto", "dvd", "bluray"], default="auto",
+        "-t", "--disc-type", choices=["auto", "dvd", "bluray"], default="auto",
         help="Force disc-type classification for this run instead of using the size heuristic",
     )
     p.add_argument(
@@ -1467,7 +1467,7 @@ def parse_args() -> argparse.Namespace:
              "permissions - rather than one bad disc). 0 disables this circuit breaker",
     )
     p.add_argument(
-        "--makemkvcon", default="makemkvcon", metavar="PATH",
+        "-M", "--makemkvcon", default="makemkvcon", metavar="PATH",
         help="Path to the makemkvcon executable",
     )
     p.add_argument(
