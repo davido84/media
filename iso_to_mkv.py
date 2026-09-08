@@ -1494,8 +1494,8 @@ def process_iso(
         # subsets of the same disc). If it does, something is badly wrong
         # (e.g. a duplicate/looping extraction, or a title-selection bug
         # pulling near-identical playlists) - stop pulling more titles
-        # from this ISO and leave the source alone rather than silently
-        # deleting it once the run finishes.
+        # from this ISO and leave the source alone rather than risk
+        # deleting it (if --delete-source is set) after a broken extraction.
         total_extracted_bytes += after_snapshot[qualifying_new_mkvs[0]]
         if total_extracted_bytes > iso_size_bytes:
             stop_reason = (
@@ -1528,15 +1528,15 @@ def process_iso(
         # manifest_matches().
         write_manifest(out_dir, iso_path, candidates, output_filenames, args)
 
-    if args.keep_source:
-        logger.info("Keeping source file (--keep-source)", iso_path)
+    if not args.delete_source:
+        logger.info("Keeping source file (deletion is off by default; enable with --delete-source)", iso_path)
     else:
         if args.dry_run:
-            logger.info("[DRY RUN] Would delete source ISO file", iso_path)
+            logger.info("[DRY RUN] Would delete source ISO file (--delete-source)", iso_path)
         else:
             try:
                 iso_path.unlink()
-                logger.info("Deleted source ISO file", iso_path)
+                logger.info("Deleted source ISO file (--delete-source)", iso_path)
             except OSError as e:
                 logger.error(f"Failed to delete source file: {e}", iso_path)
 
@@ -1583,8 +1583,9 @@ def parse_args() -> argparse.Namespace:
              "explicit path to place it elsewhere",
     )
     p.add_argument(
-        "-k", "--keep-source", action="store_true",
-        help="Keep the source ISO after a successful conversion instead of deleting it",
+        "--delete-source", action="store_true",
+        help="Delete each source ISO after it converts successfully. Off by default - sources "
+             "are kept unless this is given",
     )
     p.add_argument("-n", "--dry-run", action="store_true", help="Show what would happen without changing anything")
     p.add_argument(
