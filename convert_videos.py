@@ -167,12 +167,11 @@ def build_parser():
                          help="Delete the source file once it has been successfully "
                               "copied or encoded to the output folder (files skipped "
                               "due to --limit or an existing output file are left "
-                              "alone, as is anything that fails). No effect for "
-                              "in-place runs (-o same as -i), since those already "
-                              "replace the original with the encoded output instead "
-                              "of leaving a separate source file around. Has no "
-                              "effect combined with --dry-run or --compare-crf. "
-                              "Default: off")
+                              "alone, as is anything that fails). Requires -o/--output "
+                              "different from -i/--input, since in-place runs already "
+                              "replace the original and there'd be nothing left to "
+                              "delete. Has no effect combined with --dry-run or "
+                              "--compare-crf. Default: off")
     parser.add_argument("--compare-crf", type=str, default=None, metavar="CRF1,CRF2,...",
                          help="Comparison mode: test-encode every file at each given CRF "
                               "(e.g. 18,22,28,35), printing a size/time table per file plus "
@@ -1025,16 +1024,16 @@ def main():
               "--compare-crf is set.", file=sys.stderr)
         sys.exit(1)
 
+    if args.delete_source and same_location:
+        print("Error: output folder must be different from the input folder when "
+              "--delete-source is set. An in-place run already replaces the source "
+              "file, so there would be nothing left to delete.", file=sys.stderr)
+        sys.exit(1)
+
     # Comparison runs get an encoder-tagged log, so a hardware and a software run over
     # the same output folder produce separate logs rather than interleaving in one.
     log_suffix = f"_{args.encoding}" if crf_values is not None else ""
     log_path = setup_logging(args.output_folder, log_suffix)
-
-    if args.delete_source and same_location:
-        logging.info("--delete-source has no effect for in-place runs (input and "
-                     "output folders match): the source is already replaced by the "
-                     "encoded output, so there is never a separate original left to "
-                     "delete.")
 
     if crf_values is not None:
         compare_start = time.monotonic()
@@ -1198,11 +1197,7 @@ def main():
             if grew_larger:
                 grew_larger_count += 1
 
-            # Only delete when there's a genuinely separate source file to remove:
-            # in-place runs already overwrote src via the atomic swap inside
-            # process_file, so src and dst are the same path there and deleting
-            # would just destroy the output that was just written.
-            if args.delete_source and not same_location and not args.dry_run:
+            if args.delete_source and not args.dry_run:
                 try:
                     src.unlink()
                     deleted_source_count += 1
@@ -1243,7 +1238,7 @@ def main():
     logging.info(grew_larger_line)
     print(grew_larger_line)
 
-    if args.delete_source and not same_location:
+    if args.delete_source:
         deleted_line = f"Source files deleted: {deleted_source_count} file(s)"
         logging.info(deleted_line)
         print(deleted_line)
