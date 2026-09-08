@@ -509,6 +509,56 @@ def preserve_source_timestamps(src_stat: os.stat_result, dest_paths: List[Path])
     return failed
 
 
+def stamp_outputs_with_source_date(
+    iso_path: Path,
+    out_dir: Path,
+    filenames: List[str],
+    logger: "DualLogger",
+    stats: "Stats",
+) -> None:
+    """Set each named output file's mtime/atime to the source ISO's date,
+    for both the fresh-conversion path and the resume-skip path (so a
+    re-run repairs outputs that predate this behavior, without needing
+    --force). Idempotent and quiet: a file whose mtime already matches the
+    source (within a 2s tolerance, so low-resolution filesystems like
+    FAT/exFAT don't get re-stamped every run) is left alone. Best-effort -
+    a filesystem that refuses the timestamp set is logged as a warning,
+    never a hard failure."""
+    try:
+        src_stat = iso_path.stat()
+    except OSError as e:
+        logger.warning(f"Could not read source file date to apply to outputs: {e}", iso_path)
+        stats.warnings += 1
+        return
+
+    to_set: List[Path] = []
+    for name in filenames:
+        p = out_dir / name
+        try:
+            if not p.is_file():
+                continue
+            # 2s tolerance absorbs FAT/exFAT's 2-second mtime granularity
+            # so matching files aren't needlessly re-stamped on every run.
+            if abs(p.stat().st_mtime - src_stat.st_mtime) > 2:
+                to_set.append(p)
+        except OSError:
+            to_set.append(p)  # can't compare - attempt the set anyway
+
+    if not to_set:
+        return
+
+    failed = preserve_source_timestamps(src_stat, to_set)
+    applied = len(to_set) - len(failed)
+    if applied > 0:
+        logger.info(f"Applied source file date to {applied} output file(s)", iso_path)
+    if failed:
+        logger.warning(
+            f"Could not set source file date on {len(failed)} output file(s): {', '.join(failed)}",
+            iso_path,
+        )
+        stats.warnings += 1
+
+
 def write_manifest(
     out_dir: Path,
     iso_path: Path,
@@ -1322,6 +1372,14 @@ def process_iso(
             f"title selection and these settings - skipping. Use --force to redo.",
             iso_path,
         )
+        # Even when skipping, make sure the existing outputs carry the
+        # source file date - this repairs folders converted before file-
+        # date preservation existed, without needing --force. No-op when
+        # they already match (see stamp_outputs_with_source_date).
+        if not args.dry_run and previous_manifest:
+            stamp_outputs_with_source_date(
+                iso_path, natural_out_dir, previous_manifest.get("output_filenames", []), logger, stats
+            )
         stats.already_converted_skipped += 1
         return ProcessResult(skipped_already_done=True)
     elif previous_manifest is not None:
@@ -1555,19 +1613,7 @@ def process_iso(
         # Stamp each output .mkv with the source ISO's file date. Done
         # before any source deletion (the source still exists here) and
         # only over the final, named output files - not the manifest.
-        try:
-            src_stat = iso_path.stat()
-            failed = preserve_source_timestamps(src_stat, [out_dir / n for n in output_filenames])
-            if failed:
-                logger.warning(
-                    f"Could not set source file date on {len(failed)} output file(s): "
-                    f"{', '.join(failed)}",
-                    iso_path,
-                )
-                stats.warnings += 1
-        except OSError as e:
-            logger.warning(f"Could not read source file date to apply to outputs: {e}", iso_path)
-            stats.warnings += 1
+        stamp_outputs_with_source_date(iso_path, out_dir, output_filenames, logger, stats)
 
     if not args.delete_source:
         logger.info("Keeping source file (deletion is off by default; enable with --delete-source)", iso_path)
