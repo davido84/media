@@ -57,6 +57,22 @@ HOW IT WORKS
    "Season <NN>/extras/" (Jellyfin's generic-extras folder). Emptied "<S>-<D>"
    disk folders are removed unless --keep-empty-dirs is given.
 
+   Season 0 ("0-<D>" disk folders) is treated as Jellyfin SPECIALS: every title
+   is placed in "Season 00/" as "<Title> (<Year>) S00E<NN>.mkv", numbered in
+   disk-then-title order. Extras detection is not applied to season 0 (a special
+   is episode-like, with no reliable length signal to split it from an extra).
+
+   TWO-PARTERS (stacked episodes): when a single file holds two or more
+   consecutive episodes joined together, mark the source "title_<nn>x<k>.mkv"
+   ("x<k>" = number of episodes in the file, e.g. "title_04x2.mkv"). It is then
+   named "<Title> (<Year>) S<NN>E<AA>-E<BB>.mkv" (Jellyfin's stacked-episode
+   form, mapping the one file to both slots) and the episode counter advances by
+   <k>. This is an explicit marker on purpose: a joined two-parter is only ~2x a
+   normal episode by length, which is too weak a signal to auto-stack (a wrong
+   guess would misnumber the entire rest of the season). Duration is used only to
+   WARN - an unusually long single title is flagged as a possible two-parter, and
+   a marked title whose length disagrees with its part count is flagged too.
+
 3. Re-running is safe and idempotent: a file already at its target name is a
    no-op, and once a series' disk folders have been consumed into Season
    folders a re-run finds nothing to do.
@@ -90,8 +106,9 @@ CAVEATS
 - MOVIES: "main = longest" can't tell a real extra from a second cut
   (theatrical vs extended). If the two longest are within
   --similar-duration-pct, a warning is logged; the longest still wins.
-- Only "title_<nn>.mkv" files in a disk folder are considered episodes/extras;
-  any other .mkv there is left in place with a warning.
+- Only "title_<nn>.mkv" (optionally "title_<nn>x<k>.mkv") files in a disk folder
+  are considered episodes/extras; any other .mkv there is left in place with a
+  warning.
 - Moves use os.replace (atomic) but never overwrite an EXISTING, DIFFERENT
   file; such a collision is reported and skipped, never acted on.
 - Characters illegal in Windows/exFAT/SMB filenames are stripped from the
@@ -116,8 +133,10 @@ DEFAULT_LOG = "./organize.log"
 TITLE_YEAR_RE = re.compile(r"^(?P<title>.+?)\s*\((?P<year>(?:19|20)\d{2})\)\s*$")
 # Matches a per-disc subfolder "<season>-<disk>", e.g. "1-1", "2-3", "10-1".
 SEASON_DISK_RE = re.compile(r"^(?P<season>\d+)-(?P<disk>\d+)$")
-# Matches an extracted title file "title_<nn>.mkv", e.g. "title_00.mkv".
-EPISODE_FILE_RE = re.compile(r"^title_(?P<num>\d+)\.mkv$", re.IGNORECASE)
+# Matches an extracted title file "title_<nn>.mkv", with an optional "x<k>"
+# multi-episode marker, e.g. "title_00.mkv" (one episode) or "title_04x2.mkv"
+# (one file holding two consecutive episodes -> Jellyfin S..E..-E.. stacking).
+EPISODE_FILE_RE = re.compile(r"^title_(?P<num>\d+)(?:x(?P<parts>\d+))?\.mkv$", re.IGNORECASE)
 # Characters not safely usable in filenames on Windows/exFAT/SMB.
 INVALID_FILENAME_CHARS_RE = re.compile(r'[\\/:*?"<>|]')
 
@@ -212,23 +231,29 @@ def probe_duration_seconds(ffprobe_bin: str, path: Path) -> Optional[float]:
 # --------------------------------------------------------------------------
 
 # Move.status is set during conflict resolution:
-#   ""       -> will be performed
-#   "noop"   -> src is already at dest (already correctly named)
-#   "exists" -> a different file already occupies dest (skip)
-#   "dup"    -> another planned move also targets dest (skip)
-#   "chain"  -> dest exists and is itself a file being moved (skip; ordering hazard)
-SKIP_STATUSES = ("exists", "dup", "chain")
+#   ""        -> will be performed
+#   "noop"    -> src is already at dest (already correctly named)
+#   "exists"  -> a different, non-moving file already occupies dest (skip)
+#   "dup"     -> another planned move also targets dest (skip)
+#   "blocked" -> the move depends, through a rename chain, on an "exists"/"dup"
+#                that never vacates, so it can never complete (skip)
+# A move whose dest is occupied by ANOTHER file that is itself moving away is
+# NOT a conflict: such chains and cycles are performed safely (reordering, and
+# staging via a temporary name to break cycles) by execute_plan.
+SKIP_STATUSES = ("exists", "dup", "blocked")
 
 
-@dataclass
+@dataclass(eq=False)  # identity-based, so moves can be graph nodes in sets/dicts
 class PlannedMove:
     src: Path
     dest: Path
     kind: str                       # episode | extra | movie-main | movie-extra
     duration: Optional[float] = None
     ratio: Optional[float] = None   # duration / season median (TV only)
-    flag: str = ""                  # "" | long | borderline
+    flag: str = ""                  # "" | long | borderline | multipart-suspect
+    parts: int = 1                  # episodes contained in this one file (>=2 = stacked)
     status: str = ""
+    staged: bool = False            # part of a rename cycle -> resolved via a temp
 
 
 @dataclass
@@ -271,6 +296,7 @@ class Stats:
     files_renamed: int = 0
     files_already_correct: int = 0
     extras_separated: int = 0
+    specials_placed: int = 0
     dirs_removed: int = 0
     conflicts: int = 0
     errors: int = 0
@@ -295,18 +321,37 @@ def folder_has_season_disks(folder: Path) -> bool:
         return False
 
 
-def _collect_disk_titles(disk_path: Path, logger: Logger, stats: Stats) -> Tuple[List[Tuple[int, Path]], List[Path]]:
-    """Return (titles, leftovers). titles = [(title_number, path)] sorted by number."""
-    titles: List[Tuple[int, Path]] = []
+def folder_has_regular_season(folder: Path) -> bool:
+    """True if the series has any non-zero season (season 0 == specials only)."""
+    try:
+        for p in folder.iterdir():
+            if p.is_dir():
+                sd = SEASON_DISK_RE.match(p.name.strip())
+                if sd and int(sd.group("season")) != 0:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def _collect_disk_titles(disk_path: Path, logger: Logger,
+                         stats: Stats) -> Tuple[List[Tuple[int, int, Path]], List[Path]]:
+    """Return (titles, leftovers). titles = [(title_number, parts, path)] sorted by number."""
+    titles: List[Tuple[int, int, Path]] = []
     leftovers: List[Path] = []
     for f in sorted(disk_path.iterdir()):
         em = EPISODE_FILE_RE.match(f.name) if f.is_file() else None
         if em:
-            titles.append((int(em.group("num")), f))
+            parts = int(em.group("parts")) if em.group("parts") else 1
+            if parts < 1:
+                logger.warning(f"{disk_path}: '{f.name}' has a part count below 1 - treating as a single episode")
+                stats.warnings += 1
+                parts = 1
+            titles.append((int(em.group("num")), parts, f))
         else:
             leftovers.append(f)
             if f.is_file() and f.suffix.lower() == ".mkv":
-                logger.warning(f"{disk_path}: '{f.name}' does not match 'title_<nn>.mkv' - "
+                logger.warning(f"{disk_path}: '{f.name}' does not match 'title_<nn>[x<k>].mkv' - "
                                f"not treated as an episode, left in place")
                 stats.warnings += 1
     titles.sort(key=lambda item: item[0])
@@ -324,10 +369,13 @@ def _plan_season(series_folder: Path, series_stem: str, season: int, disks: List
     extras_folder = season_folder / "extras"
 
     ordered: List[Path] = []
+    parts_of: Dict[Path, int] = {}
     for _disk_num, disk_path in disks:
         titles, leftovers = _collect_disk_titles(disk_path, logger, stats)
         plan.disk_info[disk_path] = (len(titles), bool(leftovers))
-        ordered.extend(p for _n, p in titles)
+        for _n, parts, p in titles:
+            ordered.append(p)
+            parts_of[p] = parts
     if not ordered:
         return None
 
@@ -337,13 +385,21 @@ def _plan_season(series_folder: Path, series_stem: str, season: int, disks: List
     is_extra: Dict[Path, bool] = {p: False for p in ordered}
     reference: Optional[float] = None
     detection_note = ""
+    specials = (season == 0)
 
-    if not args.detect_extras:
+    if specials:
+        # Season 0 == Jellyfin specials. A special is episode-like, so there is
+        # no reliable length signal to split it from an extra; every title is
+        # kept as an S00Exx special and duration is not probed.
+        detection_note = "specials - every title kept as S00Exx (extras detection not applied)"
+    elif not args.detect_extras:
         detection_note = "extras detection off - every title treated as an episode"
     else:
         for p in ordered:
             durations[p] = probe_duration_seconds(args.ffprobe, p)
-        known = [d for p in ordered if (d := durations[p]) is not None and d > 0]
+        # A K-part title covers K episodes, so its per-episode length is dur/K;
+        # use that for the reference so a stacked title doesn't inflate the median.
+        known = [d / parts_of[p] for p in ordered if (d := durations[p]) is not None and d > 0]
         if len(known) < EXTRA_DETECTION_MIN_TITLES:
             detection_note = (f"only {len(known)} probeable title(s) - too few to detect extras; "
                               f"all treated as episodes")
@@ -351,6 +407,8 @@ def _plan_season(series_folder: Path, series_stem: str, season: int, disks: List
             reference = statistics.median(known)
             extra_ratio = args.extra_threshold_pct / 100.0
             for p in ordered:
+                if parts_of[p] >= 2:
+                    continue                       # a marked multi-parter is never an extra
                 d = durations[p]
                 if d is None or d <= 0:
                     logger.warning(f"{season_label}: could not determine duration of '{p.name}' - "
@@ -372,6 +430,14 @@ def _plan_season(series_folder: Path, series_stem: str, season: int, disks: List
                 is_extra = {p: False for p in ordered}
             else:
                 for p in ordered:
+                    if parts_of[p] >= 2:
+                        # Advisory only: does the length agree with the marked count?
+                        d = durations.get(p)
+                        if d and d > 0:
+                            ratios[p] = (d / parts_of[p]) / reference
+                            if ratios[p] < extra_ratio or ratios[p] > LONG_EPISODE_RATIO:
+                                flags[p] = "multipart-suspect"
+                        continue
                     r = ratios[p]
                     if r is None:
                         continue
@@ -390,11 +456,15 @@ def _plan_season(series_folder: Path, series_stem: str, season: int, disks: List
         if is_extra[p]:
             extra_no += 1
             dest = extras_folder / f"{series_stem} - Extra {extra_no:02d}.mkv"
-            moves.append(PlannedMove(p, dest, "extra", durations.get(p), ratios.get(p), flags.get(p, "")))
+            moves.append(PlannedMove(p, dest, "extra", durations.get(p), ratios.get(p), flags.get(p, ""), parts=1))
         else:
-            episode_no += 1
-            dest = season_folder / f"{series_stem} S{season:02d}E{episode_no:02d}.mkv"
-            moves.append(PlannedMove(p, dest, "episode", durations.get(p), ratios.get(p), flags.get(p, "")))
+            k = parts_of[p]
+            start = episode_no + 1
+            episode_no += k
+            span = f"S{season:02d}E{start:02d}" if k == 1 else f"S{season:02d}E{start:02d}-E{episode_no:02d}"
+            dest = season_folder / f"{series_stem} {span}.mkv"
+            kind = "special" if specials else "episode"
+            moves.append(PlannedMove(p, dest, kind, durations.get(p), ratios.get(p), flags.get(p, ""), parts=k))
 
     stats.seasons += 1
     return SeasonPlan(series_folder.name, season, reference, detection_note, moves)
@@ -485,10 +555,64 @@ def resolve_statuses(plan: Plan) -> None:
             m.status = "noop"
         elif dest_counts[m.dest] > 1:
             m.status = "dup"
-        elif m.dest.exists():
-            m.status = "chain" if m.dest in srcs else "exists"
+        elif m.dest.exists() and m.dest not in srcs:
+            # Occupied by a file that is NOT itself moving away -> real conflict.
+            m.status = "exists"
         else:
+            # Free, or occupied by another file that IS moving away (a chain or
+            # cycle). resolve_chains() decides which of these can actually run.
             m.status = ""
+
+
+def resolve_chains(plan: Plan) -> None:
+    """Classify the entangled ("") moves.
+
+    A move whose target is occupied by another moving file is fine *if* that
+    file eventually vacates. Following the "who sits on my target" links, a move
+    is:
+      - blocked : the chain ends at an "exists"/"dup" that never moves;
+      - staged  : the chain loops back on itself (a cycle needs a temp file);
+      - plain    : the chain reaches a free slot (just needs the right order).
+    Only blocked moves are skipped; the rest are performed by execute_plan.
+    """
+    moves = plan.all_moves()
+    # occupant[path] = the move whose source currently sits at that path.
+    # Includes skipped moves, whose files stay put and keep blocking.
+    occupant = {m.src: m for m in moves if m.status != "noop"}
+
+    for m in moves:
+        if m.status != "":
+            continue
+        seen = {m}
+        cur = m
+        while True:
+            nxt = occupant.get(cur.dest)      # who occupies cur's target?
+            if nxt is None:                   # target is a free slot
+                break
+            if nxt.status in ("exists", "dup", "blocked"):
+                m.status = "blocked"          # chain dead-ends at a real conflict
+                break
+            if nxt in seen:                   # looped back -> resolvable cycle
+                break
+            seen.add(nxt)
+            cur = nxt
+
+    # Flag cycle members (target occupied by another *performable* move, and the
+    # chain returns to itself) so the preview can note the staging.
+    performable = {m.src: m for m in moves if m.status == ""}
+    for m in moves:
+        if m.status != "":
+            continue
+        seen = {m}
+        cur = performable.get(m.dest)
+        while cur is not None:
+            if cur is m:
+                m.staged = True
+                break
+            if cur in seen:
+                break
+            seen.add(cur)
+            cur = performable.get(cur.dest)
 
 
 def resolve_removals(plan: Plan, args: argparse.Namespace) -> None:
@@ -523,18 +647,26 @@ def _tag_for(move: PlannedMove) -> str:
         return "  [SKIP: a different file already exists at the target]"
     if move.status == "dup":
         return "  [SKIP: two files would land on this same target]"
-    if move.status == "chain":
-        return "  [SKIP: target is another file being moved this run]"
+    if move.status == "blocked":
+        return "  [SKIP: blocked by a conflict upstream in a rename chain]"
     if move.kind == "extra":
         base = "  [EXTRA]"
+    elif move.kind == "special":
+        base = "  [SPECIAL]"
     elif move.kind == "movie-main":
         base = "  [main feature]"
     else:
         base = ""
+    if move.staged:
+        base += "  [rename cycle - resolved via a temporary file]"
+    if move.parts >= 2:
+        base += f"  [{move.parts}-parter -> stacked]"
     if move.flag == "long":
-        base += "  [unusually long - verify it's not a two-parter/extra]"
+        base += "  [unusually long - if it's a joined two-parter, mark it title_NNx2]"
     elif move.flag == "borderline":
         base += "  [borderline call - verify]"
+    elif move.flag == "multipart-suspect":
+        base += "  [length looks off for this part count - verify]"
     return base
 
 
@@ -612,36 +744,107 @@ def _dest_display(src: Path, dest: Path) -> str:
     return dest.name if dest.parent == src.parent else f"{dest.parent.name}/{dest.name}"
 
 
+def _unique_staging_path(directory: Path, suffix: str, used: set) -> Path:
+    n = 0
+    while True:
+        cand = directory / f".organize_media.staging.{n}{suffix or '.tmp'}"
+        if cand not in used and not cand.exists():
+            used.add(cand)
+            return cand
+        n += 1
+
+
+def _perform_move(m: PlannedMove, origin: Path, logger: Logger, stats: Stats) -> bool:
+    """Move m.src -> m.dest. `origin` is the file's ORIGINAL location, for logs."""
+    shown = _dest_display(origin, m.dest)
+    try:
+        m.dest.parent.mkdir(parents=True, exist_ok=True)
+        m.src.replace(m.dest)
+    except OSError as e:
+        logger.error(f"Failed to rename {origin} -> {shown}: {e}")
+        stats.errors += 1
+        return False
+    logger.info(f"Renamed {origin} -> {shown}")
+    stats.files_renamed += 1
+    if m.kind == "extra":
+        stats.extras_separated += 1
+    elif m.kind == "special":
+        stats.specials_placed += 1
+    if m.flag == "long":
+        logger.warning(f"{shown}: kept as a single episode but unusually long "
+                       f"({format_duration(m.duration)}) - if it's a joined two-parter, "
+                       f"mark the source title_NNx2 and re-run")
+        stats.warnings += 1
+    elif m.flag == "borderline":
+        logger.warning(f"{shown}: borderline episode/extra call "
+                       f"({format_duration(m.duration)}) - verify")
+        stats.warnings += 1
+    elif m.flag == "multipart-suspect":
+        logger.warning(f"{shown}: marked as a {m.parts}-part file but its length "
+                       f"({format_duration(m.duration)}) looks off for that many episodes - "
+                       f"verify the part count")
+        stats.warnings += 1
+    return True
+
+
 def execute_plan(plan: Plan, logger: Logger, stats: Stats) -> None:
-    for m in plan.all_moves():
-        shown = _dest_display(m.src, m.dest)
+    moves = plan.all_moves()
+
+    # No-ops and unresolvable conflicts: account and report, don't touch disk.
+    for m in moves:
         if m.status == "noop":
             stats.files_already_correct += 1
-            continue
-        if m.status in SKIP_STATUSES:
-            reason = {"exists": "a different file already exists at the target",
-                      "dup": "two files target the same name",
-                      "chain": "the target is another file being moved this run"}[m.status]
-            logger.error(f"Skipping {m.src.name} -> {shown}: {reason}")
+        elif m.status in SKIP_STATUSES:
+            reason = {
+                "exists": "a different file already exists at the target",
+                "dup": "two files target the same name",
+                "blocked": "blocked by a conflict upstream in a rename chain",
+            }[m.status]
+            logger.error(f"Skipping {m.src.name} -> {_dest_display(m.src, m.dest)}: {reason}")
             stats.conflicts += 1
+
+    # Perform the rest in a dependency-safe order: a move runs once its target is
+    # no longer occupied by another still-pending source. Chains just need the
+    # right order; a cycle (moves remain but none is ready) is broken by staging
+    # one file to a temporary name. `origin` remembers each file's true starting
+    # point so logs read naturally even after a stage.
+    performable = [m for m in moves if m.status == ""]
+    origin = {m: m.src for m in performable}
+    occupied = {m.src for m in performable}
+    used_temps: set = set()
+    remaining = list(performable)
+    guard = 4 * len(performable) + 16
+
+    while remaining and guard > 0:
+        guard -= 1
+        progressed = False
+        for m in list(remaining):
+            if m.dest in occupied:
+                continue                    # target still holds a pending file
+            occupied.discard(m.src)
+            _perform_move(m, origin[m], logger, stats)  # errors are logged inside
+            remaining.remove(m)
+            progressed = True
+        if progressed or not remaining:
             continue
+        # Stalled -> everything left is on a cycle. Stage one file aside.
+        m = remaining[0]
+        temp = _unique_staging_path(m.src.parent, m.src.suffix, used_temps)
         try:
-            m.dest.parent.mkdir(parents=True, exist_ok=True)
-            m.src.replace(m.dest)
-            logger.info(f"Renamed {m.src} -> {shown}")
-            stats.files_renamed += 1
-            if m.kind == "extra":
-                stats.extras_separated += 1
-            if m.flag == "long":
-                logger.warning(f"{shown}: kept as an episode but unusually long "
-                               f"({format_duration(m.duration)}) - verify it isn't a two-parter or extra")
-                stats.warnings += 1
-            elif m.flag == "borderline":
-                logger.warning(f"{shown}: borderline episode/extra call "
-                               f"({format_duration(m.duration)}) - verify")
-                stats.warnings += 1
+            occupied.discard(m.src)
+            m.src.replace(temp)
         except OSError as e:
-            logger.error(f"Failed to rename {m.src} -> {shown}: {e}")
+            logger.error(f"Failed to stage {origin[m].name} to resolve a rename cycle: {e}")
+            stats.errors += 1
+            remaining.remove(m)
+            continue
+        logger.info(f"Staged {origin[m].name} to a temporary name to resolve a rename cycle")
+        m.src = temp                        # its final move is now temp -> dest
+
+    if remaining:  # should not happen; safety valve against an unforeseen loop
+        for m in remaining:
+            logger.error(f"Could not complete move of {origin[m].name} -> {m.dest.name} "
+                         f"(unresolved dependency) - left in place")
             stats.errors += 1
 
     for disk in plan.removals:
@@ -665,6 +868,8 @@ def tally_plan_into_stats(plan: Plan, stats: Stats) -> None:
             stats.files_renamed += 1
             if m.kind == "extra":
                 stats.extras_separated += 1
+            elif m.kind == "special":
+                stats.specials_placed += 1
     stats.dirs_removed += len(plan.removals)
 
 
@@ -713,7 +918,9 @@ def main() -> int:
     logger.info(f"Found {len(folders)} '<Title> (<Year>)' folder(s) under {input_root} "
                 f"({len(tv_series)} TV series, {len(movies)} movie)")
 
-    need_ffprobe = bool(movies) or (bool(tv_series) and args.detect_extras)
+    need_ffprobe = bool(movies) or (
+        args.detect_extras and any(folder_has_regular_season(f) for f in tv_series)
+    )
     if need_ffprobe:
         err = preflight_check_ffprobe(args.ffprobe)
         if err:
@@ -734,6 +941,7 @@ def main() -> int:
         if mp is not None:
             plan.movies.append(mp)
     resolve_statuses(plan)
+    resolve_chains(plan)
     resolve_removals(plan, args)
 
     # --- Phase 2: render (dry-run) or execute ---
@@ -757,6 +965,7 @@ def main() -> int:
         row(rename_label, stats.files_renamed),
         row("Files already correctly named", stats.files_already_correct),
         row("TV extras separated", stats.extras_separated),
+        row("TV specials placed", stats.specials_placed),
         row(remove_label, stats.dirs_removed),
         row("Conflicts skipped", stats.conflicts),
         row("Warnings", stats.warnings),
