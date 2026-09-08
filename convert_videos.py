@@ -102,6 +102,17 @@ def compute_timeout_seconds(src_size_bytes: int) -> float:
     return TIMEOUT_FLOOR_SECONDS + size_gb * TIMEOUT_SECONDS_PER_GB
 
 
+def _is_within(path: Path, folder: Path) -> bool:
+    """True if path is folder itself or lives anywhere inside it. Both arguments must
+    already be resolved (absolute, with symlinks/./.. resolved) for this to be
+    meaningful."""
+    try:
+        path.relative_to(folder)
+        return True
+    except ValueError:
+        return False
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="Recursively re-encode .mp4/.mkv files to H.265 (hardware via Intel "
@@ -1030,6 +1041,14 @@ def main():
               "file, so there would be nothing left to delete.", file=sys.stderr)
         sys.exit(1)
 
+    if args.delete_source and _is_within(output_resolved, input_resolved):
+        print("Error: output folder must not be inside the input folder when "
+              "--delete-source is set. Since the input scan is recursive, a later "
+              "run would find already-converted files sitting in the output folder "
+              "and treat them as new sources — and -x would then delete them.",
+              file=sys.stderr)
+        sys.exit(1)
+
     # Comparison runs get an encoder-tagged log, so a hardware and a software run over
     # the same output folder produce separate logs rather than interleaving in one.
     log_suffix = f"_{args.encoding}" if crf_values is not None else ""
@@ -1112,6 +1131,7 @@ def main():
     downscaled_count = 0
     grew_larger_count = 0
     deleted_source_count = 0
+    deleted_source_bytes = 0
     limit_bytes = float("inf") if args.limit == -1 else args.limit * 1024 ** 3
     limit_reached = False
 
@@ -1197,15 +1217,22 @@ def main():
             if grew_larger:
                 grew_larger_count += 1
 
-            if args.delete_source and not args.dry_run:
-                try:
-                    src.unlink()
+            if args.delete_source:
+                if args.dry_run:
                     deleted_source_count += 1
-                    logging.info(f"DELETED SOURCE (after successful {action}): {src}")
-                except OSError as e:
-                    logging.warning(f"Could not delete source file after successful "
-                                     f"{action} (output at {dst} is unaffected): "
-                                     f"{src}: {e}")
+                    deleted_source_bytes += orig_size
+                    logging.info(f"[DRY RUN] WOULD DELETE SOURCE (after successful "
+                                 f"{action}): {src}")
+                else:
+                    try:
+                        src.unlink()
+                        deleted_source_count += 1
+                        deleted_source_bytes += orig_size
+                        logging.info(f"DELETED SOURCE (after successful {action}): {src}")
+                    except OSError as e:
+                        logging.warning(f"Could not delete source file after successful "
+                                         f"{action} (output at {dst} is unaffected): "
+                                         f"{src}: {e}")
 
     if skipped_existing:
         logging.info(f"{skipped_existing} file(s) skipped because the output file already existed.")
@@ -1239,7 +1266,12 @@ def main():
     print(grew_larger_line)
 
     if args.delete_source:
-        deleted_line = f"Source files deleted: {deleted_source_count} file(s)"
+        if args.dry_run:
+            deleted_line = (f"Source files that would be deleted: {deleted_source_count} "
+                            f"file(s), {human_size(deleted_source_bytes)} would be freed")
+        else:
+            deleted_line = (f"Source files deleted: {deleted_source_count} file(s), "
+                            f"{human_size(deleted_source_bytes)} freed")
         logging.info(deleted_line)
         print(deleted_line)
 
