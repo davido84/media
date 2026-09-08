@@ -1167,7 +1167,7 @@ def main():
         print(f"Processed: {human_size(processed_bytes)} | "
               f"Remaining: {human_size(remaining_bytes)} | "
               f"ETA: {eta_str} | "
-              f"Current file ({human_size(src_size)}): {src.name}")
+              f"Current file ({human_size(src_size)}): {src.resolve()}")
 
         if same_location:
             dst = src
