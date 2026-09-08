@@ -1164,7 +1164,8 @@ def main():
         else:
             eta_str = "calculating..."
 
-        print(f"Processed: {human_size(processed_bytes)} | "
+        print(f"[{time.strftime('%H:%M:%S')}] "
+              f"Processed: {human_size(processed_bytes)} | "
               f"Remaining: {human_size(remaining_bytes)} | "
               f"ETA: {eta_str} | "
               f"Current file ({human_size(src_size)}): {src.resolve()}")
