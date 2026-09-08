@@ -249,6 +249,12 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        process cleanly, then still prints the summary-so-far and closes
        the log, rather than leaving an orphaned process or a truncated
        log file.
+     - Source file date preservation: each output .mkv is stamped with
+       the source ISO's access/modification times, so the converted file
+       carries the same file date as the disc image it came from (handy
+       for chronological sorting and for anything downstream that keys off
+       mtime). Best-effort - a filesystem that refuses the timestamp set
+       is logged as a warning, not a failure.
      - Every makemkvcon command actually run (both the `info` scan and
        each title's `mkv` extraction) has its verbatim command line
        written to the log file, tagged [CMD] - but never printed to the
@@ -288,6 +294,7 @@ script. See organize_media.py's own docstring for details.
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -483,6 +490,23 @@ def read_manifest(out_dir: Path) -> Optional[dict]:
         return json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return None
+
+
+def preserve_source_timestamps(src_stat: os.stat_result, dest_paths: List[Path]) -> List[str]:
+    """Copy the source ISO's access/modification times onto each output
+    file, so an archived .mkv carries the same file date as the disc image
+    it came from (useful for chronological sorting and for downstream tools
+    that key off mtime). Full nanosecond precision is used where the
+    filesystem supports it. Best-effort per file: returns the names of any
+    files whose timestamp couldn't be set (e.g. a read-only filesystem), so
+    the caller can warn without failing the conversion."""
+    failed: List[str] = []
+    for p in dest_paths:
+        try:
+            os.utime(p, ns=(src_stat.st_atime_ns, src_stat.st_mtime_ns))
+        except OSError:
+            failed.append(p.name)
+    return failed
 
 
 def write_manifest(
@@ -1527,6 +1551,23 @@ def process_iso(
         # apart from "coincidentally the same file count" - see
         # manifest_matches().
         write_manifest(out_dir, iso_path, candidates, output_filenames, args)
+
+        # Stamp each output .mkv with the source ISO's file date. Done
+        # before any source deletion (the source still exists here) and
+        # only over the final, named output files - not the manifest.
+        try:
+            src_stat = iso_path.stat()
+            failed = preserve_source_timestamps(src_stat, [out_dir / n for n in output_filenames])
+            if failed:
+                logger.warning(
+                    f"Could not set source file date on {len(failed)} output file(s): "
+                    f"{', '.join(failed)}",
+                    iso_path,
+                )
+                stats.warnings += 1
+        except OSError as e:
+            logger.warning(f"Could not read source file date to apply to outputs: {e}", iso_path)
+            stats.warnings += 1
 
     if not args.delete_source:
         logger.info("Keeping source file (deletion is off by default; enable with --delete-source)", iso_path)
