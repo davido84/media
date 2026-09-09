@@ -19,6 +19,15 @@ TV series, decided by its contents:
     and its files are renamed in place (longest = main feature, rest =
     extras).
 
+The title folder may carry a metadata-provider id after the year, in either the
+Plex/Sonarr/Radarr curly form ("{tvdb-78581}", "{imdb-tt0235198}", "{tmdb-N}")
+or Jellyfin's own square form. Because Jellyfin only reads the square, id-suffixed
+form, the id is normalized and the top-level folder is renamed accordingly:
+"Dilbert (1999) {tvdb-78581}" -> "Dilbert (1999) [tvdbid-78581]". For a series the
+id lives on the folder only (episode files stay id-free); for a movie it is also
+added to the main file, e.g. "Audition (1999) [imdbid-tt0235198].mkv". Folders
+already in the square form are left unchanged.
+
 Internally the script works in two phases: it first builds a complete PLAN of
 every rename/move/removal without touching the disk, then either RENDERS that
 plan (--dry-run) or EXECUTES it. Because both paths consume the identical
@@ -131,6 +140,15 @@ DEFAULT_LOG = "./organize.log"
 
 # Matches a Jellyfin/Plex-style "<Title> (<Year>)" folder name.
 TITLE_YEAR_RE = re.compile(r"^(?P<title>.+?)\s*\((?P<year>(?:19|20)\d{2})\)\s*$")
+# A trailing metadata-provider id token, either the Plex/Sonarr/Radarr curly form
+# ({imdb-tt..}, {tvdb-..}, {tmdb-..}) or Jellyfin's own square form
+# ([imdbid-tt..], [tvdbid-..], [tmdbid-..]). Captured so it can be normalized to
+# the square form Jellyfin actually reads.
+TRAILING_ID_RE = re.compile(
+    r"\s*(?:\{(?P<cprov>imdb|tvdb|tmdb)-(?P<cid>[A-Za-z0-9]+)\}"
+    r"|\[(?P<sprov>imdbid|tvdbid|tmdbid)-(?P<sid>[A-Za-z0-9]+)\])\s*$",
+    re.IGNORECASE,
+)
 # Matches a per-disc subfolder "<season>-<disk>", e.g. "1-1", "2-3", "10-1".
 SEASON_DISK_RE = re.compile(r"^(?P<season>\d+)-(?P<disk>\d+)$")
 # Matches an extracted title file "title_<nn>.mkv", with an optional "x<k>"
@@ -150,6 +168,44 @@ def sanitize_filename_component(name: str) -> str:
     cleaned = INVALID_FILENAME_CHARS_RE.sub("", name)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned or "output"
+
+
+def _normalize_provider_id(prov: str, ident: str) -> str:
+    """Return Jellyfin's square-bracket form, e.g. '[tvdbid-78581]'.
+
+    Accepts either the curly key (imdb/tvdb/tmdb) or the square key
+    (imdbid/tvdbid/tmdbid); Jellyfin only reads the square, id-suffixed form.
+    """
+    base = prov.lower()
+    if base.endswith("id"):
+        base = base[:-2]
+    return f"[{base}id-{ident}]"
+
+
+def parse_title_folder(folder_name: str) -> Optional[Tuple[str, str, Optional[str]]]:
+    """Parse a "<Title> (<Year>) [id]" folder name.
+
+    Returns (title, year, jellyfin_id or None), or None if it is not a
+    title/year folder. A trailing provider id in either the Plex curly form or
+    the Jellyfin square form is recognized and normalized to the square form.
+    """
+    name = folder_name.strip()
+    jf_id: Optional[str] = None
+    idm = TRAILING_ID_RE.search(name)
+    if idm:
+        prov = idm.group("cprov") or idm.group("sprov")
+        ident = idm.group("cid") or idm.group("sid")
+        jf_id = _normalize_provider_id(prov, ident)
+        name = name[:idm.start()].rstrip()
+    ty = TITLE_YEAR_RE.match(name)
+    if not ty:
+        return None
+    return ty.group("title").strip(), ty.group("year"), jf_id
+
+
+def desired_folder_name(title: str, year: str, jf_id: Optional[str]) -> str:
+    base = sanitize_filename_component(f"{title} ({year})")
+    return f"{base} {jf_id}" if jf_id else base
 
 
 def format_duration(seconds: Optional[float]) -> str:
@@ -271,11 +327,20 @@ class MoviePlan:
     moves: List[PlannedMove]
 
 
+@dataclass(eq=False)
+class FolderRename:
+    src: Path
+    dest: Path
+    kind: str          # "series" | "movie"
+    status: str = ""   # "" | noop | exists
+
+
 @dataclass
 class Plan:
     seasons: List[SeasonPlan] = field(default_factory=list)
     movies: List[MoviePlan] = field(default_factory=list)
     removals: List[Path] = field(default_factory=list)
+    folder_renames: List[FolderRename] = field(default_factory=list)
     # disk folder -> (num title files, had non-title leftovers)
     disk_info: Dict[Path, Tuple[int, bool]] = field(default_factory=dict)
 
@@ -298,6 +363,7 @@ class Stats:
     extras_separated: int = 0
     specials_placed: int = 0
     dirs_removed: int = 0
+    folders_renamed: int = 0
     conflicts: int = 0
     errors: int = 0
     warnings: int = 0
@@ -310,8 +376,16 @@ class Stats:
 def find_title_year_folders(input_root: Path) -> List[Path]:
     return sorted(
         p for p in input_root.rglob("*")
-        if p.is_dir() and TITLE_YEAR_RE.match(p.name.strip())
+        if p.is_dir() and parse_title_folder(p.name) is not None
     )
+
+
+def _plan_folder_rename(folder: Path, title: str, year: str, jf_id: Optional[str],
+                        kind: str, plan: Plan) -> None:
+    """Queue a rename of the series/movie folder to its Jellyfin-correct name."""
+    target = folder.parent / desired_folder_name(title, year, jf_id)
+    if target != folder:
+        plan.folder_renames.append(FolderRename(folder, target, kind))
 
 
 def folder_has_season_disks(folder: Path) -> bool:
@@ -471,10 +545,10 @@ def _plan_season(series_folder: Path, series_stem: str, season: int, disks: List
 
 
 def plan_tv_series(series_folder: Path, args: argparse.Namespace, logger: Logger, stats: Stats, plan: Plan) -> None:
-    m = TITLE_YEAR_RE.match(series_folder.name.strip())
-    assert m is not None
-    title, year = m.group("title").strip(), m.group("year")
-    series_stem = sanitize_filename_component(f"{title} ({year})")
+    parsed = parse_title_folder(series_folder.name)
+    assert parsed is not None
+    title, year, jf_id = parsed
+    series_stem = sanitize_filename_component(f"{title} ({year})")  # episodes stay id-free
 
     seasons: Dict[int, List[Tuple[int, Path]]] = {}
     stray_mkvs: List[Path] = []
@@ -500,16 +574,22 @@ def plan_tv_series(series_folder: Path, args: argparse.Namespace, logger: Logger
         if sp is not None:
             plan.seasons.append(sp)
 
+    # The id (if any) belongs on the series folder, so re-tag it to Jellyfin form.
+    _plan_folder_rename(series_folder, title, year, jf_id, "series", plan)
+
 
 # --------------------------------------------------------------------------
 # Planning: movies
 # --------------------------------------------------------------------------
 
-def plan_movie_folder(folder: Path, args: argparse.Namespace, logger: Logger, stats: Stats) -> Optional[MoviePlan]:
-    m = TITLE_YEAR_RE.match(folder.name.strip())
-    assert m is not None
-    title, year = m.group("title").strip(), m.group("year")
+def plan_movie_folder(folder: Path, args: argparse.Namespace, logger: Logger, stats: Stats,
+                      plan: Plan) -> Optional[MoviePlan]:
+    parsed = parse_title_folder(folder.name)
+    assert parsed is not None
+    title, year, jf_id = parsed
     canonical_stem = sanitize_filename_component(f"{title} ({year})")
+    # For movies the id goes on the main file too (it must match the folder name).
+    main_stem = f"{canonical_stem} {jf_id}" if jf_id else canonical_stem
 
     mkvs = sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".mkv")
     if not mkvs:
@@ -536,9 +616,11 @@ def plan_movie_folder(folder: Path, args: argparse.Namespace, logger: Logger, st
 
     moves: List[PlannedMove] = []
     main_file, main_dur = probed[0]
-    moves.append(PlannedMove(main_file, folder / f"{canonical_stem}.mkv", "movie-main", main_dur))
+    moves.append(PlannedMove(main_file, folder / f"{main_stem}.mkv", "movie-main", main_dur))
     for n, (f, d) in enumerate(probed[1:], start=1):
         moves.append(PlannedMove(f, folder / f"extra.{n}.mkv", "movie-extra", d))
+
+    _plan_folder_rename(folder, title, year, jf_id, "movie", plan)
     return MoviePlan(folder.name, moves)
 
 
@@ -630,6 +712,16 @@ def resolve_removals(plan: Plan, args: argparse.Namespace) -> None:
     plan.removals = sorted(removable)
 
 
+def resolve_folder_renames(plan: Plan) -> None:
+    for fr in plan.folder_renames:
+        if fr.src == fr.dest:
+            fr.status = "noop"
+        elif fr.dest.exists():
+            fr.status = "exists"
+        else:
+            fr.status = ""
+
+
 # --------------------------------------------------------------------------
 # Rendering (--dry-run)
 # --------------------------------------------------------------------------
@@ -675,18 +767,19 @@ def render_plan(plan: Plan, logger: Logger, input_root: Path) -> None:
     moves = plan.all_moves()
     to_do = [m for m in moves if m.status == ""]
     conflicts = [m for m in moves if m.status in SKIP_STATUSES]
+    renames = [fr for fr in plan.folder_renames if fr.status != "noop"]
 
     R()
     R("=================  DRY RUN  =================")
     R(f"Root: {input_root}")
     R("No files will be changed. This is exactly what a real run would do.")
 
-    if not moves:
+    if not moves and not renames:
         R("")
         R("No '<Title> (<Year>)' folders with anything to organize were found.")
         R("=============================================")
         return
-    if not to_do and not conflicts and not plan.removals:
+    if not to_do and not conflicts and not plan.removals and not renames:
         R("")
         R("Everything is already organized - nothing to do.")
         R("=============================================")
@@ -724,6 +817,15 @@ def render_plan(plan: Plan, logger: Logger, input_root: Path) -> None:
         R("Empty disk folders that would be removed:")
         for d in plan.removals:
             R(f"    {d.parent.name}/{d.name}")
+
+    # ---- Series/movie folders re-tagged with a Jellyfin-form metadata id ----
+    if renames:
+        R("")
+        R("Title folders that would be renamed (folder + all its contents keep the new name):")
+        width = max((len(fr.src.name) for fr in renames), default=0)
+        for fr in renames:
+            note = "  [SKIP: a different folder already exists at that name]" if fr.status == "exists" else ""
+            R(f"    {fr.src.name:<{width}}  ->  {fr.dest.name}{note}")
 
     # ---- Conflicts, called out again together ----
     if conflicts:
@@ -856,6 +958,24 @@ def execute_plan(plan: Plan, logger: Logger, stats: Stats) -> None:
             logger.warning(f"Could not remove disk folder {disk}: {e}")
             stats.warnings += 1
 
+    # Folder renames last: everything inside has already been organized, so the
+    # top folder (and all its new contents) just gets its Jellyfin-correct name.
+    for fr in plan.folder_renames:
+        if fr.status == "noop":
+            continue
+        if fr.status == "exists":
+            logger.error(f"Skipping folder rename {fr.src.name} -> {fr.dest.name}: "
+                         f"a different folder already exists at that name")
+            stats.conflicts += 1
+            continue
+        try:
+            fr.src.replace(fr.dest)
+            logger.info(f"Renamed {fr.kind} folder {fr.src.name} -> {fr.dest.name}")
+            stats.folders_renamed += 1
+        except OSError as e:
+            logger.error(f"Failed to rename folder {fr.src.name} -> {fr.dest.name}: {e}")
+            stats.errors += 1
+
 
 def tally_plan_into_stats(plan: Plan, stats: Stats) -> None:
     """For --dry-run: make the summary reflect the plan without executing it."""
@@ -871,6 +991,11 @@ def tally_plan_into_stats(plan: Plan, stats: Stats) -> None:
             elif m.kind == "special":
                 stats.specials_placed += 1
     stats.dirs_removed += len(plan.removals)
+    for fr in plan.folder_renames:
+        if fr.status == "exists":
+            stats.conflicts += 1
+        elif fr.status != "noop":
+            stats.folders_renamed += 1
 
 
 # --------------------------------------------------------------------------
@@ -937,12 +1062,13 @@ def main() -> int:
     for folder in tv_series:
         plan_tv_series(folder, args, logger, stats, plan)
     for folder in movies:
-        mp = plan_movie_folder(folder, args, logger, stats)
+        mp = plan_movie_folder(folder, args, logger, stats, plan)
         if mp is not None:
             plan.movies.append(mp)
     resolve_statuses(plan)
     resolve_chains(plan)
     resolve_removals(plan, args)
+    resolve_folder_renames(plan)
 
     # --- Phase 2: render (dry-run) or execute ---
     if args.dry_run:
@@ -967,6 +1093,7 @@ def main() -> int:
         row("TV extras separated", stats.extras_separated),
         row("TV specials placed", stats.specials_placed),
         row(remove_label, stats.dirs_removed),
+        row("Title folders re-tagged", stats.folders_renamed),
         row("Conflicts skipped", stats.conflicts),
         row("Warnings", stats.warnings),
         row("Errors", stats.errors),
