@@ -174,7 +174,7 @@ def build_parser():
                               "track is tagged as a different language, or has no "
                               "language tag at all, all audio tracks are kept regardless. "
                               "Default: off (all audio tracks are kept)")
-    parser.add_argument("-x", "--delete-source", action="store_true",
+    parser.add_argument("--delete-source", action="store_true",
                          help="Delete the source file once it has been successfully "
                               "copied or encoded to the output folder (files skipped "
                               "due to --limit or an existing output file are left "
@@ -182,7 +182,13 @@ def build_parser():
                               "different from -i/--input, since in-place runs already "
                               "replace the original and there'd be nothing left to "
                               "delete. Has no effect combined with --dry-run or "
-                              "--compare-crf. Default: off")
+                              "--compare-crf. Prompts for confirmation before the run "
+                              "starts unless --yes is also given. Default: off")
+    parser.add_argument("--yes", action="store_true",
+                         help="Skip the confirmation prompt that --delete-source shows "
+                              "before starting a run. Has no effect without "
+                              "--delete-source. Intended for unattended/cron use — "
+                              "make sure -i/-o are correct before relying on this.")
     parser.add_argument("--compare-crf", type=str, default=None, metavar="CRF1,CRF2,...",
                          help="Comparison mode: test-encode every file at each given CRF "
                               "(e.g. 18,22,28,35), printing a size/time table per file plus "
@@ -1045,9 +1051,26 @@ def main():
         print("Error: output folder must not be inside the input folder when "
               "--delete-source is set. Since the input scan is recursive, a later "
               "run would find already-converted files sitting in the output folder "
-              "and treat them as new sources — and -x would then delete them.",
+              "and treat them as new sources — and --delete-source would then delete "
+              "them.",
               file=sys.stderr)
         sys.exit(1)
+
+    # Dry runs never actually delete anything (they only log a preview), so the
+    # confirmation prompt would just be noise there.
+    if args.delete_source and not args.dry_run and not args.yes:
+        if not sys.stdin.isatty():
+            print("Error: --delete-source needs confirmation, but stdin isn't a "
+                  "terminal (e.g. running under cron). Pass --yes to skip the prompt "
+                  "for unattended runs.", file=sys.stderr)
+            sys.exit(1)
+        print(f"--delete-source is set: source files under {input_resolved} will be "
+              f"permanently deleted, one at a time, right after each is successfully "
+              f"copied or encoded to {output_resolved}.")
+        reply = input("Type 'yes' to continue: ").strip().lower()
+        if reply != "yes":
+            print("Aborted: confirmation not given.", file=sys.stderr)
+            sys.exit(1)
 
     # Comparison runs get an encoder-tagged log, so a hardware and a software run over
     # the same output folder produce separate logs rather than interleaving in one.
@@ -1225,6 +1248,21 @@ def main():
                     logging.info(f"[DRY RUN] WOULD DELETE SOURCE (after successful "
                                  f"{action}): {src}")
                 else:
+                    # One more direct check right here, independent of process_file's
+                    # own validation, immediately before the irreversible step: confirm
+                    # the output this deletion is predicated on is actually sitting on
+                    # disk with real content. Catches a race (something removing/
+                    # truncating dst between process_file returning and here) or a
+                    # future bug upstream that returns success without a good file.
+                    try:
+                        dst_size = dst.stat().st_size
+                    except OSError:
+                        dst_size = 0
+                    if dst_size == 0:
+                        logging.warning(f"Refusing to delete source: output at {dst} "
+                                         f"is missing or empty, despite a reported "
+                                         f"successful {action}: {src}")
+                        continue
                     try:
                         src.unlink()
                         deleted_source_count += 1
