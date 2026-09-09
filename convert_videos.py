@@ -1216,12 +1216,6 @@ def main():
         else:
             eta_str = "calculating..."
 
-        print(f"[{time.strftime('%H:%M:%S')}] "
-              f"Processed: {human_size(processed_bytes)} | "
-              f"Remaining: {human_size(remaining_bytes)} | "
-              f"ETA: {eta_str} | "
-              f"Current file ({human_size(src_size)}): {src.resolve()}")
-
         if same_location:
             dst = src
         else:
@@ -1229,11 +1223,18 @@ def main():
             dst = args.output_folder / rel_path
 
         if not same_location and dst.exists() and not args.force:
+            print(f"[{time.strftime('%H:%M:%S')}] Output file exists: {dst}")
             prefix = "[DRY RUN] WOULD SKIP" if args.dry_run else "SKIPPED"
             logging.info(f"{prefix} (output file already exists): {dst}")
             skipped_existing += 1
             processed_bytes += src_size
             continue
+
+        print(f"[{time.strftime('%H:%M:%S')}] "
+              f"Processed: {human_size(processed_bytes)} | "
+              f"Remaining: {human_size(remaining_bytes)} | "
+              f"ETA: {eta_str} | "
+              f"Current file ({human_size(src_size)}): {src.resolve()}")
 
         try:
             result = process_file(src, dst, args.crf, args.duration, args.min_size_mb,
