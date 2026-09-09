@@ -558,11 +558,14 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                   normalize_audio: bool = True, loudnorm_target: float = -16,
                   downscale: bool = False, strip_non_english_audio: bool = False):
     """Returns (original_size, new_size, video_duration_seconds, action, downscaled,
-    grew_larger) on success or dry-run preview, or None only when the caller already
-    decided to skip the file entirely before calling this (not used internally here;
-    reserved for callers). action is 'encoded' or 'copied'. downscaled is True if the
-    file was scaled down from >1080p. video_duration_seconds may be None if duration
-    could not be determined at all. In dry-run mode, new_size is a placeholder equal to
+    grew_larger, retried) on success or dry-run preview, or None only when the caller
+    already decided to skip the file entirely before calling this (not used internally
+    here; reserved for callers). action is 'encoded' or 'copied'. downscaled is True if
+    the file was scaled down from >1080p. video_duration_seconds may be None if duration
+    could not be determined at all. retried is True only when the real hardware encode
+    needed more than one attempt to succeed (see HARDWARE_ENCODE_MAX_ATTEMPTS); always
+    False for copied files, dry-run previews, and software encodes, since those are
+    never retried. In dry-run mode, new_size is a placeholder equal to
     original_size (no actual encode happens, so the real output size is unknown) — safe
     because dry-run never prints the "Total reduction" summary that would otherwise
     misuse it; it's only used for the Encoded/Copied/Failed breakdown and --limit
@@ -601,16 +604,16 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         if same_location:
             logging.info(f"KEPT (below {min_size_mb}MB minimum, already in place, "
                          f"{human_size(src_size)}): {src}")
-            return (src_size, src_size, small_file_duration, "copied", False, False)
+            return (src_size, src_size, small_file_duration, "copied", False, False, False)
         if dry_run:
             logging.info(f"[DRY RUN] WOULD COPY (below {min_size_mb}MB minimum, "
                          f"{human_size(src_size)}): {src} -> {dst}")
-            return (src_size, src_size, small_file_duration, "copied", False, False)
+            return (src_size, src_size, small_file_duration, "copied", False, False, False)
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
         logging.info(f"COPIED (below {min_size_mb}MB minimum, "
                      f"{human_size(src_size)}): {src} -> {dst}")
-        return (src_size, src_size, small_file_duration, "copied", False, False)
+        return (src_size, src_size, small_file_duration, "copied", False, False, False)
 
     media = probe_media(src, timeout_seconds)
     video_info = media["video"]
@@ -622,14 +625,14 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     if codec == "hevc":
         if same_location:
             logging.info(f"KEPT (already H.265, already in place): {src}")
-            return (src_size, src_size, video_duration, "copied", False, False)
+            return (src_size, src_size, video_duration, "copied", False, False, False)
         if dry_run:
             logging.info(f"[DRY RUN] WOULD COPY (already H.265): {src} -> {dst}")
-            return (src_size, src_size, video_duration, "copied", False, False)
+            return (src_size, src_size, video_duration, "copied", False, False, False)
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
         logging.info(f"COPIED (already H.265): {src} -> {dst}")
-        return (src_size, src_size, video_duration, "copied", False, False)
+        return (src_size, src_size, video_duration, "copied", False, False, False)
 
     needs_downscale = downscale and (width > 1920 or height > 1080)
 
@@ -709,7 +712,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         # reduction" summary is never printed in dry-run mode, only the
         # Encoded/Copied/Failed breakdown and --limit accounting, which need orig_size
         # and action/downscaled, not a real new_size.
-        return (src_size, src_size, video_duration, "encoded", needs_downscale, False)
+        return (src_size, src_size, video_duration, "encoded", needs_downscale, False, False)
 
     # When replacing in place, ffmpeg can't read and write the same path at once,
     # so encode to a temp file alongside it, then swap it in on success. The real
@@ -813,7 +816,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
             logging.warning(f"DISCARDED (encode grew {human_size(src_size)} -> "
                             f"{human_size(candidate_size)}, +{growth_pct:.1f}%); "
                             f"copied original instead: {src} -> {dst}")
-        return (src_size, src_size, video_duration, "copied", False, True)
+        return (src_size, src_size, video_duration, "copied", False, True, False)
 
     if same_location:
         os.replace(encode_target, dst)  # dst == src here; atomic swap-in
@@ -846,7 +849,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     logging.info(f"DONE: {src} -> {dst} "
                  f"({human_size(orig_size)} -> {human_size(new_size)}, {saved_pct:.1f}% smaller"
                  f"{speed_str})")
-    return (orig_size, new_size, video_duration, "encoded", needs_downscale, grew_larger)
+    return (orig_size, new_size, video_duration, "encoded", needs_downscale, grew_larger,
+             attempt > 1)
 
 
 def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duration: float,
@@ -1177,6 +1181,7 @@ def main():
     copied_count = 0
     downscaled_count = 0
     grew_larger_count = 0
+    retried_count = 0
     deleted_source_count = 0
     deleted_source_bytes = 0
     limit_bytes = float("inf") if args.limit == -1 else args.limit * 1024 ** 3
@@ -1251,7 +1256,7 @@ def main():
         processed_bytes += src_size
 
         if result is not None:
-            orig_size, new_size, video_duration, action, downscaled, grew_larger = result
+            orig_size, new_size, video_duration, action, downscaled, grew_larger, retried = result
             total_orig += orig_size
             total_new += new_size
             if video_duration is not None:
@@ -1264,6 +1269,8 @@ def main():
                 downscaled_count += 1
             if grew_larger:
                 grew_larger_count += 1
+            if retried:
+                retried_count += 1
 
             if args.delete_source:
                 if args.dry_run:
@@ -1327,6 +1334,10 @@ def main():
     grew_larger_line = f"Larger after encoding: {grew_larger_count} file(s)"
     logging.info(grew_larger_line)
     print(grew_larger_line)
+
+    retried_line = f"Needed a retry after a transient encode failure: {retried_count} file(s)"
+    logging.info(retried_line)
+    print(retried_line)
 
     if args.delete_source:
         if args.dry_run:
