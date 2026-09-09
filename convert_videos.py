@@ -92,6 +92,17 @@ TIMEOUT_FLOOR_SECONDS = 30 * 60  # 30 minutes
 # rather than merely slow work.
 TIMEOUT_SECONDS_PER_GB = 15 * 60  # 15 minutes per GB
 
+# Hardware (Quick Sync) encodes launched back-to-back can occasionally hit a
+# transient session/driver hiccup that a bare re-run of the same command doesn't
+# reproduce (e.g. the GPU context from the previous file not being fully released
+# yet). A couple of automatic retries with a short pause absorbs that without
+# masking a genuinely bad file, which will fail the same way on every attempt.
+# Software (libx265) encode failures aren't retried: they're far more likely to
+# indicate a real problem, and retrying would be costly given how much slower a
+# software encode is.
+HARDWARE_ENCODE_MAX_ATTEMPTS = 3
+HARDWARE_ENCODE_RETRY_DELAY_SECONDS = 5
+
 
 def compute_timeout_seconds(src_size_bytes: int) -> float:
     """A generous timeout for a single ffprobe metadata read over a file this size, so
@@ -729,16 +740,29 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                             keep_subtitle_indices, video_info["stream_index"],
                             measured_loudness)
     logging.info(f"Command: {format_cmd_for_log(cmd)}")
-    encode_start = time.monotonic()
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    max_attempts = HARDWARE_ENCODE_MAX_ATTEMPTS if encoding == "hardware" else 1
+    for attempt in range(1, max_attempts + 1):
+        encode_start = time.monotonic()
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        encode_elapsed = time.monotonic() - encode_start
 
-    if result.returncode != 0:
+        if result.returncode == 0:
+            break
+
         if encode_target.exists():
             encode_target.unlink(missing_ok=True)
-        raise ConversionError(src, f"ffmpeg exited with code {result.returncode}: "
-                                    f"{result.stderr[-2000:]}")
 
-    encode_elapsed = time.monotonic() - encode_start
+        if attempt < max_attempts:
+            logging.warning(f"ffmpeg exited with code {result.returncode} on attempt "
+                             f"{attempt}/{max_attempts} (often a transient hardware "
+                             f"encoder hiccup from back-to-back Quick Sync sessions); "
+                             f"retrying in {HARDWARE_ENCODE_RETRY_DELAY_SECONDS}s: "
+                             f"{src}\n{result.stderr[-2000:]}")
+            time.sleep(HARDWARE_ENCODE_RETRY_DELAY_SECONDS)
+        else:
+            attempts_str = f"{max_attempts} attempt(s)" if max_attempts > 1 else "1 attempt"
+            raise ConversionError(src, f"ffmpeg exited with code {result.returncode} "
+                                        f"after {attempts_str}: {result.stderr[-2000:]}")
 
     # Post-encode validation: confirm the output's duration roughly matches the
     # source's before trusting it (and, for in-place mode, before it ever overwrites
