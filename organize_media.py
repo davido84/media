@@ -51,9 +51,18 @@ HOW IT WORKS
      MOVIE      otherwise
 
    --- MOVIE ---
-   The longest .mkv directly inside becomes "<Title> (<Year>).mkv"; the rest
-   become "extra.<n>.mkv", numbered longest-to-shortest. (A "Featurettes/"
-   subfolder or similar is not recursed into.)
+   A single-disc movie has its .mkv files directly in the folder: the longest
+   becomes the main feature, named to match the folder (with the metadata id,
+   if any): "<Title> (<Year>) [id].mkv". Every other .mkv is a bonus extra,
+   moved into Jellyfin's "extras/" subfolder as "<Title> (<Year>) - Extra
+   <NN>.mkv" (longest-to-shortest).
+
+   A MULTI-DISC movie instead holds plain-numbered disc subfolders ("1", "2",
+   ...), each containing "title_<nn>.mkv" files. The lowest-numbered disc is the
+   main-feature disc and is handled exactly like a single-disc movie (longest =
+   main, the rest = extras); every title on the higher discs is collected into
+   "extras/" as well. Emptied disc folders are removed unless --keep-empty-dirs
+   is given.
 
    --- TV SERIES ---
    Disk subfolders are grouped by season; within a season disks are ordered by
@@ -151,6 +160,10 @@ TRAILING_ID_RE = re.compile(
 )
 # Matches a per-disc subfolder "<season>-<disk>", e.g. "1-1", "2-3", "10-1".
 SEASON_DISK_RE = re.compile(r"^(?P<season>\d+)-(?P<disk>\d+)$")
+# Matches a plain-numbered movie disc subfolder, e.g. "1", "2", "03". A
+# multi-disc movie has these instead of loose .mkv files; the lowest number is
+# the main-feature disc, higher numbers are extras discs.
+MOVIE_DISC_RE = re.compile(r"^(?P<disc>\d+)$")
 # Matches an extracted title file "title_<nn>.mkv", with an optional "x<k>"
 # multi-episode marker, e.g. "title_00.mkv" (one episode) or "title_04x2.mkv"
 # (one file holding two consecutive episodes -> Jellyfin S..E..-E.. stacking).
@@ -315,6 +328,7 @@ class PlannedMove:
 @dataclass
 class SeasonPlan:
     series_name: str
+    series_root: Path
     season: int
     reference: Optional[float]
     detection_note: str
@@ -325,6 +339,7 @@ class SeasonPlan:
 class MoviePlan:
     folder_name: str
     moves: List[PlannedMove]
+    root: Optional[Path] = None   # movie folder, for relative source display
 
 
 @dataclass(eq=False)
@@ -406,6 +421,14 @@ def folder_has_regular_season(folder: Path) -> bool:
     except OSError:
         pass
     return False
+
+
+def folder_has_movie_discs(folder: Path) -> bool:
+    """True if the folder holds plain-numbered disc subfolders (multi-disc movie)."""
+    try:
+        return any(p.is_dir() and MOVIE_DISC_RE.match(p.name.strip()) for p in folder.iterdir())
+    except OSError:
+        return False
 
 
 def _collect_disk_titles(disk_path: Path, logger: Logger,
@@ -541,7 +564,7 @@ def _plan_season(series_folder: Path, series_stem: str, season: int, disks: List
             moves.append(PlannedMove(p, dest, kind, durations.get(p), ratios.get(p), flags.get(p, ""), parts=k))
 
     stats.seasons += 1
-    return SeasonPlan(series_folder.name, season, reference, detection_note, moves)
+    return SeasonPlan(series_folder.name, series_folder, season, reference, detection_note, moves)
 
 
 def plan_tv_series(series_folder: Path, args: argparse.Namespace, logger: Logger, stats: Stats, plan: Plan) -> None:
@@ -552,11 +575,14 @@ def plan_tv_series(series_folder: Path, args: argparse.Namespace, logger: Logger
 
     seasons: Dict[int, List[Tuple[int, Path]]] = {}
     stray_mkvs: List[Path] = []
+    stray_disc_dirs: List[Path] = []
     for p in series_folder.iterdir():
         if p.is_dir():
             sd = SEASON_DISK_RE.match(p.name.strip())
             if sd:
                 seasons.setdefault(int(sd.group("season")), []).append((int(sd.group("disk")), p))
+            elif MOVIE_DISC_RE.match(p.name.strip()):
+                stray_disc_dirs.append(p)
         elif p.is_file() and p.suffix.lower() == ".mkv":
             stray_mkvs.append(p)
 
@@ -566,6 +592,13 @@ def plan_tv_series(series_folder: Path, args: argparse.Namespace, logger: Logger
     if stray_mkvs:
         logger.warning(f"{series_folder}: {len(stray_mkvs)} .mkv file(s) sit directly in the series folder "
                        f"(outside any '<S>-<D>' disk folder) - left untouched")
+        stats.warnings += 1
+    if stray_disc_dirs:
+        names = ", ".join(sorted(d.name for d in stray_disc_dirs))
+        logger.warning(f"{series_folder}: also has plain-numbered subfolder(s) ({names}), the movie-disc form - "
+                       f"treating this folder as a TV series because it has season-disk '<S>-<D>' folders, and "
+                       f"IGNORING the plain-numbered ones. If this is actually a movie, drop the '<S>-<D>' "
+                       f"folders; if it's TV, rename these to '<season>-<disk>'. Check the naming")
         stats.warnings += 1
 
     for season in sorted(seasons):
@@ -581,6 +614,19 @@ def plan_tv_series(series_folder: Path, args: argparse.Namespace, logger: Logger
 # --------------------------------------------------------------------------
 # Planning: movies
 # --------------------------------------------------------------------------
+
+def _warn_similar_cuts(folder: Path, probed: List[Tuple[Path, Optional[float]]],
+                       args: argparse.Namespace, logger: Logger, stats: Stats) -> None:
+    """Warn if the two longest titles are close in length (possible second cut)."""
+    if len(probed) >= 2:
+        longest, second = probed[0][1] or 0.0, probed[1][1] or 0.0
+        if longest > 0 and (longest - second) / longest * 100.0 < args.similar_duration_pct:
+            logger.warning(f"{folder}: the two longest files are within {args.similar_duration_pct:g}% of each "
+                           f"other ({probed[0][0].name}: {format_duration(longest)} vs {probed[1][0].name}: "
+                           f"{format_duration(second)}) - picking the longest as the main feature, but this may "
+                           f"be two cuts of the movie (theatrical vs extended); please double check")
+            stats.warnings += 1
+
 
 def plan_movie_folder(folder: Path, args: argparse.Namespace, logger: Logger, stats: Stats,
                       plan: Plan) -> Optional[MoviePlan]:
@@ -604,24 +650,82 @@ def plan_movie_folder(folder: Path, args: argparse.Namespace, logger: Logger, st
             stats.warnings += 1
         probed.append((f, d))
     probed.sort(key=lambda item: (item[1] or 0.0), reverse=True)
-
-    if len(probed) >= 2:
-        longest, second = probed[0][1] or 0.0, probed[1][1] or 0.0
-        if longest > 0 and (longest - second) / longest * 100.0 < args.similar_duration_pct:
-            logger.warning(f"{folder}: the two longest files are within {args.similar_duration_pct:g}% of each "
-                           f"other ({probed[0][0].name}: {format_duration(longest)} vs {probed[1][0].name}: "
-                           f"{format_duration(second)}) - picking the longest as the main feature, but this may "
-                           f"be two cuts of the movie (theatrical vs extended); please double check")
-            stats.warnings += 1
+    _warn_similar_cuts(folder, probed, args, logger, stats)
 
     moves: List[PlannedMove] = []
     main_file, main_dur = probed[0]
     moves.append(PlannedMove(main_file, folder / f"{main_stem}.mkv", "movie-main", main_dur))
+    extras_folder = folder / "extras"
     for n, (f, d) in enumerate(probed[1:], start=1):
-        moves.append(PlannedMove(f, folder / f"extra.{n}.mkv", "movie-extra", d))
+        dest = extras_folder / f"{canonical_stem} - Extra {n:02d}.mkv"
+        moves.append(PlannedMove(f, dest, "movie-extra", d))
 
     _plan_folder_rename(folder, title, year, jf_id, "movie", plan)
-    return MoviePlan(folder.name, moves)
+    return MoviePlan(folder.name, moves, folder)
+
+
+def plan_multidisc_movie(folder: Path, args: argparse.Namespace, logger: Logger, stats: Stats,
+                         plan: Plan) -> Optional[MoviePlan]:
+    """Multi-disc movie: lowest disc = single-disc-style main+extras, rest all extras."""
+    parsed = parse_title_folder(folder.name)
+    assert parsed is not None
+    title, year, jf_id = parsed
+    canonical_stem = sanitize_filename_component(f"{title} ({year})")
+    main_stem = f"{canonical_stem} {jf_id}" if jf_id else canonical_stem
+    extras_folder = folder / "extras"
+
+    disc_dirs: List[Tuple[int, Path]] = []
+    stray_mkvs: List[Path] = []
+    for p in folder.iterdir():
+        if p.is_dir() and MOVIE_DISC_RE.match(p.name.strip()):
+            disc_dirs.append((int(p.name.strip()), p))
+        elif p.is_file() and p.suffix.lower() == ".mkv":
+            stray_mkvs.append(p)
+    disc_dirs.sort(key=lambda item: item[0])
+    if not disc_dirs:
+        return None
+
+    main_num, main_disc = disc_dirs[0]
+    main_titles, main_leftovers = _collect_disk_titles(main_disc, logger, stats)
+    if not main_titles:
+        logger.warning(f"{folder}: main disc '{main_disc.name}' has no title_<nn>.mkv files - skipping")
+        stats.warnings += 1
+        return None
+
+    stats.movie_folders += 1
+    if stray_mkvs:
+        logger.warning(f"{folder}: {len(stray_mkvs)} .mkv file(s) sit directly in the movie folder "
+                       f"(outside any disc subfolder) - left untouched")
+        stats.warnings += 1
+    plan.disk_info[main_disc] = (len(main_titles), bool(main_leftovers))
+
+    # Main disc: longest title is the main feature, exactly like a single-disc movie.
+    dur_of = {p: probe_duration_seconds(args.ffprobe, p) for _n, _pp, p in main_titles}
+    probed = sorted(((p, dur_of[p]) for _n, _pp, p in main_titles),
+                    key=lambda item: (item[1] or 0.0), reverse=True)
+    _warn_similar_cuts(folder, probed, args, logger, stats)
+    main_file, main_dur = probed[0]
+
+    moves: List[PlannedMove] = [PlannedMove(main_file, folder / f"{main_stem}.mkv", "movie-main", main_dur)]
+    extra_no = 0
+    # Remaining main-disc titles (title order) -> extras.
+    for _n, _pp, p in main_titles:
+        if p == main_file:
+            continue
+        extra_no += 1
+        moves.append(PlannedMove(p, extras_folder / f"{canonical_stem} - Extra {extra_no:02d}.mkv",
+                                 "movie-extra", dur_of[p]))
+    # Every title on the higher discs -> extras (disc order, then title order).
+    for _disc_num, disc in disc_dirs[1:]:
+        titles, leftovers = _collect_disk_titles(disc, logger, stats)
+        plan.disk_info[disc] = (len(titles), bool(leftovers))
+        for _n, _pp, p in titles:
+            extra_no += 1
+            moves.append(PlannedMove(p, extras_folder / f"{canonical_stem} - Extra {extra_no:02d}.mkv",
+                                     "movie-extra", None))
+
+    _plan_folder_rename(folder, title, year, jf_id, "movie", plan)
+    return MoviePlan(folder.name, moves, folder)
 
 
 # --------------------------------------------------------------------------
@@ -702,9 +806,8 @@ def resolve_removals(plan: Plan, args: argparse.Namespace) -> None:
         plan.removals = []
         return
     moves_by_disk: Dict[Path, List[PlannedMove]] = defaultdict(list)
-    for sp in plan.seasons:
-        for mv in sp.moves:
-            moves_by_disk[mv.src.parent].append(mv)
+    for mv in plan.all_moves():
+        moves_by_disk[mv.src.parent].append(mv)
     removable: List[Path] = []
     for disk, (n_titles, had_leftovers) in plan.disk_info.items():
         if n_titles > 0 and not had_leftovers and all(mv.status == "" for mv in moves_by_disk.get(disk, [])):
@@ -727,7 +830,7 @@ def resolve_folder_renames(plan: Plan) -> None:
 # --------------------------------------------------------------------------
 
 def _target_rel(move: PlannedMove) -> str:
-    if move.kind == "extra":
+    if move.kind in ("extra", "movie-extra"):
         return f"extras/{move.dest.name}"
     return move.dest.name
 
@@ -762,6 +865,54 @@ def _tag_for(move: PlannedMove) -> str:
     return base
 
 
+def _leaf_annotation(move: PlannedMove, src_disp: str) -> str:
+    """Right-hand annotation for a file in the result tree: source, length, tags."""
+    if move.status == "noop":
+        return "  (already named - unchanged)"
+    parts = [f"<- {src_disp}"]
+    if move.duration is not None:
+        parts.append(f"({format_duration(move.duration)})")
+    if move.ratio is not None:
+        parts.append(f"{move.ratio * 100:.0f}% of typical")
+    tag = _tag_for(move).strip()
+    if tag:
+        parts.append(tag)
+    return "  " + "  ".join(parts)
+
+
+def _print_result_tree(title_line: str, sub_note: Optional[str],
+                       leaves: List[Tuple[Tuple[str, ...], str]],
+                       removed: List[str], R) -> None:
+    """Print one title folder as an indented final-state tree.
+
+    leaves: (relative-path-parts, annotation). removed: disk folder names.
+    """
+    R("")
+    R(title_line)
+    if sub_note:
+        R(f"    {sub_note}")
+
+    # Build a nested {dirs, files} tree from the destination relative paths.
+    root: Dict = {"dirs": {}, "files": []}
+    for parts, annot in leaves:
+        node = root
+        for d in parts[:-1]:
+            node = node["dirs"].setdefault(d, {"dirs": {}, "files": []})
+        node["files"].append((parts[-1], annot))
+
+    def walk(node: Dict, indent: str) -> None:
+        fwidth = max((len(name) for name, _ in node["files"]), default=0)
+        for name, annot in node["files"]:
+            R(f"{indent}{name:<{fwidth}}{annot}")
+        for dname in sorted(node["dirs"]):
+            R(f"{indent}{dname}/")
+            walk(node["dirs"][dname], indent + "    ")
+
+    walk(root, "    ")
+    if removed:
+        R(f"    (empty disk folder(s) removed: {', '.join(removed)})")
+
+
 def render_plan(plan: Plan, logger: Logger, input_root: Path) -> None:
     R = logger.report
     moves = plan.all_moves()
@@ -769,10 +920,16 @@ def render_plan(plan: Plan, logger: Logger, input_root: Path) -> None:
     conflicts = [m for m in moves if m.status in SKIP_STATUSES]
     renames = [fr for fr in plan.folder_renames if fr.status != "noop"]
 
+    # Final folder name per title folder (root -> displayed name after rename).
+    rename_by_root: Dict[Path, FolderRename] = {fr.src: fr for fr in plan.folder_renames}
+    removals_by_root: Dict[Path, List[str]] = defaultdict(list)
+    for d in plan.removals:
+        removals_by_root[d.parent].append(d.name)
+
     R()
     R("=================  DRY RUN  =================")
     R(f"Root: {input_root}")
-    R("No files will be changed. This is exactly what a real run would do.")
+    R("Nothing below has happened yet - this is exactly what a real run would do.")
 
     if not moves and not renames:
         R("")
@@ -785,54 +942,66 @@ def render_plan(plan: Plan, logger: Logger, input_root: Path) -> None:
         R("=============================================")
         return
 
-    # ---- TV, grouped series -> season ----
-    seasons_by_series: Dict[str, List[SeasonPlan]] = defaultdict(list)
+    # ---- Up-front manifest of the scope ----
+    R("")
+    R(f"Planned changes:  {len(to_do)} file(s) moved/renamed | "
+      f"{len(renames)} title folder(s) re-tagged | "
+      f"{len(plan.removals)} empty disk folder(s) removed | "
+      f"{len(conflicts)} conflict(s) skipped")
+    R("Each file below shows its FINAL name and, after '<-', where it comes from.")
+
+    def header(root: Path, kind: str) -> Tuple[str, Optional[str]]:
+        fr = rename_by_root.get(root)
+        if fr is not None and fr.status == "":
+            return f"{kind}  {fr.dest.name}/", f"(folder renamed from \"{root.name}\")"
+        if fr is not None and fr.status == "exists":
+            return (f"{kind}  {root.name}/",
+                    f"(would re-tag to \"{fr.dest.name}\" but that folder already exists - SKIPPED)")
+        return f"{kind}  {root.name}/", None
+
+    def leaves_for(mvs: List[PlannedMove], root: Path) -> List[Tuple[Tuple[str, ...], str]]:
+        out = []
+        for m in mvs:
+            if m.status in SKIP_STATUSES:
+                continue  # skipped -> won't appear in the result; listed under Conflicts
+            rel_parts = m.dest.relative_to(root).parts
+            try:
+                src_disp = str(m.src.relative_to(root))
+            except ValueError:
+                src_disp = m.src.name
+            out.append((rel_parts, _leaf_annotation(m, src_disp)))
+        return out
+
+    # ---- TV series, grouped by folder ----
+    seasons_by_root: Dict[Path, List[SeasonPlan]] = defaultdict(list)
     for sp in plan.seasons:
-        seasons_by_series[sp.series_name].append(sp)
+        seasons_by_root[sp.series_root].append(sp)
 
-    for series_name, seasons in seasons_by_series.items():
-        R("")
-        R(f"[TV] {series_name}")
-        for sp in sorted(seasons, key=lambda s: s.season):
-            R(f"  Season {sp.season:02d}  ({sp.detection_note})")
-            width = max((len(f"{m.src.parent.name}/{m.src.name}") for m in sp.moves), default=0)
-            for m in sp.moves:
-                src_disp = f"{m.src.parent.name}/{m.src.name}"
-                pct = f"{m.ratio * 100:.0f}%" if m.ratio is not None else "  -"
-                R(f"    {src_disp:<{width}}  {format_duration(m.duration):>8}  {pct:>4}  "
-                  f"-> {_target_rel(m)}{_tag_for(m)}")
+    for root, sps in seasons_by_root.items():
+        title_line, sub = header(root, "[TV]")
+        leaves: List[Tuple[Tuple[str, ...], str]] = []
+        notes = []
+        for sp in sorted(sps, key=lambda s: s.season):
+            leaves.extend(leaves_for(sp.moves, root))
+            notes.append(f"Season {sp.season:02d}: {sp.detection_note}")
+        _print_result_tree(title_line, sub, leaves, removals_by_root.get(root, []), R)
+        for n in notes:
+            R(f"    - {n}")
 
-    # ---- Movies ----
+    # ---- Movies (single- and multi-disc), one folder each ----
     for mp in plan.movies:
-        R("")
-        R(f"[Movie] {mp.folder_name}")
-        width = max((len(m.src.name) for m in mp.moves), default=0)
-        for m in mp.moves:
-            R(f"    {m.src.name:<{width}}  {format_duration(m.duration):>8}  "
-              f"-> {m.dest.name}{_tag_for(m)}")
+        root = mp.root if mp.root is not None else (mp.moves[0].src.parent if mp.moves else input_root)
+        title_line, sub = header(root, "[Movie]")
+        leaves = leaves_for(mp.moves, root)
+        _print_result_tree(title_line, sub, leaves, removals_by_root.get(root, []), R)
 
-    # ---- Disk folders that would be removed ----
-    if plan.removals:
-        R("")
-        R("Empty disk folders that would be removed:")
-        for d in plan.removals:
-            R(f"    {d.parent.name}/{d.name}")
-
-    # ---- Series/movie folders re-tagged with a Jellyfin-form metadata id ----
-    if renames:
-        R("")
-        R("Title folders that would be renamed (folder + all its contents keep the new name):")
-        width = max((len(fr.src.name) for fr in renames), default=0)
-        for fr in renames:
-            note = "  [SKIP: a different folder already exists at that name]" if fr.status == "exists" else ""
-            R(f"    {fr.src.name:<{width}}  ->  {fr.dest.name}{note}")
-
-    # ---- Conflicts, called out again together ----
+    # ---- Conflicts, called out together (these do NOT happen) ----
     if conflicts:
         R("")
-        R(f"!! {len(conflicts)} conflict(s) would be SKIPPED (nothing overwritten):")
+        R(f"!! {len(conflicts)} conflict(s) SKIPPED - nothing is overwritten:")
         for m in conflicts:
-            R(f"    {m.src}  ->  {m.dest.name}{_tag_for(m)}")
+            R(f"    {m.src}")
+            R(f"      -> {m.dest}{_tag_for(m)}")
 
     R("")
     R("=============================================")
@@ -868,7 +1037,7 @@ def _perform_move(m: PlannedMove, origin: Path, logger: Logger, stats: Stats) ->
         return False
     logger.info(f"Renamed {origin} -> {shown}")
     stats.files_renamed += 1
-    if m.kind == "extra":
+    if m.kind in ("extra", "movie-extra"):
         stats.extras_separated += 1
     elif m.kind == "special":
         stats.specials_placed += 1
@@ -986,7 +1155,7 @@ def tally_plan_into_stats(plan: Plan, stats: Stats) -> None:
             stats.conflicts += 1
         else:
             stats.files_renamed += 1
-            if m.kind == "extra":
+            if m.kind in ("extra", "movie-extra"):
                 stats.extras_separated += 1
             elif m.kind == "special":
                 stats.specials_placed += 1
@@ -1039,11 +1208,13 @@ def main() -> int:
 
     folders = find_title_year_folders(input_root)
     tv_series = [f for f in folders if folder_has_season_disks(f)]
-    movies = [f for f in folders if f not in tv_series]
+    multidisc = [f for f in folders if f not in tv_series and folder_has_movie_discs(f)]
+    movies = [f for f in folders if f not in tv_series and f not in multidisc]
     logger.info(f"Found {len(folders)} '<Title> (<Year>)' folder(s) under {input_root} "
-                f"({len(tv_series)} TV series, {len(movies)} movie)")
+                f"({len(tv_series)} TV series, {len(multidisc)} multi-disc movie, "
+                f"{len(movies)} single-disc movie)")
 
-    need_ffprobe = bool(movies) or (
+    need_ffprobe = bool(movies) or bool(multidisc) or (
         args.detect_extras and any(folder_has_regular_season(f) for f in tv_series)
     )
     if need_ffprobe:
@@ -1061,6 +1232,10 @@ def main() -> int:
     plan = Plan()
     for folder in tv_series:
         plan_tv_series(folder, args, logger, stats, plan)
+    for folder in multidisc:
+        mp = plan_multidisc_movie(folder, args, logger, stats, plan)
+        if mp is not None:
+            plan.movies.append(mp)
     for folder in movies:
         mp = plan_movie_folder(folder, args, logger, stats, plan)
         if mp is not None:
@@ -1090,7 +1265,7 @@ def main() -> int:
         row("Movie folders processed", stats.movie_folders),
         row(rename_label, stats.files_renamed),
         row("Files already correctly named", stats.files_already_correct),
-        row("TV extras separated", stats.extras_separated),
+        row("Extras placed (TV + movie)", stats.extras_separated),
         row("TV specials placed", stats.specials_placed),
         row(remove_label, stats.dirs_removed),
         row("Title folders re-tagged", stats.folders_renamed),
