@@ -124,6 +124,31 @@ def _is_within(path: Path, folder: Path) -> bool:
         return False
 
 
+def relpath_for_matching(src: Path, input_folder: Path) -> str:
+    """The path of src relative to input_folder, written with forward slashes, for use
+    with --include/--exclude regexes. Forward slashes make patterns portable across
+    OSes; matching this relative form (rather than the absolute path) is what lets a
+    pattern anchor to the first path component below the input folder."""
+    return src.relative_to(input_folder).as_posix()
+
+
+def filter_files(files, input_folder: Path, include_re, exclude_re):
+    """Apply the compiled --include/--exclude patterns to a list of source paths and
+    return the ones to keep. Each is matched (start-anchored, via re.match) against the
+    file's path relative to input_folder in forward-slash form. A file is kept when it
+    matches include (or include is None) AND does not match exclude; exclude wins any
+    tie. include_re/exclude_re are compiled patterns (already case-insensitive) or None."""
+    kept = []
+    for src in files:
+        rel = relpath_for_matching(src, input_folder)
+        if include_re is not None and not include_re.match(rel):
+            continue
+        if exclude_re is not None and exclude_re.match(rel):
+            continue
+        kept.append(src)
+    return kept
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="Recursively re-encode .mp4/.mkv files to H.265 (hardware via Intel "
@@ -200,6 +225,22 @@ def build_parser():
                               "before starting a run. Has no effect without "
                               "--delete-source. Intended for unattended/cron use — "
                               "make sure -i/-o are correct before relying on this.")
+    parser.add_argument("--include", type=str, default=None, metavar="REGEX",
+                         help="Only process files whose path, taken relative to the "
+                              "input folder and written with forward slashes, matches "
+                              "this regex at its start (like re.match, not a full "
+                              "match). E.g. with -i d:/media, --include=ABC processes "
+                              "d:/media/ABCdef/title.mkv but not d:/media/zABC/title.mkv. "
+                              "Case-insensitive. Files that don't match are skipped "
+                              "entirely (never copied, encoded, or deleted). Default: "
+                              "process everything")
+    parser.add_argument("--exclude", type=str, default=None, metavar="REGEX",
+                         help="Skip files whose path, taken relative to the input "
+                              "folder and written with forward slashes, matches this "
+                              "regex at its start (like re.match). Same anchoring and "
+                              "case-insensitivity as --include. When a file matches "
+                              "both --include and --exclude, --exclude wins and the "
+                              "file is skipped. Default: exclude nothing")
     parser.add_argument("--compare-crf", type=str, default=None, metavar="CRF1,CRF2,...",
                          help="Comparison mode: test-encode every file at each given CRF "
                               "(e.g. 18,22,28,35), printing a size/time table per file plus "
@@ -1028,6 +1069,29 @@ def main():
         build_parser().print_help()
         sys.exit(1)
 
+    include_re = exclude_re = None
+    try:
+        if args.include is not None:
+            include_re = re.compile(args.include, re.IGNORECASE)
+        if args.exclude is not None:
+            exclude_re = re.compile(args.exclude, re.IGNORECASE)
+    except re.error as e:
+        print(f"Error: invalid --include/--exclude regex: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if include_re is not None or exclude_re is not None:
+        total_found = len(mp4_files)
+        mp4_files = filter_files(mp4_files, args.input_folder, include_re, exclude_re)
+        filtered_out = total_found - len(mp4_files)
+        # Printed before logging is configured, so echo to the console directly; the
+        # same numbers are logged again below once the log file is open.
+        print(f"Filtered {total_found} file(s) down to {len(mp4_files)} "
+              f"({filtered_out} excluded by --include/--exclude).")
+        if not mp4_files:
+            print("No files remain after applying --include/--exclude; nothing to do.",
+                  file=sys.stderr)
+            sys.exit(1)
+
     if args.duration != -1 and args.output_folder is None:
         print("Error: -o/--output is required when --duration is set. "
               "Test encodes must be written to a separate folder so your source "
@@ -1169,6 +1233,12 @@ def main():
                  f"Data limit: {'none' if args.limit == -1 else f'{args.limit}GB'} "
                  f"Downscale to 1080p: {'yes' if args.downscale else 'no'} "
                  f"Strip non-English audio: {'yes' if args.strip_no_english_audio else 'no'}")
+
+    if args.include is not None or args.exclude is not None:
+        logging.info(f"Filters active — include: {args.include!r}, "
+                     f"exclude: {args.exclude!r} (matched against each file's path "
+                     f"relative to the input folder, forward-slash form, "
+                     f"case-insensitive, start-anchored).")
 
     logging.info(f"Found {len(mp4_files)} .mp4/.mkv file(s) to process.")
 
