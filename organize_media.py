@@ -163,6 +163,9 @@ SEASON_DISK_RE = re.compile(r"^(?P<season>\d+)-(?P<disk>\d+)$")
 # multi-disc movie has these instead of loose .mkv files; the lowest number is
 # the main-feature disc, higher numbers are extras discs.
 MOVIE_DISC_RE = re.compile(r"^(?P<disc>\d+)$")
+# Matches an already-organized season folder ("Season 00", "Season 01", ...),
+# used only to give a re-run an accurate "already organized" skip reason.
+SEASON_FOLDER_RE = re.compile(r"^Season \d+$", re.IGNORECASE)
 # Matches an extracted title file "title_<nn>.mkv", with an optional "x<k>"
 # multi-episode marker, e.g. "title_00.mkv" (one episode) or "title_04x2.mkv"
 # (one file holding two consecutive episodes -> Jellyfin S..E..-E.. stacking).
@@ -355,6 +358,8 @@ class Plan:
     movies: List[MoviePlan] = field(default_factory=list)
     removals: List[Path] = field(default_factory=list)
     folder_renames: List[FolderRename] = field(default_factory=list)
+    # recognized title folders that produced nothing: (folder, reason)
+    skipped: List[Tuple[Path, str]] = field(default_factory=list)
     # disk folder -> (num title files, had non-title leftovers)
     disk_info: Dict[Path, Tuple[int, bool]] = field(default_factory=dict)
 
@@ -378,6 +383,7 @@ class Stats:
     specials_placed: int = 0
     dirs_removed: int = 0
     folders_renamed: int = 0
+    folders_skipped: int = 0
     conflicts: int = 0
     errors: int = 0
     warnings: int = 0
@@ -587,7 +593,6 @@ def plan_tv_series(series_folder: Path, args: argparse.Namespace, logger: Logger
 
     if not seasons:
         return
-    stats.series_folders += 1
     if stray_mkvs:
         logger.warning(f"{series_folder}: {len(stray_mkvs)} .mkv file(s) sit directly in the series folder "
                        f"(outside any '<S>-<D>' disk folder) - left untouched")
@@ -600,12 +605,20 @@ def plan_tv_series(series_folder: Path, args: argparse.Namespace, logger: Logger
                        f"folders; if it's TV, rename these to '<season>-<disk>'. Check the naming")
         stats.warnings += 1
 
+    produced = False
     for season in sorted(seasons):
         disks = sorted(seasons[season], key=lambda item: item[0])
         sp = _plan_season(series_folder, series_stem, season, disks, args, logger, stats, plan)
         if sp is not None:
             plan.seasons.append(sp)
+            produced = True
 
+    if not produced:
+        # Season-disk folders exist but hold no episodes: nothing to organize,
+        # so leave the folder completely alone (no re-tag either).
+        plan.skipped.append((series_folder, "TV series: season-disk folders contain no title_<nn>.mkv files"))
+        return
+    stats.series_folders += 1
     # The id (if any) belongs on the series folder, so re-tag it to Jellyfin form.
     _plan_folder_rename(series_folder, title, year, jf_id, "series", plan)
 
@@ -638,6 +651,10 @@ def plan_movie_folder(folder: Path, args: argparse.Namespace, logger: Logger, st
 
     mkvs = sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".mkv")
     if not mkvs:
+        if any(p.is_dir() and SEASON_FOLDER_RE.match(p.name) for p in folder.iterdir()):
+            plan.skipped.append((folder, "already organized (contains Season folders)"))
+        else:
+            plan.skipped.append((folder, "no .mkv files directly in the folder"))
         return None
     stats.movie_folders += 1
 
@@ -687,8 +704,7 @@ def plan_multidisc_movie(folder: Path, args: argparse.Namespace, logger: Logger,
     main_num, main_disc = disc_dirs[0]
     main_titles, main_leftovers = _collect_disk_titles(main_disc, logger, stats)
     if not main_titles:
-        logger.warning(f"{folder}: main disc '{main_disc.name}' has no title_<nn>.mkv files - skipping")
-        stats.warnings += 1
+        plan.skipped.append((folder, f"multi-disc movie: main disc '{main_disc.name}' has no title_<nn>.mkv files"))
         return None
 
     stats.movie_folders += 1
@@ -927,14 +943,30 @@ def render_plan(plan: Plan, logger: Logger, input_root: Path) -> None:
     R(f"Root: {input_root}")
     R("Nothing below has happened yet - this is exactly what a real run would do.")
 
-    if not moves and not renames:
+    def render_skipped() -> None:
+        if not plan.skipped:
+            return
+        R("")
+        R("Skipped (recognized folders with nothing to organize - left untouched):")
+        def disp(f: Path) -> str:
+            try:
+                return str(f.relative_to(input_root))
+            except ValueError:
+                return f.name
+        width = max(len(disp(f)) for f, _ in plan.skipped)
+        for f, reason in sorted(plan.skipped):
+            R(f"    {disp(f):<{width}}  - {reason}")
+
+    if not moves and not renames and not plan.skipped:
         R("")
         R("No '<Title> (<Year>)' folders with anything to organize were found.")
         R("=============================================")
         return
     if not to_do and not conflicts and not plan.removals and not renames:
         R("")
-        R("Everything is already organized - nothing to do.")
+        R("Nothing to organize.")
+        render_skipped()
+        R("")
         R("=============================================")
         return
 
@@ -943,7 +975,8 @@ def render_plan(plan: Plan, logger: Logger, input_root: Path) -> None:
     R(f"Planned changes:  {len(to_do)} file(s) moved/renamed | "
       f"{len(renames)} title folder(s) re-tagged | "
       f"{len(plan.removals)} empty disk folder(s) removed | "
-      f"{len(conflicts)} conflict(s) skipped")
+      f"{len(conflicts)} conflict(s) skipped | "
+      f"{len(plan.skipped)} folder(s) skipped")
     R("Each file below shows its FINAL name and, after '<-', where it comes from.")
 
     def header(root: Path, kind: str) -> Tuple[str, Optional[str]]:
@@ -990,6 +1023,9 @@ def render_plan(plan: Plan, logger: Logger, input_root: Path) -> None:
         title_line, sub = header(root, "[Movie]")
         leaves = leaves_for(mp.moves, root)
         _print_result_tree(title_line, sub, leaves, removals_by_root.get(root, []), R)
+
+    # ---- Recognized folders that were skipped ----
+    render_skipped()
 
     # ---- Conflicts, called out together (these do NOT happen) ----
     if conflicts:
@@ -1238,6 +1274,10 @@ def main() -> int:
     resolve_removals(plan)
     resolve_folder_renames(plan)
 
+    for folder, reason in plan.skipped:
+        logger.info(f"Skipped: {folder}  ({reason})")
+    stats.folders_skipped = len(plan.skipped)
+
     # --- Phase 2: render (dry-run) or execute ---
     if args.dry_run:
         render_plan(plan, logger, input_root)
@@ -1262,6 +1302,7 @@ def main() -> int:
         row("TV specials placed", stats.specials_placed),
         row(remove_label, stats.dirs_removed),
         row("Title folders re-tagged", stats.folders_renamed),
+        row("Folders skipped (nothing to do)", stats.folders_skipped),
         row("Conflicts skipped", stats.conflicts),
         row("Warnings", stats.warnings),
         row("Errors", stats.errors),
