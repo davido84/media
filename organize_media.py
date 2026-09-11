@@ -61,8 +61,7 @@ HOW IT WORKS
    ...), each containing "title_<nn>.mkv" files. The lowest-numbered disc is the
    main-feature disc and is handled exactly like a single-disc movie (longest =
    main, the rest = extras); every title on the higher discs is collected into
-   "extras/" as well. Emptied disc folders are removed unless --keep-empty-dirs
-   is given.
+   "extras/" as well. Emptied disc folders are removed after organizing.
 
    --- TV SERIES ---
    Disk subfolders are grouped by season; within a season disks are ordered by
@@ -73,7 +72,7 @@ HOW IT WORKS
    2's continuing the count - and moved to
    "Season <NN>/<Title> (<Year>) S<NN>E<NN>.mkv". Detected extras go to
    "Season <NN>/extras/" (Jellyfin's generic-extras folder). Emptied "<S>-<D>"
-   disk folders are removed unless --keep-empty-dirs is given.
+   disk folders are removed after organizing.
 
    Season 0 ("0-<D>" disk folders) is treated as Jellyfin SPECIALS: every title
    is placed in "Season 00/" as "<Title> (<Year>) S00E<NN>.mkv", numbered in
@@ -120,7 +119,7 @@ CAVEATS
 -----------------------------------------------------------------------------
 - ffprobe (part of ffmpeg) is needed for MOVIE folders always, and for TV
   folders when extras detection is on. Checked up front, only if the run
-  needs it; override its location with --ffprobe.
+  needs it.
 - MOVIES: "main = longest" can't tell a real extra from a second cut
   (theatrical vs extended). If the two longest are within
   --similar-duration-pct, a warning is logged; the longest still wins.
@@ -275,14 +274,14 @@ class Logger:
 # ffprobe interaction
 # --------------------------------------------------------------------------
 
-def preflight_check_ffprobe(ffprobe_bin: str) -> Optional[str]:
-    if shutil.which(ffprobe_bin) is None:
-        return f"ffprobe executable not found or not executable: {ffprobe_bin!r}"
+def preflight_check_ffprobe() -> Optional[str]:
+    if shutil.which("ffprobe") is None:
+        return "ffprobe executable not found on PATH - install ffmpeg"
     return None
 
 
-def probe_duration_seconds(ffprobe_bin: str, path: Path) -> Optional[float]:
-    cmd = [ffprobe_bin, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)]
+def probe_duration_seconds(path: Path) -> Optional[float]:
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)]
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     except FileNotFoundError:
@@ -493,7 +492,7 @@ def _plan_season(series_folder: Path, series_stem: str, season: int, disks: List
         detection_note = "extras detection off - every title treated as an episode"
     else:
         for p in ordered:
-            durations[p] = probe_duration_seconds(args.ffprobe, p)
+            durations[p] = probe_duration_seconds(p)
         # A K-part title covers K episodes, so its per-episode length is dur/K;
         # use that for the reference so a stacked title doesn't inflate the median.
         known = [d / parts_of[p] for p in ordered if (d := durations[p]) is not None and d > 0]
@@ -644,7 +643,7 @@ def plan_movie_folder(folder: Path, args: argparse.Namespace, logger: Logger, st
 
     probed: List[Tuple[Path, Optional[float]]] = []
     for f in mkvs:
-        d = probe_duration_seconds(args.ffprobe, f)
+        d = probe_duration_seconds(f)
         if d is None:
             logger.warning(f"{folder}: could not determine duration of {f.name} (ffprobe failed) - treating as 0s")
             stats.warnings += 1
@@ -700,7 +699,7 @@ def plan_multidisc_movie(folder: Path, args: argparse.Namespace, logger: Logger,
     plan.disk_info[main_disc] = (len(main_titles), bool(main_leftovers))
 
     # Main disc: longest title is the main feature, exactly like a single-disc movie.
-    dur_of = {p: probe_duration_seconds(args.ffprobe, p) for _n, _pp, p in main_titles}
+    dur_of = {p: probe_duration_seconds(p) for _n, _pp, p in main_titles}
     probed = sorted(((p, dur_of[p]) for _n, _pp, p in main_titles),
                     key=lambda item: (item[1] or 0.0), reverse=True)
     _warn_similar_cuts(folder, probed, args, logger, stats)
@@ -801,10 +800,7 @@ def resolve_chains(plan: Plan) -> None:
             cur = performable.get(cur.dest)
 
 
-def resolve_removals(plan: Plan, args: argparse.Namespace) -> None:
-    if args.keep_empty_dirs:
-        plan.removals = []
-        return
+def resolve_removals(plan: Plan) -> None:
     moves_by_disk: Dict[Path, List[PlannedMove]] = defaultdict(list)
     for mv in plan.all_moves():
         moves_by_disk[mv.src.parent].append(mv)
@@ -1182,15 +1178,12 @@ def parse_args() -> argparse.Namespace:
                    help="Log file path (default: organize.log in the --input folder)")
     p.add_argument("--dry-run", action="store_true",
                    help="Print exactly what a real run would do, changing nothing")
-    p.add_argument("--keep-empty-dirs", action="store_true",
-                   help="Do not remove '<S>-<D>' disk folders after their titles have been moved out")
     p.add_argument("--no-detect-extras", dest="detect_extras", action="store_false",
                    help="TV: don't use running time to separate 'extras' from episodes (TV then needs no ffprobe)")
     p.add_argument("--extra-threshold-pct", type=float, default=70.0, metavar="PCT",
                    help="TV: a title shorter than this %% of the season's median episode length is an extra")
     p.add_argument("--similar-duration-pct", type=float, default=10.0, metavar="PCT",
                    help="MOVIES: warn if the two longest files are within this %% of each other in duration")
-    p.add_argument("--ffprobe", default="ffprobe", metavar="PATH", help="Path to the ffprobe executable")
     p.set_defaults(detect_extras=True)
     return p.parse_args()
 
@@ -1218,10 +1211,10 @@ def main() -> int:
         args.detect_extras and any(folder_has_regular_season(f) for f in tv_series)
     )
     if need_ffprobe:
-        err = preflight_check_ffprobe(args.ffprobe)
+        err = preflight_check_ffprobe()
         if err:
             logger.error(err)
-            logger.error("Aborting before touching any files - install ffmpeg/ffprobe, pass --ffprobe, "
+            logger.error("Aborting before touching any files - install ffmpeg/ffprobe "
                          "or (TV only) pass --no-detect-extras")
             logger.close()
             return 1
@@ -1242,7 +1235,7 @@ def main() -> int:
             plan.movies.append(mp)
     resolve_statuses(plan)
     resolve_chains(plan)
-    resolve_removals(plan, args)
+    resolve_removals(plan)
     resolve_folder_renames(plan)
 
     # --- Phase 2: render (dry-run) or execute ---
