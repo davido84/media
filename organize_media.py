@@ -105,7 +105,7 @@ only signal is running time. The rules are deliberately conservative:
     titles in the season, pooled across every disk (median because it shrugs
     off a handful of outliers, as long as real episodes are the majority).
   - A title is separated out as an extra only if SHORTER than
-    --extra-threshold-pct of that median (default 50%).
+    --extra-threshold-pct of that median (default 70%).
   - A much LONGER title is NOT auto-classified as an extra (it is usually a
     two-part/finale episode) - it stays an episode but is flagged for review.
   - SAFETY NET: if half or more of a season's titles fall under the threshold,
@@ -239,7 +239,7 @@ class Logger:
         self._fh = None
         if log_path is not None:
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            self._fh = open(log_path, "a", encoding="utf-8")
+            self._fh = open(log_path, "w", encoding="utf-8")
             self._raw(f"\n==== Run started {datetime.now().isoformat(timespec='seconds')} ====")
 
     def _raw(self, line: str) -> None:
@@ -1178,15 +1178,15 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("-i", "--input", default=".",
                    help="Root folder to search recursively for '<Title> (<Year>)' folders")
-    p.add_argument("-l", "--log", nargs="?", const=DEFAULT_LOG, default=DEFAULT_LOG, metavar="LOGFILE",
-                   help="Log file path")
+    p.add_argument("-l", "--log", nargs="?", const=None, default=None, metavar="LOGFILE",
+                   help="Log file path (default: organize.log in the --input folder)")
     p.add_argument("--dry-run", action="store_true",
                    help="Print exactly what a real run would do, changing nothing")
     p.add_argument("--keep-empty-dirs", action="store_true",
                    help="Do not remove '<S>-<D>' disk folders after their titles have been moved out")
     p.add_argument("--no-detect-extras", dest="detect_extras", action="store_false",
                    help="TV: don't use running time to separate 'extras' from episodes (TV then needs no ffprobe)")
-    p.add_argument("--extra-threshold-pct", type=float, default=50.0, metavar="PCT",
+    p.add_argument("--extra-threshold-pct", type=float, default=70.0, metavar="PCT",
                    help="TV: a title shorter than this %% of the season's median episode length is an extra")
     p.add_argument("--similar-duration-pct", type=float, default=10.0, metavar="PCT",
                    help="MOVIES: warn if the two longest files are within this %% of each other in duration")
@@ -1198,7 +1198,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     input_root = Path(args.input).resolve()
-    log_path = Path(args.log).resolve()
+    log_path = Path(args.log).resolve() if args.log else input_root / DEFAULT_LOG
     logger = Logger(log_path)
 
     if not input_root.is_dir():
