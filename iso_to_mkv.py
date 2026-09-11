@@ -176,7 +176,7 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        .mkv file actually appeared/changed in the output directory for
        each extracted title - a 0-exit-code from makemkvcon is treated as
        necessary but not sufficient. See MIN_OUTPUT_FILE_BYTES.
-     - A pre-flight check confirms makemkvcon can be found/executed
+     - A pre-flight check confirms makemkvcon can be found on PATH
        before any files are touched. Beyond that, if
        --max-consecutive-failures (default 3) ISOs in a row fail at the
        initial title-info scan, the whole run stops early rather than
@@ -439,13 +439,13 @@ def classify_disc(iso_path: Path, max_dvd_bytes: float, override: Optional[str])
     return DISC_TYPE_BLURAY if size > max_dvd_bytes else DISC_TYPE_DVD
 
 
-def preflight_check_makemkvcon(makemkvcon_bin: str) -> Optional[str]:
-    """Confirm the makemkvcon binary can actually be found/executed before
-    processing any files, so a bad --makemkvcon path or missing install
-    fails fast with one clear message instead of every ISO in the batch
-    failing individually with the same root cause (safety enhancement 2)."""
-    if shutil.which(makemkvcon_bin) is None:
-        return f"makemkvcon executable not found or not executable: {makemkvcon_bin!r}"
+def preflight_check_makemkvcon() -> Optional[str]:
+    """Confirm makemkvcon can actually be found on PATH before processing
+    any files, so a missing install fails fast with one clear message
+    instead of every ISO in the batch failing individually with the same
+    root cause (safety enhancement 2)."""
+    if shutil.which("makemkvcon") is None:
+        return "makemkvcon not found on PATH - install MakeMKV and ensure makemkvcon is in your PATH"
     return None
 
 
@@ -857,7 +857,7 @@ class Title:
 
 
 def get_disc_titles(
-    makemkvcon_bin: str, iso_path: Path, logger: "DualLogger"
+    iso_path: Path, logger: "DualLogger"
 ) -> Tuple[int, str, Dict[int, Title], bool, bool]:
     """Run `makemkvcon info` on the ISO and parse the title table.
 
@@ -869,7 +869,7 @@ def get_disc_titles(
     could not find a JRE to use - a much stronger signal than jre_engaged
     simply being False, which is also true for every disc that never
     needed Java at all."""
-    cmd = [makemkvcon_bin, "-r", "--cache=1", "info", f"iso:{iso_path}"]
+    cmd = ["makemkvcon", "-r", "--cache=1", "info", f"iso:{iso_path}"]
     logger.file_only("CMD", " ".join(cmd), iso_path)
     rc, output = run_cmd(cmd)
     titles: Dict[int, Title] = {}
@@ -1163,7 +1163,7 @@ def process_iso(
     disc_type = classify_disc(iso_path, args.dvd_max_size_gb * 1_000_000_000, disc_type_override)
     logger.info(f"Classified as {disc_type} ({human_bytes(iso_path.stat().st_size)})", iso_path)
 
-    rc, output, titles, jre_engaged, jre_required_missing = get_disc_titles(args.makemkvcon, iso_path, logger)
+    rc, output, titles, jre_engaged, jre_required_missing = get_disc_titles(iso_path, logger)
     if rc != 0 or not titles:
         logger.error(f"Failed to read title information (exit code {rc})", iso_path)
         logger.append_raw_to_file(output)
@@ -1398,6 +1398,12 @@ def process_iso(
     all_ok = True
     stop_reason: Optional[str] = None  # set when all_ok is False for a reason other than a title outright failing
     output_filenames: List[str] = []  # populated on success, written into the manifest below
+    # Tracks whether EVERY extracted title was affirmatively verified clean
+    # by the track/duration cross-check. Starts True only if a probe tool is
+    # available at all; any title that can't be probed, or that shows a
+    # mismatch, flips it False. --delete-source consults this so a source is
+    # only ever removed when its output was positively confirmed good.
+    output_verified = probe_tool is not None
     iso_size_bytes = iso_path.stat().st_size
     total_extracted_bytes = 0  # running total across titles - see size failsafe below
     for tid in sorted(candidates):
@@ -1412,7 +1418,7 @@ def process_iso(
         # filtering (makemkvcon has no CLI mechanism for it at all, and a
         # prior mkvmerge-based workaround was deliberately removed in
         # favor of leaving track curation to a later encoding pass).
-        cmd = [args.makemkvcon, "-r", "--cache=1", "mkv", f"iso:{iso_path}", str(tid), str(out_dir)]
+        cmd = ["makemkvcon", "-r", "--cache=1", "mkv", f"iso:{iso_path}", str(tid), str(out_dir)]
 
         if args.dry_run:
             logger.info(f"[DRY RUN] Would run: {' '.join(cmd)}", iso_path)
@@ -1568,6 +1574,11 @@ def process_iso(
                         iso_path,
                     )
                     stats.warnings += 1
+                    output_verified = False  # a flagged title means the disc isn't cleanly verified
+            else:
+                # Probe tool present but couldn't read this file - can't
+                # affirmatively verify it, so the disc isn't clean-verified.
+                output_verified = False
 
         # --- Runaway-output failsafe ---
         # The combined size of everything extracted from this ISO should
@@ -1617,15 +1628,30 @@ def process_iso(
 
     if not args.delete_source:
         logger.info("Keeping source file (deletion is off by default; enable with --delete-source)", iso_path)
+    elif args.dry_run:
+        logger.info(
+            "[DRY RUN] Would delete source ISO file if its output verified clean (--delete-source)",
+            iso_path,
+        )
+    elif not output_verified:
+        # --delete-source only removes a source whose output was positively
+        # confirmed good by the track/duration cross-check. Here it wasn't
+        # (a mismatch, a probe that couldn't read a file, or no probe tool
+        # available), so the source is kept regardless of --delete-source.
+        # This is the safety gate working as intended, so it's INFO, not an
+        # error; any actual mismatch already logged its own warning above.
+        logger.info(
+            "Not deleting source ISO: its output was not verified clean by the track/duration "
+            "cross-check, so it's kept for safety despite --delete-source. Resolve the issue and "
+            "re-run, or delete manually once satisfied.",
+            iso_path,
+        )
     else:
-        if args.dry_run:
-            logger.info("[DRY RUN] Would delete source ISO file (--delete-source)", iso_path)
-        else:
-            try:
-                iso_path.unlink()
-                logger.info("Deleted source ISO file (--delete-source)", iso_path)
-            except OSError as e:
-                logger.error(f"Failed to delete source file: {e}", iso_path)
+        try:
+            iso_path.unlink()
+            logger.info("Deleted source ISO file (--delete-source, output verified clean)", iso_path)
+        except OSError as e:
+            logger.error(f"Failed to delete source file: {e}", iso_path)
 
     return ProcessResult(converted=True)
 
@@ -1671,8 +1697,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--delete-source", action="store_true",
-        help="Delete each source ISO after it converts successfully. Off by default - sources "
-             "are kept unless this is given",
+        help="Delete each source ISO after it converts AND its output passes the track/duration "
+             "cross-check clean. Off by default - sources are kept unless this is given. A source "
+             "whose output can't be positively verified (a cross-check mismatch, an unreadable "
+             "output, or no mkvmerge/ffprobe available) is always kept, so this has no effect "
+             "without a probe tool installed",
     )
     p.add_argument("-n", "--dry-run", action="store_true", help="Show what would happen without changing anything")
     p.add_argument(
@@ -1753,12 +1782,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max-consecutive-failures", type=int, default=3, metavar="N",
         help="Abort the whole run if this many ISOs in a row fail at the initial title-info "
-             "scan (a strong sign of a systemic problem - bad makemkvcon path, expired key, "
+             "scan (a strong sign of a systemic problem - bad registration key or permissions - "
              "permissions - rather than one bad disc). 0 disables this circuit breaker",
-    )
-    p.add_argument(
-        "-M", "--makemkvcon", default="makemkvcon", metavar="PATH",
-        help="Path to the makemkvcon executable",
     )
     p.add_argument(
         "--no-verify-tracks", dest="verify_tracks", action="store_false", default=True,
@@ -1797,10 +1822,10 @@ def main() -> int:
     # --- Pre-flight check (safety enhancement 2) ---
     # Fail fast on a bad/missing makemkvcon rather than letting every ISO
     # in the batch fail individually with the same root cause.
-    preflight_error = preflight_check_makemkvcon(args.makemkvcon)
+    preflight_error = preflight_check_makemkvcon()
     if preflight_error:
         logger.error(preflight_error)
-        logger.error("Aborting before processing any files - check --makemkvcon or your PATH")
+        logger.error("Aborting before processing any files - ensure makemkvcon is in your PATH")
         logger.close()
         return 1
 
@@ -1815,6 +1840,19 @@ def main() -> int:
             "Neither mkvmerge nor ffprobe was found - the post-extraction track-count/duration "
             "cross-check will be skipped for this entire run. Install MKVToolNix or ffmpeg to "
             "enable it, or pass --no-verify-tracks to silence this message."
+        )
+
+    # --delete-source now removes a source only after its output passes the
+    # cross-check clean. If that check can't run this session, deletion can
+    # never be authorized, so warn up front rather than silently keeping
+    # every source.
+    if args.delete_source and probe_tool is None:
+        reason = "--no-verify-tracks is set" if not args.verify_tracks else "no mkvmerge/ffprobe found"
+        logger.warning(
+            f"--delete-source only deletes a source after its output is verified clean by the "
+            f"track/duration cross-check, but that check is unavailable this run ({reason}). "
+            f"No sources will be deleted. Install mkvmerge or ffprobe (and don't pass "
+            f"--no-verify-tracks) to enable verified deletion."
         )
 
     if not input_root.is_dir():
@@ -1942,7 +1980,7 @@ def main() -> int:
                     logger.error(
                         f"{consecutive_info_scan_failures} ISOs in a row failed (title-info scan "
                         f"or an unexpected error) - this usually means a systemic problem "
-                        f"(makemkvcon registration/key, permissions, or a bad --makemkvcon path) "
+                        f"(makemkvcon registration/key or permissions) rather than bad discs. "
                         f"rather than bad discs. Stopping early; fix the underlying issue and "
                         f"re-run (already-converted ISOs will be skipped via resume support)."
                     )
