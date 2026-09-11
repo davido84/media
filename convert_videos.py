@@ -103,6 +103,22 @@ TIMEOUT_SECONDS_PER_GB = 15 * 60  # 15 minutes per GB
 HARDWARE_ENCODE_MAX_ATTEMPTS = 3
 HARDWARE_ENCODE_RETRY_DELAY_SECONDS = 5
 
+# Valid -preset values differ by encoder: hevc_qsv (hardware) maps preset names onto
+# Intel's numeric TargetUsage scale, which only goes down to "veryfast"; libx265
+# (software) has the full x264/x265-style range down to "ultrafast"/"placebo". These
+# are also each encoder's out-of-the-box default before considering our own defaults
+# below, which favor quality over speed for both.
+QSV_PRESETS = ("veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow")
+X265_PRESETS = ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium",
+                "slow", "slower", "veryslow", "placebo")
+
+# Our defaults when --preset isn't given: veryslow for hardware (paired with
+# look_ahead, this maximizes quality-per-bit on QSV — see build_ffmpeg_cmd) and slow
+# for software (a common sweet spot; veryslow's software gains are usually small
+# relative to the extra time — see xcodecpack.com's HEVC settings guide).
+DEFAULT_QSV_PRESET = "veryslow"
+DEFAULT_X265_PRESET = "slow"
+
 
 def compute_timeout_seconds(src_size_bytes: int) -> float:
     """A generous timeout for a single ffprobe metadata read over a file this size, so
@@ -180,6 +196,15 @@ def build_parser():
     parser.add_argument("--encoding", choices=["hardware", "software"], default="hardware",
                          help="Encoding mode. 'software' uses libx265 (CPU). 'hardware' uses "
                               "Intel Quick Sync (hevc_qsv). Default: hardware")
+    parser.add_argument("--preset", type=str, default=None,
+                         help=f"Override the encoder's speed/quality preset. Valid values "
+                              f"depend on --encoding: hardware (hevc_qsv) accepts "
+                              f"{', '.join(QSV_PRESETS)}; software (libx265) accepts "
+                              f"{', '.join(X265_PRESETS)}. On hardware, preset has a real "
+                              f"but much smaller effect on speed than on software — expect "
+                              f"a modest slowdown moving toward veryslow, not the large "
+                              f"swings seen with libx265. Default: {DEFAULT_QSV_PRESET} for "
+                              f"hardware, {DEFAULT_X265_PRESET} for software")
     parser.add_argument("-n", "--normalize-audio", action="store_true",
                          help="Apply EBU R128 loudness normalization (ffmpeg's loudnorm filter, "
                               "two-pass) to the audio track during encoding. Only affects files "
@@ -218,13 +243,8 @@ def build_parser():
                               "different from -i/--input, since in-place runs already "
                               "replace the original and there'd be nothing left to "
                               "delete. Has no effect combined with --dry-run or "
-                              "--compare-crf. Prompts for confirmation before the run "
-                              "starts unless --yes is also given. Default: off")
-    parser.add_argument("--yes", action="store_true",
-                         help="Skip the confirmation prompt that --delete-source shows "
-                              "before starting a run. Has no effect without "
-                              "--delete-source. Intended for unattended/cron use — "
-                              "make sure -i/-o are correct before relying on this.")
+                              "--compare-crf. Always prompts for confirmation before "
+                              "the run starts. Default: off")
     parser.add_argument("--include", type=str, default=None, metavar="REGEX",
                          help="Only process files whose path, taken relative to the "
                               "input folder and written with forward slashes, matches "
@@ -506,7 +526,7 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
                       encoding: str = "software", normalize_audio: bool = True,
                       loudnorm_target: float = -16, audio_stream_indices: list = None,
                       subtitle_stream_indices: list = None, video_stream_index: int = 0,
-                      measured_loudness: dict = None) -> list:
+                      measured_loudness: dict = None, preset: str = None) -> list:
     cmd = ["ffmpeg", "-y", "-i", str(src)]
 
     if duration != -1:
@@ -546,14 +566,15 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
         # handles that fine, but libopus doesn't support quality-scale mode at all and
         # refuses to open, aborting the whole encode with no output written.
         cmd += ["-pix_fmt", "p010le", "-c:v", "hevc_qsv", "-global_quality:v", str(crf),
-                "-preset", "veryslow", "-low_power", "0",
+                "-preset", preset or DEFAULT_QSV_PRESET, "-low_power", "0",
                 "-look_ahead", "1", "-look_ahead_depth", "40"]
     else:
         # yuv420p10le: encode in 10-bit. Even for 8-bit sources, x265's finer
         # quantization steps in 10-bit mode noticeably improve compression
         # efficiency at a given CRF, at negligible compatibility cost on modern
         # players/decoders.
-        cmd += ["-pix_fmt", "yuv420p10le", "-c:v", "libx265", "-preset", "slow", "-crf", str(crf)]
+        cmd += ["-pix_fmt", "yuv420p10le", "-c:v", "libx265", "-preset", preset or DEFAULT_X265_PRESET,
+                "-crf", str(crf)]
 
     cmd += ["-c:a", "libopus", "-ac", "2", "-b:a", "128k"]
 
@@ -597,7 +618,8 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
 def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: float,
                   same_location: bool, dry_run: bool = False, encoding: str = "software",
                   normalize_audio: bool = True, loudnorm_target: float = -16,
-                  downscale: bool = False, strip_non_english_audio: bool = False):
+                  downscale: bool = False, strip_non_english_audio: bool = False,
+                  preset: str = None):
     """Returns (original_size, new_size, video_duration_seconds, action, downscaled,
     grew_larger, retried) on success or dry-run preview, or None only when the caller
     already decided to skip the file entirely before calling this (not used internally
@@ -742,7 +764,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         # encode (below) runs an actual two-pass measurement when normalize_audio is on.
         cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
                                 normalize_audio, loudnorm_target, keep_audio_indices,
-                                keep_subtitle_indices, video_info["stream_index"])
+                                keep_subtitle_indices, video_info["stream_index"],
+                                preset=preset)
         logging.info(f"[DRY RUN] Command: {format_cmd_for_log(cmd)}")
         if normalize_audio and keep_audio_indices:
             logging.info(f"[DRY RUN] Note: audio will be normalized in two passes "
@@ -782,7 +805,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     cmd = build_ffmpeg_cmd(src, encode_target, crf, duration, needs_downscale, encoding,
                             normalize_audio, loudnorm_target, keep_audio_indices,
                             keep_subtitle_indices, video_info["stream_index"],
-                            measured_loudness)
+                            measured_loudness, preset=preset)
     logging.info(f"Command: {format_cmd_for_log(cmd)}")
     max_attempts = HARDWARE_ENCODE_MAX_ATTEMPTS if encoding == "hardware" else 1
     for attempt in range(1, max_attempts + 1):
@@ -895,7 +918,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
 
 
 def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duration: float,
-                        encoding: str, downscale: bool) -> tuple:
+                        encoding: str, downscale: bool, preset: str = None) -> tuple:
     """Comparison mode for a single source file: test-encodes src once per CRF value in
     crf_values, all other settings held fixed (audio normalization off, all audio/
     subtitle tracks kept), and prints/logs a size + encode-time table so the effect
@@ -976,7 +999,7 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
 
         cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
                                 False, -16, keep_audio_indices, keep_subtitle_indices,
-                                video_info["stream_index"], None)
+                                video_info["stream_index"], None, preset=preset)
         logging.info(f"Command: {format_cmd_for_log(cmd)}")
 
         start = time.monotonic()
@@ -1069,6 +1092,14 @@ def main():
         build_parser().print_help()
         sys.exit(1)
 
+    if args.preset is not None:
+        valid_presets = QSV_PRESETS if args.encoding == "hardware" else X265_PRESETS
+        if args.preset not in valid_presets:
+            print(f"Error: --preset {args.preset!r} is not valid for "
+                  f"--encoding={args.encoding}. Valid values: "
+                  f"{', '.join(valid_presets)}.", file=sys.stderr)
+            sys.exit(1)
+
     include_re = exclude_re = None
     try:
         if args.include is not None:
@@ -1150,11 +1181,11 @@ def main():
 
     # Dry runs never actually delete anything (they only log a preview), so the
     # confirmation prompt would just be noise there.
-    if args.delete_source and not args.dry_run and not args.yes:
+    if args.delete_source and not args.dry_run:
         if not sys.stdin.isatty():
             print("Error: --delete-source needs confirmation, but stdin isn't a "
-                  "terminal (e.g. running under cron). Pass --yes to skip the prompt "
-                  "for unattended runs.", file=sys.stderr)
+                  "terminal (e.g. running under cron), so the prompt can't be "
+                  "answered. Run interactively instead.", file=sys.stderr)
             sys.exit(1)
         print(f"--delete-source is set: source files under {input_resolved} will be "
               f"permanently deleted, one at a time, right after each is successfully "
@@ -1188,7 +1219,7 @@ def main():
             try:
                 src_size, rows = run_crf_comparison(src, args.output_folder, crf_values,
                                                      args.duration, args.encoding,
-                                                     args.downscale)
+                                                     args.downscale, args.preset)
             except ConversionTimeoutError as e:
                 logging.error(f"TIMEOUT: {e.file.resolve()}\n{e.reason}")
                 logging.error("Stopping the run so this timeout can be investigated. "
@@ -1223,10 +1254,12 @@ def main():
         sys.exit(0)
 
     mode = "DRY RUN" if args.dry_run else "LIVE"
+    effective_preset = args.preset or (DEFAULT_QSV_PRESET if args.encoding == "hardware"
+                                        else DEFAULT_X265_PRESET)
     logging.info(f"Starting batch conversion [{mode}]. Input: {input_resolved} "
                  f"Output: {output_resolved} "
                  f"({'in-place' if same_location else 'separate output'}) CRF: {args.crf} "
-                 f"Encoding: {args.encoding} "
+                 f"Encoding: {args.encoding} Preset: {effective_preset} "
                  f"Normalize audio: {'yes (' + str(args.loudnorm_target) + ' LUFS)' if args.normalize_audio else 'no'} "
                  f"Duration limit: {'none' if args.duration == -1 else f'{args.duration}s'} "
                  f"Min size: {args.min_size_mb}MB "
@@ -1310,7 +1343,7 @@ def main():
             result = process_file(src, dst, args.crf, args.duration, args.min_size_mb,
                                    same_location, args.dry_run, args.encoding,
                                    args.normalize_audio, args.loudnorm_target, args.downscale,
-                                   args.strip_no_english_audio)
+                                   args.strip_no_english_audio, args.preset)
         except ConversionTimeoutError as e:
             failed_path = e.file.resolve()
             logging.error(f"TIMEOUT: {failed_path}\n{e.reason}")
