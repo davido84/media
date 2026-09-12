@@ -1375,6 +1375,16 @@ def main():
         else:
             rel_path = src.relative_to(args.input_folder)
             dst = args.output_folder / rel_path
+            # In diagnostic mode, tag the output name with the preset and CRF so the
+            # same source encoded under different settings lands in distinct files
+            # (rather than colliding, or being skipped as "already exists"), making
+            # A/B comparison of presets/CRF levels straightforward. Only for separate
+            # output — an in-place run must keep the original name.
+            if args.diagnose:
+                effective_preset = args.preset or (DEFAULT_QSV_PRESET
+                                                    if args.encoding == "hardware"
+                                                    else DEFAULT_X265_PRESET)
+                dst = dst.with_name(f"{dst.stem}_{effective_preset}_crf{args.crf}{dst.suffix}")
 
         if not same_location and dst.exists() and not args.force:
             print(f"[{time.strftime('%H:%M:%S')}] Output file exists: {dst}")
