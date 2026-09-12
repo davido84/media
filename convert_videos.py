@@ -205,6 +205,18 @@ def build_parser():
                               f"a modest slowdown moving toward veryslow, not the large "
                               f"swings seen with libx265. Default: {DEFAULT_QSV_PRESET} for "
                               f"hardware, {DEFAULT_X265_PRESET} for software")
+    parser.add_argument("--diagnose", action="store_true",
+                         help="Throughput-diagnostic mode: for finding whether disk I/O "
+                              "or GPU/CPU encoding is limiting your overall speed. Before "
+                              "each file is encoded, its source is read once from disk and "
+                              "timed to measure the delivered read speed; that read also "
+                              "warms the OS page cache, so the encode that follows reflects "
+                              "mostly the encoder's own speed rather than disk waiting. "
+                              "Per-file and end-of-run lines then compare read MB/s against "
+                              "encode MB/s (both also expressed as GB/day) and name which "
+                              "stage is the bottleneck. Adds a full extra read per file, so "
+                              "scope it to a handful of files with --limit or --include "
+                              "rather than a whole run. Default: off")
     parser.add_argument("-n", "--normalize-audio", action="store_true",
                          help="Apply EBU R128 loudness normalization (ffmpeg's loudnorm filter, "
                               "two-pass) to the audio track during encoding. Only affects files "
@@ -501,6 +513,40 @@ def human_duration(seconds: float, include_seconds: bool = False) -> str:
     if hours:
         return f"{hours}h {minutes}m"
     return f"{minutes}m"
+
+
+def measure_read_speed(path: Path, chunk_size: int = 8 * 1024 * 1024) -> tuple:
+    """Sequentially read the whole file from disk, timed, and discard the bytes.
+    Returns (elapsed_seconds, bytes_read). Two purposes: (1) measure the disk's
+    delivered read throughput for this file, and (2) warm the OS page cache so an
+    encode run immediately afterward serves its reads from RAM — isolating the
+    encoder's own speed from disk-wait. Note: for a file larger than free RAM the
+    cache can't hold all of it, so the following encode still incurs some real I/O;
+    the comparison stays self-consistent (a file that won't cache is exactly one that
+    stays I/O bound in production), just less cleanly separated."""
+    start = time.monotonic()
+    total = 0
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            total += len(chunk)
+    return (time.monotonic() - start, total)
+
+
+def mbps_to_gb_per_day(mbps: float) -> float:
+    """Convert a sustained MB/s throughput into GB/day, the unit the whole 60TB job is
+    naturally reasoned about in (e.g. 'the disk delivers ~X GB/day')."""
+    return mbps * 86400 / 1024
+
+
+def format_throughput(bytes_moved: int, seconds: float) -> str:
+    """A 'X.X MB/s (Y GB/day)' string for a byte count moved over a wall-clock span."""
+    if seconds <= 0:
+        return "n/a"
+    mbps = bytes_moved / (1024 * 1024) / seconds
+    return f"{mbps:.1f} MB/s ({mbps_to_gb_per_day(mbps):.0f} GB/day)"
 
 
 def format_cmd_for_log(cmd: list) -> str:
@@ -1287,6 +1333,11 @@ def main():
     retried_count = 0
     deleted_source_count = 0
     deleted_source_bytes = 0
+    # Diagnostic accumulators (only populated when --diagnose is set).
+    diag_read_seconds = 0.0
+    diag_read_bytes = 0
+    diag_encode_seconds = 0.0
+    diag_encode_bytes = 0
     limit_bytes = float("inf") if args.limit == -1 else args.limit * 1024 ** 3
     limit_reached = False
 
@@ -1339,6 +1390,22 @@ def main():
               f"ETA: {eta_str} | "
               f"Current file ({human_size(src_size)}): {src.resolve()}")
 
+        # Diagnostic: read the source cold to measure disk throughput (and warm the
+        # page cache so the encode below is mostly encoder-bound, not disk-bound). Done
+        # only for files that will actually be encoded — a copy or skip isn't the case
+        # we're trying to diagnose. We can't know the action without probing, so the
+        # cheap proxy is: measure now, and only fold the numbers into the totals below
+        # once we see the file was in fact encoded.
+        diag_read_this_file = None
+        if args.diagnose and not args.dry_run:
+            read_seconds, read_bytes = measure_read_speed(src)
+            diag_read_this_file = (read_seconds, read_bytes)
+            logging.info(f"[DIAGNOSE] Disk read: {src.name}: "
+                         f"{human_size(read_bytes)} in "
+                         f"{human_duration(read_seconds, include_seconds=True)} = "
+                         f"{format_throughput(read_bytes, read_seconds)}")
+
+        call_start = time.monotonic()
         try:
             result = process_file(src, dst, args.crf, args.duration, args.min_size_mb,
                                    same_location, args.dry_run, args.encoding,
@@ -1356,6 +1423,7 @@ def main():
             failed_files.append(failed_path)
             processed_bytes += src_size
             continue
+        call_elapsed = time.monotonic() - call_start
 
         processed_bytes += src_size
 
@@ -1375,6 +1443,33 @@ def main():
                 grew_larger_count += 1
             if retried:
                 retried_count += 1
+
+            # Fold the diagnostic numbers in only for files that were actually encoded
+            # (and not retried — a retry inflates call_elapsed with the failed attempt
+            # plus its sleep, which would understate encode speed). call_elapsed is the
+            # whole process_file call: probe + encode, but with the cache warmed by the
+            # pre-read the probe is near-instant, so it's a good stand-in for encode time.
+            if diag_read_this_file is not None and action == "encoded" and not retried:
+                read_seconds, read_bytes = diag_read_this_file
+                diag_read_seconds += read_seconds
+                diag_read_bytes += read_bytes
+                diag_encode_seconds += call_elapsed
+                diag_encode_bytes += orig_size
+                read_mbps = read_bytes / (1024 * 1024) / read_seconds if read_seconds > 0 else 0
+                enc_mbps = orig_size / (1024 * 1024) / call_elapsed if call_elapsed > 0 else 0
+                if read_mbps and enc_mbps:
+                    if read_mbps < enc_mbps * 0.9:
+                        verdict = "I/O bound (disk slower than the encoder)"
+                    elif enc_mbps < read_mbps * 0.9:
+                        verdict = "encode bound (encoder slower than the disk)"
+                    else:
+                        verdict = "balanced (disk and encoder are close)"
+                    diag_line = (f"[DIAGNOSE] {src.name}: "
+                                 f"read {format_throughput(read_bytes, read_seconds)} vs "
+                                 f"encode {format_throughput(orig_size, call_elapsed)} "
+                                 f"-> {verdict}")
+                    logging.info(diag_line)
+                    print(diag_line)
 
             if args.delete_source:
                 if args.dry_run:
@@ -1452,6 +1547,40 @@ def main():
                             f"{human_size(deleted_source_bytes)} freed")
         logging.info(deleted_line)
         print(deleted_line)
+
+    if args.diagnose and diag_encode_bytes > 0 and diag_read_seconds > 0:
+        read_mbps = diag_read_bytes / (1024 * 1024) / diag_read_seconds
+        enc_mbps = diag_encode_bytes / (1024 * 1024) / diag_encode_seconds
+        bottleneck_mbps = min(read_mbps, enc_mbps)
+        if read_mbps < enc_mbps * 0.9:
+            verdict = ("DISK I/O is your bottleneck. The encoder can consume data "
+                       "faster than the disk delivers it, so a faster --preset will "
+                       "NOT speed up the overall job. Staging files to an SSD first, "
+                       "or encoding several files in parallel so one file's encode "
+                       "overlaps another's disk read, is what would help.")
+        elif enc_mbps < read_mbps * 0.9:
+            verdict = ("ENCODING is your bottleneck. The disk can deliver data faster "
+                       "than the encoder consumes it, so a faster --preset (e.g. "
+                       "medium instead of veryslow) should directly speed up the job.")
+        else:
+            verdict = ("Disk and encoder are roughly balanced. A faster --preset may "
+                       "help somewhat, but you'll hit the disk ceiling soon after.")
+        diag_summary = [
+            "",
+            "=== Throughput diagnosis ===",
+            f"Avg disk read speed:  {format_throughput(diag_read_bytes, diag_read_seconds)}",
+            f"Avg encode speed:     {format_throughput(diag_encode_bytes, diag_encode_seconds)} "
+            f"(source consumed, cache-warmed)",
+            f"Effective ceiling:    ~{bottleneck_mbps * 86400 / 1024:.0f} GB/day "
+            f"(the slower of the two)",
+            verdict,
+            "(Encode speed is measured with the OS cache warmed by the diagnostic "
+            "read, so it reflects the encoder more than the disk. Files larger than "
+            "free RAM won't fully cache, which narrows the gap.)",
+        ]
+        for line in diag_summary:
+            logging.info(line)
+            print(line)
 
     script_runtime = time.monotonic() - batch_start
     script_runtime_line = f"Script runtime: {human_duration(script_runtime, include_seconds=True)}"
