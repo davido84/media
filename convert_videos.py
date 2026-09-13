@@ -176,7 +176,12 @@ def build_parser():
                     "at multiple CRF values side by side."
     )
     parser.add_argument("-i", "--input", dest="input_folder", type=Path, default=Path("."),
-                         help="Folder to scan recursively for .mp4/.mkv files. Default: current folder")
+                         help="Folder to scan recursively for .mp4/.mkv files, or a single "
+                              ".mp4/.mkv file to process on its own. If a name is somehow both "
+                              "a folder and a file, it's treated as a folder. For a single "
+                              "file, the output is written flat at the top of the output "
+                              "folder (e.g. -i test.mp4 -o d:\\tmp writes d:\\tmp\\test.mp4). "
+                              "Default: current folder")
     parser.add_argument("-o", "--output", dest="output_folder", type=Path, default=None,
                          help="Folder to write converted/copied files to. Default: current folder. "
                               "If this is the same as the input folder, converted files replace "
@@ -1126,16 +1131,31 @@ def print_crf_aggregate_summary(aggregate: dict, crf_values: list, files_compare
 def main():
     args = parse_args()
 
-    if not args.input_folder.is_dir():
-        print(f"Input folder does not exist: {args.input_folder}", file=sys.stderr)
-        sys.exit(1)
-
     video_extensions = ("*.mp4", "*.MP4", "*.mkv", "*.MKV")
-    mp4_files = sorted(set().union(*(args.input_folder.rglob(pat) for pat in video_extensions)))
 
-    if not mp4_files:
-        print(f"No .mp4 or .mkv files found in: {args.input_folder}\n", file=sys.stderr)
-        build_parser().print_help()
+    # -i may name either a folder (recurse into it, as usual) or a single video file.
+    # If a name is somehow BOTH a directory and a file on disk, the directory wins
+    # (documented precedence). input_base is the folder that output paths are made
+    # relative to: the input folder itself for a folder run, or the file's parent for
+    # a single-file run (so its output lands flat in the output folder, no structure to
+    # mirror).
+    if args.input_folder.is_dir():
+        input_base = args.input_folder
+        mp4_files = sorted(set().union(*(input_base.rglob(pat) for pat in video_extensions)))
+        if not mp4_files:
+            print(f"No .mp4 or .mkv files found in: {args.input_folder}\n", file=sys.stderr)
+            build_parser().print_help()
+            sys.exit(1)
+    elif args.input_folder.is_file():
+        if args.input_folder.suffix.lower() not in (".mp4", ".mkv"):
+            print(f"Input file is not a .mp4 or .mkv file: {args.input_folder}",
+                  file=sys.stderr)
+            sys.exit(1)
+        input_base = args.input_folder.parent
+        mp4_files = [args.input_folder]
+    else:
+        print(f"Input path does not exist (expected a folder or a .mp4/.mkv file): "
+              f"{args.input_folder}", file=sys.stderr)
         sys.exit(1)
 
     if args.preset is not None:
@@ -1158,7 +1178,7 @@ def main():
 
     if include_re is not None or exclude_re is not None:
         total_found = len(mp4_files)
-        mp4_files = filter_files(mp4_files, args.input_folder, include_re, exclude_re)
+        mp4_files = filter_files(mp4_files, input_base, include_re, exclude_re)
         filtered_out = total_found - len(mp4_files)
         # Printed before logging is configured, so echo to the console directly; the
         # same numbers are logged again below once the log file is open.
@@ -1195,7 +1215,11 @@ def main():
     if args.output_folder is None:
         args.output_folder = Path(".")
 
-    input_resolved = args.input_folder.resolve()
+    # input_base is the folder outputs are written relative to (the input folder for a
+    # folder run, or the file's parent for a single-file run), so it — not the raw -i
+    # argument, which for a single file is the file itself — is what "same location as
+    # the output" and the containment checks below must reason about.
+    input_resolved = input_base.resolve()
     output_resolved = args.output_folder.resolve()
     same_location = input_resolved == output_resolved
 
@@ -1382,7 +1406,7 @@ def main():
         if same_location:
             dst = src
         else:
-            rel_path = src.relative_to(args.input_folder)
+            rel_path = src.relative_to(input_base)
             dst = args.output_folder / rel_path
             # In diagnostic mode, tag the output name with the preset and CRF so the
             # same source encoded under different settings lands in distinct files
