@@ -1210,6 +1210,13 @@ def main():
               "--compare-crf is set.", file=sys.stderr)
         sys.exit(1)
 
+    if args.diagnose and same_location:
+        print("Error: output folder must be different from the input folder when "
+              "--diagnose is set. Diagnostic output files are name-tagged with the "
+              "preset and CRF, so writing them alongside the sources would clutter "
+              "(and risk colliding with) your input folder.", file=sys.stderr)
+        sys.exit(1)
+
     if args.delete_source and same_location:
         print("Error: output folder must be different from the input folder when "
               "--delete-source is set. An in-place run already replaces the source "
@@ -1380,8 +1387,9 @@ def main():
             # In diagnostic mode, tag the output name with the preset and CRF so the
             # same source encoded under different settings lands in distinct files
             # (rather than colliding, or being skipped as "already exists"), making
-            # A/B comparison of presets/CRF levels straightforward. Only for separate
-            # output — an in-place run must keep the original name.
+            # A/B comparison of presets/CRF levels straightforward. --diagnose is
+            # validated to require separate output, so this only ever runs here in the
+            # non-same_location branch.
             if args.diagnose:
                 effective_preset = args.preset or (DEFAULT_QSV_PRESET
                                                     if args.encoding == "hardware"
