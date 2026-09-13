@@ -1338,6 +1338,8 @@ def main():
     diag_read_bytes = 0
     diag_encode_seconds = 0.0
     diag_encode_bytes = 0
+    diag_encode_new_bytes = 0
+    diag_video_seconds = 0.0
     limit_bytes = float("inf") if args.limit == -1 else args.limit * 1024 ** 3
     limit_reached = False
 
@@ -1465,6 +1467,9 @@ def main():
                 diag_read_bytes += read_bytes
                 diag_encode_seconds += call_elapsed
                 diag_encode_bytes += orig_size
+                diag_encode_new_bytes += new_size
+                if video_duration is not None:
+                    diag_video_seconds += video_duration
                 read_mbps = read_bytes / (1024 * 1024) / read_seconds if read_seconds > 0 else 0
                 enc_mbps = orig_size / (1024 * 1024) / call_elapsed if call_elapsed > 0 else 0
                 if read_mbps and enc_mbps:
@@ -1474,10 +1479,20 @@ def main():
                         verdict = "encode bound (encoder slower than the disk)"
                     else:
                         verdict = "balanced (disk and encoder are close)"
+                    # Compression achieved on this file, and how fast the encode ran
+                    # relative to the video's own running time (realtime factor) — the
+                    # bitrate-independent way to compare encoder effort across clips.
+                    pct_smaller = (1 - new_size / orig_size) * 100 if orig_size > 0 else 0
+                    size_part = (f"{human_size(orig_size)}->{human_size(new_size)}, "
+                                 f"{pct_smaller:.0f}% smaller")
+                    if video_duration and call_elapsed > 0:
+                        rt_part = f", {video_duration / call_elapsed:.1f}x realtime"
+                    else:
+                        rt_part = ""
                     diag_line = (f"[DIAGNOSE] {src.name}: "
                                  f"read {format_throughput(read_bytes, read_seconds)} vs "
-                                 f"encode {format_throughput(orig_size, call_elapsed)} "
-                                 f"-> {verdict}")
+                                 f"encode {format_throughput(orig_size, call_elapsed)}"
+                                 f"{rt_part} | {size_part} -> {verdict}")
                     logging.info(diag_line)
                     print(diag_line)
 
@@ -1579,15 +1594,57 @@ def main():
             "",
             "=== Throughput diagnosis ===",
             f"Avg disk read speed:  {format_throughput(diag_read_bytes, diag_read_seconds)}",
-            f"Avg encode speed:     {format_throughput(diag_encode_bytes, diag_encode_seconds)} "
-            f"(source consumed, cache-warmed)",
+        ]
+
+        # Encode speed line, with the bitrate-independent realtime factor appended when
+        # we have video durations to compute it from.
+        encode_speed_line = (f"Avg encode speed:     "
+                             f"{format_throughput(diag_encode_bytes, diag_encode_seconds)} "
+                             f"(source consumed, cache-warmed)")
+        if diag_video_seconds > 0 and diag_encode_seconds > 0:
+            encode_speed_line += f"  |  {diag_video_seconds / diag_encode_seconds:.1f}x realtime"
+        diag_summary.append(encode_speed_line)
+
+        # Compression achieved across the encoded sample.
+        if diag_encode_bytes > 0:
+            pct_smaller = (1 - diag_encode_new_bytes / diag_encode_bytes) * 100
+            ratio = diag_encode_bytes / diag_encode_new_bytes if diag_encode_new_bytes > 0 else 0
+            diag_summary.append(
+                f"Avg compression:      {human_size(diag_encode_bytes)} -> "
+                f"{human_size(diag_encode_new_bytes)}, {pct_smaller:.0f}% smaller "
+                f"({ratio:.2f}x) across {encoded_count} encoded file(s)")
+
+        diag_summary.append(
             f"Effective ceiling:    ~{bottleneck_mbps * 86400 / 1024:.0f} GB/day "
-            f"(the slower of the two)",
-            verdict,
+            f"(the slower of the two)")
+
+        # Full-job projection over everything discovered in the input tree. total_size_bytes
+        # is the sum of ALL matched source files (the whole tree unless narrowed by
+        # --include/--exclude), so pointing --diagnose at the real media root with --limit
+        # to cap the sample gives a projection over the true remaining corpus.
+        if bottleneck_mbps > 0 and total_size_bytes > 0:
+            proj_seconds = total_size_bytes / (bottleneck_mbps * 1024 * 1024)
+            proj_line = (f"Projected full job:   {human_size(total_size_bytes)} across "
+                         f"{total_files} file(s) -> ~"
+                         f"{human_duration(proj_seconds, include_seconds=True)} "
+                         f"at this rate")
+            diag_summary.append(proj_line)
+            if diag_encode_bytes > 0 and diag_encode_new_bytes > 0:
+                proj_ratio = diag_encode_new_bytes / diag_encode_bytes
+                proj_out = total_size_bytes * proj_ratio
+                proj_saved = total_size_bytes - proj_out
+                diag_summary.append(
+                    f"Projected size:       ~{human_size(proj_out)} output, "
+                    f"~{human_size(proj_saved)} saved (if the sample's compression holds)")
+
+        diag_summary.append(verdict)
+        diag_summary.append(
             "(Encode speed is measured with the OS cache warmed by the diagnostic "
             "read, so it reflects the encoder more than the disk. Files larger than "
-            "free RAM won't fully cache, which narrows the gap.)",
-        ]
+            "free RAM won't fully cache, which narrows the gap. Projection assumes the "
+            "whole tree encodes like the sampled files — already-HEVC files that get "
+            "copied instead will finish faster and shrink less.)")
+
         for line in diag_summary:
             logging.info(line)
             print(line)
