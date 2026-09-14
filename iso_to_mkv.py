@@ -1661,8 +1661,11 @@ def process_iso(
 # --------------------------------------------------------------------------
 
 def compile_regex_arg(value: str) -> re.Pattern:
+    # Case-insensitive per the filtering contract (requirement 2). Anchoring
+    # to the start of the input-relative path is done at match time with
+    # .match() (requirement 1), not here.
     try:
-        return re.compile(value)
+        return re.compile(value, re.IGNORECASE)
     except re.error as e:
         raise argparse.ArgumentTypeError(f"Invalid regular expression {value!r}: {e}")
 
@@ -1711,13 +1714,16 @@ def parse_args() -> argparse.Namespace:
     filter_group = p.add_mutually_exclusive_group()
     filter_group.add_argument(
         "-I", "--include", type=compile_regex_arg, default=None, metavar="REGEX",
-        help="Only process ISOs whose full path matches this regex; all others are skipped. "
-             "Mutually exclusive with --exclude",
+        help="Only process ISOs whose path, relative to the input folder (-i), matches this "
+             "regex. Anchored at the start (a partial match from the first character counts, "
+             "a match further down the path does not) and case-insensitive. E.g. with -i d:/tmp, "
+             "'ab' matches tmp/abcdef.iso but not tmp/xy/ab.iso. Mutually exclusive with --exclude",
     )
     filter_group.add_argument(
         "-X", "--exclude", type=compile_regex_arg, default=None, metavar="REGEX",
-        help="Skip any ISO whose full path matches this regex; all others are processed. "
-             "Mutually exclusive with --include",
+        help="Skip any ISO whose path, relative to the input folder (-i), matches this regex "
+             "(same anchored-at-start, case-insensitive matching as --include); all others are "
+             "processed. Mutually exclusive with --include",
     )
     p.add_argument(
         "--obfuscation-threshold", type=int, default=30, metavar="N",
@@ -1867,16 +1873,24 @@ def main() -> int:
         {p for p in input_root.rglob("*") if p.is_file() and p.suffix.lower() == ".iso"}
     )
 
+    # --include/--exclude match against each ISO's path RELATIVE to the
+    # input folder, as a forward-slash string (so patterns are the same on
+    # Windows and Unix), and are anchored at the start via .match() - a
+    # partial match from the first character counts, but a match further
+    # down the path does not. So with -i d:/tmp, --include=ab matches
+    # d:/tmp/abcdef.iso (relative "abcdef.iso") but not d:/tmp/xy/ab.iso
+    # (relative "xy/ab.iso"). Matching is case-insensitive (see
+    # compile_regex_arg).
     if args.include:
         before = len(iso_files)
-        iso_files = [p for p in iso_files if args.include.search(str(p))]
+        iso_files = [p for p in iso_files if args.include.match(p.relative_to(input_root).as_posix())]
         logger.info(
             f"--include={args.include.pattern!r} applied: {len(iso_files)} of {before} "
             f"ISO(s) matched and will be processed"
         )
     elif args.exclude:
         before = len(iso_files)
-        iso_files = [p for p in iso_files if not args.exclude.search(str(p))]
+        iso_files = [p for p in iso_files if not args.exclude.match(p.relative_to(input_root).as_posix())]
         logger.info(
             f"--exclude={args.exclude.pattern!r} applied: {before - len(iso_files)} of {before} "
             f"ISO(s) matched and will be skipped"
