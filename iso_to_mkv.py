@@ -708,6 +708,19 @@ def check_free_space(out_dir: Path, output_root: Path, required_bytes: int, marg
     return None
 
 
+def free_bytes_on_volume(path: Path) -> int | None:
+    """Free bytes on the volume containing `path`, walking up to the first
+    ancestor that actually exists (the output tree may not be created yet
+    in a dry run). Returns None if it can't be determined."""
+    p = path
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    try:
+        return shutil.disk_usage(p).free
+    except OSError:
+        return None
+
+
 # --------------------------------------------------------------------------
 # Logging
 # --------------------------------------------------------------------------
@@ -1111,11 +1124,20 @@ class Stats:
 @dataclass
 class ProcessResult:
     """Outcome of process_iso, richer than a plain bool so main() can
-    drive the resume/limit/circuit-breaker logic around it."""
+    drive the resume/limit/circuit-breaker logic around it - and, in
+    dry-run, assemble a pre-flight plan (space forecast, needs-attention
+    list, and summary) without extracting anything."""
     converted: bool = False           # fully converted this run (counts toward --limit, eligible for deletion)
     skipped_already_done: bool = False  # resume: output already existed, nothing was done
     info_scan_failed: bool = False    # couldn't even read title info - used for the circuit breaker
     unexpected_error: bool = False    # an unhandled exception was caught around this ISO - also feeds the circuit breaker
+    # --- dry-run planning fields (populated on every path, consumed only by the dry-run report) ---
+    titles_selected: int = 0          # how many titles would be / were extracted
+    estimated_output_bytes: int = 0   # sum of selected titles' MakeMKV-reported sizes (output-size estimate)
+    would_delete_source: bool = False  # dry-run: source would be deleted (if --delete-source and output verifies)
+    needs_attention: bool = False     # a skip the user should resolve before a real run (vs a benign resume skip)
+    attention_reason: str | None = None  # short label for the needs-attention report
+    jre_missing: bool = False         # this disc needed a JRE that MakeMKV couldn't find (a fixable root cause)
 
 
 # --------------------------------------------------------------------------
@@ -1174,7 +1196,11 @@ def process_iso(
         logger.error(f"Failed to read title information (exit code {rc})", iso_path)
         logger.append_raw_to_file(output)
         stats.conversions_error += 1
-        return ProcessResult(info_scan_failed=True)
+        return ProcessResult(
+            info_scan_failed=True,
+            needs_attention=True,
+            attention_reason="title-info scan failed (unreadable disc, or makemkvcon registration/permissions)",
+        )
 
     # Set below only when MakeMKV's own (FPL_MainFeature) marker identifies
     # a title - not when this script's own duration-based fallback picks
@@ -1208,7 +1234,10 @@ def process_iso(
                 iso_path,
             )
             stats.conversions_error += 1
-            return ProcessResult()
+            return ProcessResult(
+                needs_attention=True,
+                attention_reason="--main-playlist matched no title on this disc",
+            )
         if len(matches) > 1:
             logger.error(
                 f"--main-playlist '{args.main_playlist}' matched {len(matches)} titles "
@@ -1216,7 +1245,10 @@ def process_iso(
                 iso_path,
             )
             stats.conversions_error += 1
-            return ProcessResult()
+            return ProcessResult(
+                needs_attention=True,
+                attention_reason="--main-playlist matched multiple titles (ambiguous)",
+            )
 
         main_tid = matches[0]
         main_duration = titles[main_tid].duration_sec
@@ -1287,7 +1319,11 @@ def process_iso(
                     iso_path,
                 )
                 stats.warnings += 1
-                return ProcessResult()
+                return ProcessResult(
+                    needs_attention=True,
+                    attention_reason="multiple (FPL_MainFeature) markers (ambiguous)",
+                    jre_missing=jre_required_missing,
+                )
             main_tid = fpl_exact[0]
             if titles[main_tid].duration_sec < min_length_sec:
                 logger.warning(
@@ -1296,7 +1332,10 @@ def process_iso(
                     iso_path,
                 )
                 stats.warnings += 1
-                return ProcessResult()
+                return ProcessResult(
+                    needs_attention=True,
+                    attention_reason="(FPL_MainFeature) title is shorter than --min-length",
+                )
             logger.info(
                 f"MakeMKV's Java-based analysis identified title {main_tid} as (FPL_MainFeature)",
                 iso_path,
@@ -1332,13 +1371,22 @@ def process_iso(
                         iso_path,
                     )
                     stats.warnings += 1
-                    return ProcessResult()
+                    return ProcessResult(
+                        needs_attention=True,
+                        attention_reason="playlist obfuscation - main title ambiguous (research the "
+                                         "correct playlist and re-run with --main-playlist)",
+                        jre_missing=jre_required_missing,
+                    )
                 # Exactly one unambiguous candidate remains - safe to proceed.
 
     if not candidates:
         logger.warning(f"No titles >= {args.min_length:g} minutes found - skipping disc", iso_path)
         stats.warnings += 1
-        return ProcessResult()
+        return ProcessResult(
+            needs_attention=True,
+            attention_reason=f"no titles >= {args.min_length:g} min (nothing would be produced)",
+            jre_missing=jre_required_missing,
+        )
 
     # Play-all detection is skipped under a manual override: the candidate
     # set is a hand-picked main title plus deliberately-kept shorter
@@ -1364,7 +1412,10 @@ def process_iso(
     if not candidates:
         logger.warning("Only a 'Play All' concatenation title was found - skipping disc", iso_path)
         stats.warnings += 1
-        return ProcessResult()
+        return ProcessResult(
+            needs_attention=True,
+            attention_reason="only a 'Play All' title found (no individual episodes to keep)",
+        )
 
     # Resume check happens here, once we know exactly which titles we'd
     # extract - compared against a previous run's manifest (see
@@ -1659,7 +1710,12 @@ def process_iso(
         except OSError as e:
             logger.error(f"Failed to delete source file: {e}", iso_path)
 
-    return ProcessResult(converted=True)
+    return ProcessResult(
+        converted=True,
+        titles_selected=len(candidates),
+        estimated_output_bytes=sum(titles[t].size_bytes for t in candidates),
+        would_delete_source=args.delete_source,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1941,6 +1997,16 @@ def main() -> int:
     consecutive_info_scan_failures: int = 0
     interrupted: bool = False
 
+    # --- Dry-run plan accumulators (consumed only when args.dry_run) ---
+    dry_convert_count: int = 0
+    dry_titles_total: int = 0
+    dry_output_bytes: int = 0
+    dry_convert_input_bytes: int = 0
+    dry_resume_skips: int = 0
+    dry_attention: list[tuple[Path, str, bool]] = []  # (iso_path, reason, jre_missing)
+    dry_delete_count: int = 0
+    dry_delete_bytes: int = 0
+
     try:
         for idx, iso_path in enumerate(iso_files, start=1):
             if limit_bytes is not None and bytes_converted_running >= limit_bytes:
@@ -2013,22 +2079,94 @@ def main() -> int:
                 bytes_converted_running += iso_size
                 stats.bytes_converted += iso_size
 
+            # Gather the dry-run pre-flight plan as we go (see the plan
+            # printed after the loop). Cheap, and only reported in dry-run.
+            if args.dry_run:
+                if result.converted:
+                    dry_convert_count += 1
+                    dry_titles_total += result.titles_selected
+                    dry_output_bytes += result.estimated_output_bytes
+                    dry_convert_input_bytes += iso_size
+                    if result.would_delete_source:
+                        dry_delete_count += 1
+                        dry_delete_bytes += iso_size
+                elif result.skipped_already_done:
+                    dry_resume_skips += 1
+                elif result.needs_attention:
+                    dry_attention.append(
+                        (iso_path, result.attention_reason or "needs attention", result.jre_missing)
+                    )
+
     except KeyboardInterrupt:
         interrupted = True
         print()  # in case a live progress line was mid-write
         logger.warning("Interrupted by user (Ctrl+C) - stopping and printing the summary so far")
 
-    summary_lines = [
-        "",
-        "==================== SUMMARY ====================",
-        f"Successful title conversions : {stats.conversions_success}",
-        f"Conversion errors            : {stats.conversions_error}",
-        f"Conversion warnings          : {stats.warnings}",
-        f"ISO files converted          : {stats.isos_converted}",
-        f"Already-converted skipped    : {stats.already_converted_skipped}",
-        f"Total ISO bytes converted    : {human_bytes(stats.bytes_converted)}",
-        "==================================================",
-    ]
+    if args.dry_run:
+        def _rel(p: Path) -> str:
+            try:
+                return str(p.relative_to(input_root))
+            except ValueError:
+                return p.name
+
+        free = free_bytes_on_volume(output_root)
+        margin = args.free_space_margin_pct
+        needed = int(dry_output_bytes * (1 + margin / 100.0))
+
+        summary_lines = [
+            "",
+            "==================== DRY RUN PLAN ====================",
+            f"Discs scanned      : {total_count} ({human_bytes(total_bytes_all)})",
+            f"Would convert      : {dry_convert_count} disc(s) "
+            f"({human_bytes(dry_convert_input_bytes)} in) -> {dry_titles_total} title(s)",
+            f"Est. output size   : ~{human_bytes(dry_output_bytes)}",
+            f"Already-converted  : {dry_resume_skips} (would be skipped by resume)",
+            f"Needs attention    : {len(dry_attention)} disc(s)",
+            "",
+            "-- Space forecast (output volume) --",
+        ]
+        if free is None:
+            summary_lines.append("  Free space  : unknown (could not read the output volume)")
+        else:
+            fits = free >= needed
+            summary_lines.append(f"  Free space  : {human_bytes(free)}")
+            summary_lines.append(
+                f"  Est. needed : ~{human_bytes(needed)} (incl. {margin:g}% margin)  ->  "
+                + ("OK, fits" if fits else f"SHORT by ~{human_bytes(needed - free)}")
+            )
+        if dry_attention:
+            summary_lines.append("")
+            summary_lines.append("-- Needs attention (resolve before a real run) --")
+            for p, reason, _jre in dry_attention:
+                summary_lines.append(f"  {_rel(p)}: {reason}")
+            jre_n = sum(1 for _, _, jre in dry_attention if jre)
+            if jre_n:
+                summary_lines.append(
+                    f"  ({jre_n} of these needed a JRE MakeMKV couldn't find - install a JRE or "
+                    f"set app_Java in MakeMKV's settings.conf)"
+                )
+        if args.delete_source:
+            summary_lines.append("")
+            summary_lines.append("-- Deletion footprint --")
+            summary_lines.append(
+                f"  Would delete {dry_delete_count} source ISO(s) "
+                f"(~{human_bytes(dry_delete_bytes)}) once each output verifies clean"
+            )
+        summary_lines.append("")
+        summary_lines.append("Nothing was changed (dry run).")
+        summary_lines.append("======================================================")
+    else:
+        summary_lines = [
+            "",
+            "==================== SUMMARY ====================",
+            f"Successful title conversions : {stats.conversions_success}",
+            f"Conversion errors            : {stats.conversions_error}",
+            f"Conversion warnings          : {stats.warnings}",
+            f"ISO files converted          : {stats.isos_converted}",
+            f"Already-converted skipped    : {stats.already_converted_skipped}",
+            f"Total ISO bytes converted    : {human_bytes(stats.bytes_converted)}",
+            "==================================================",
+        ]
     for line in summary_lines:
         print(line)
         logger.append_raw_to_file(line)
