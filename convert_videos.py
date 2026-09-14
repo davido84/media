@@ -104,13 +104,14 @@ HARDWARE_ENCODE_MAX_ATTEMPTS = 3
 HARDWARE_ENCODE_RETRY_DELAY_SECONDS = 5
 
 # Valid -preset values differ by encoder: hevc_qsv (hardware) maps preset names onto
-# Intel's numeric TargetUsage scale, which only goes down to "veryfast"; libx265
-# (software) has the full x264/x265-style range down to "ultrafast"/"placebo". These
-# are also each encoder's out-of-the-box default before considering our own defaults
+# Intel's numeric TargetUsage scale, running from "veryfast" to "veryslow"; libx265
+# (software) has the x264/x265-style range from "ultrafast" to "veryslow" (x265 also
+# defines "placebo", but it's deliberately excluded here — negligible gains for a huge
+# time cost). These roughly bracket each encoder's default before our own defaults
 # below, which favor quality over speed for both.
 QSV_PRESETS = ("veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow")
 X265_PRESETS = ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium",
-                "slow", "slower", "veryslow", "placebo")
+                "slow", "slower", "veryslow")
 
 # Our defaults when --preset isn't given: veryslow for hardware (paired with
 # look_ahead, this maximizes quality-per-bit on QSV — see build_ffmpeg_cmd) and slow
@@ -211,17 +212,26 @@ def build_parser():
                               f"swings seen with libx265. Default: {DEFAULT_QSV_PRESET} for "
                               f"hardware, {DEFAULT_X265_PRESET} for software")
     parser.add_argument("--diagnose", action="store_true",
-                         help="Throughput-diagnostic mode: for finding whether disk I/O "
-                              "or GPU/CPU encoding is limiting your overall speed. Before "
-                              "each file is encoded, its source is read once from disk and "
-                              "timed to measure the delivered read speed; that read also "
-                              "warms the OS page cache, so the encode that follows reflects "
+                         help="Throughput-diagnostic mode. Each source is read once from "
+                              "disk and timed to measure delivered read speed; that read "
+                              "also warms the OS cache so the encode(s) that follow reflect "
                               "mostly the encoder's own speed rather than disk waiting. "
-                              "Per-file and end-of-run lines then compare read MB/s against "
-                              "encode MB/s (both also expressed as GB/day) and name which "
-                              "stage is the bottleneck. Adds a full extra read per file, so "
-                              "scope it to a handful of files with --limit or --include "
-                              "rather than a whole run. Default: off")
+                              "Behavior depends on whether --preset is given. WITHOUT "
+                              "--preset: sweeps every preset for the active encoder "
+                              "(hardware or software), encoding each file under all of them "
+                              "and printing a comparison table with per-preset encode speed "
+                              "(MB/s and GB/day), realtime factor, compression %%, ratio, and "
+                              "projected full-job time over the whole input tree — so you "
+                              "can pick the fastest preset whose size/quality you like. WITH "
+                              "--preset: runs just that preset and reports whether disk I/O "
+                              "or encoding is the bottleneck, with a full-job projection. "
+                              "Each encode is written to its own preset/CRF-tagged output "
+                              "file, so nothing collides. Requires the output folder to "
+                              "differ from the input folder. Adds a full extra read per file "
+                              "(shared across presets in a sweep), and a software sweep "
+                              "includes the very slow presets, so scope it to a handful of "
+                              "files with --limit or --include rather than a whole run. "
+                              "Default: off")
     parser.add_argument("-n", "--normalize-audio", action="store_true",
                          help="Apply EBU R128 loudness normalization (ffmpeg's loudnorm filter, "
                               "two-pass) to the audio track during encoding. Only affects files "
@@ -552,6 +562,97 @@ def format_throughput(bytes_moved: int, seconds: float) -> str:
         return "n/a"
     mbps = bytes_moved / (1024 * 1024) / seconds
     return f"{mbps:.1f} MB/s ({mbps_to_gb_per_day(mbps):.0f} GB/day)"
+
+
+def build_preset_comparison_table(preset_stats: dict, presets_order: tuple,
+                                   total_size_bytes: int) -> list:
+    """Render a fixed-width table comparing each tested preset, one row per preset, in
+    the given order. preset_stats maps preset name -> dict with keys enc_seconds,
+    enc_bytes (source bytes encoded), new_bytes (output bytes), video_seconds, files.
+    total_size_bytes is the whole input tree, used to project a full-job time per
+    preset from that preset's measured encode speed. Returns a list of text lines.
+    Presets with no successfully-encoded files are shown with '-' placeholders so the
+    row still appears (useful to see which presets errored out)."""
+    header = (f"{'preset':<10} {'enc MB/s':>9} {'GB/day':>8} {'realtime':>9} "
+              f"{'smaller':>8} {'ratio':>6} {'proj. full job':>16}")
+    sep = "-" * len(header)
+    lines = [header, sep]
+    for preset in presets_order:
+        s = preset_stats.get(preset)
+        if not s or s["files"] == 0 or s["enc_seconds"] <= 0:
+            lines.append(f"{preset:<10} {'-':>9} {'-':>8} {'-':>9} {'-':>8} "
+                         f"{'-':>6} {'-':>16}")
+            continue
+        enc_mbps = s["enc_bytes"] / (1024 * 1024) / s["enc_seconds"]
+        gb_day = mbps_to_gb_per_day(enc_mbps)
+        realtime = (s["video_seconds"] / s["enc_seconds"]) if s["video_seconds"] > 0 else 0
+        pct_smaller = (1 - s["new_bytes"] / s["enc_bytes"]) * 100 if s["enc_bytes"] > 0 else 0
+        ratio = s["enc_bytes"] / s["new_bytes"] if s["new_bytes"] > 0 else 0
+        if enc_mbps > 0 and total_size_bytes > 0:
+            proj_seconds = total_size_bytes / (enc_mbps * 1024 * 1024)
+            proj = human_duration(proj_seconds)
+        else:
+            proj = "-"
+        rt_str = f"{realtime:.1f}x" if realtime else "-"
+        lines.append(f"{preset:<10} {enc_mbps:>9.1f} {gb_day:>8.0f} {rt_str:>9} "
+                     f"{pct_smaller:>7.0f}% {ratio:>5.2f}x {proj:>16}")
+    return lines
+
+
+def diagnose_encode_one(src, dst, preset, read_seconds, read_bytes, args):
+    """Encode a single file under a single preset for diagnostics, with the OS cache
+    assumed already warmed by a prior read of src. Returns a dict of this encode's
+    stats (enc_seconds, orig_bytes, new_bytes, video_seconds) on success, or None if
+    the file was copied (not encoded), failed, or errored. Also logs a per-file
+    [DIAGNOSE] line comparing disk read speed against this preset's encode speed. The
+    caller handles accumulation and the read measurement; this isolates the
+    encode-and-measure of one (file, preset) pair."""
+    call_start = time.monotonic()
+    try:
+        result = process_file(src, dst, args.crf, args.duration, args.min_size_mb,
+                               False, args.dry_run, args.encoding,
+                               args.normalize_audio, args.loudnorm_target, args.downscale,
+                               args.strip_no_english_audio, preset)
+    except ConversionError as e:
+        logging.error(f"CONVERSION FAILED (preset {preset}): {e.file.resolve()}\n{e.reason}")
+        return None
+    call_elapsed = time.monotonic() - call_start
+
+    if result is None:
+        return None
+    orig_size, new_size, video_duration, action, downscaled, grew_larger, retried = result
+    if action != "encoded" or retried:
+        # Copied (already HEVC / below min size) or retried (timing polluted by the
+        # failed attempt) — not a clean encode-speed sample.
+        return None
+
+    label = preset if preset is not None else "default"
+    read_mbps = read_bytes / (1024 * 1024) / read_seconds if read_seconds > 0 else 0
+    enc_mbps = orig_size / (1024 * 1024) / call_elapsed if call_elapsed > 0 else 0
+    pct_smaller = (1 - new_size / orig_size) * 100 if orig_size > 0 else 0
+    size_part = f"{human_size(orig_size)}->{human_size(new_size)}, {pct_smaller:.0f}% smaller"
+    rt_part = (f", {video_duration / call_elapsed:.1f}x realtime"
+               if video_duration and call_elapsed > 0 else "")
+    diag_line = (f"[DIAGNOSE] {src.name} [{label}]: "
+                 f"read {format_throughput(read_bytes, read_seconds)} vs "
+                 f"encode {format_throughput(orig_size, call_elapsed)}{rt_part} | {size_part}")
+    logging.info(diag_line)
+    print(diag_line)
+
+    return {"enc_seconds": call_elapsed, "orig_bytes": orig_size, "new_bytes": new_size,
+            "video_seconds": video_duration or 0.0}
+
+
+def diagnose_tagged_dst(src, input_base, output_folder, preset, encoding, crf):
+    """The name-tagged output path for a diagnostic encode of src under a given preset,
+    landing flat-relative to input_base in output_folder as '<stem>_<preset>_crf<crf>'.
+    Uses the effective preset name (resolving None to the encoder default) so default
+    runs get a meaningful tag rather than 'None'."""
+    rel_path = src.relative_to(input_base)
+    dst = output_folder / rel_path
+    effective_preset = preset or (DEFAULT_QSV_PRESET if encoding == "hardware"
+                                  else DEFAULT_X265_PRESET)
+    return dst.with_name(f"{dst.stem}_{effective_preset}_crf{crf}{dst.suffix}")
 
 
 def format_cmd_for_log(cmd: list) -> str:
@@ -1371,6 +1472,21 @@ def main():
     diag_encode_bytes = 0
     diag_encode_new_bytes = 0
     diag_video_seconds = 0.0
+
+    # When --diagnose is set WITHOUT an explicit --preset, sweep every preset for the
+    # active encoder so they can be compared head-to-head; otherwise a single preset
+    # runs (the explicit one, or the encoder default via None). diag_sweep flags the
+    # multi-preset case, which produces the comparison table instead of the single
+    # bottleneck block. preset_stats accumulates per-preset numbers for the table.
+    if args.diagnose and args.preset is None:
+        presets_to_test = list(QSV_PRESETS if args.encoding == "hardware" else X265_PRESETS)
+        diag_sweep = True
+    else:
+        presets_to_test = [args.preset]
+        diag_sweep = False
+    preset_stats = {p: {"enc_seconds": 0.0, "enc_bytes": 0, "new_bytes": 0,
+                        "video_seconds": 0.0, "files": 0} for p in presets_to_test}
+
     limit_bytes = float("inf") if args.limit == -1 else args.limit * 1024 ** 3
     limit_reached = False
 
@@ -1434,20 +1550,57 @@ def main():
               f"ETA: {eta_str} | "
               f"Current file ({human_size(src_size)}): {src.resolve()}")
 
-        # Diagnostic: read the source cold to measure disk throughput (and warm the
-        # page cache so the encode below is mostly encoder-bound, not disk-bound). Done
-        # only for files that will actually be encoded — a copy or skip isn't the case
-        # we're trying to diagnose. We can't know the action without probing, so the
-        # cheap proxy is: measure now, and only fold the numbers into the totals below
-        # once we see the file was in fact encoded.
-        diag_read_this_file = None
+        # --- Diagnose sweep: encode this file under every candidate preset ---
+        # Read the source once (cold) to measure disk speed and warm the cache, then
+        # run each preset's encode against that warm cache so their speeds compare
+        # cleanly without disk noise. This path fully handles the file and continues;
+        # the normal single-pass logic below is skipped. (--diagnose is validated to
+        # require separate output and is a no-op under --dry-run, so same_location is
+        # False and dry-run is off here.)
         if args.diagnose and not args.dry_run:
             read_seconds, read_bytes = measure_read_speed(src)
-            diag_read_this_file = (read_seconds, read_bytes)
             logging.info(f"[DIAGNOSE] Disk read: {src.name}: "
                          f"{human_size(read_bytes)} in "
                          f"{human_duration(read_seconds, include_seconds=True)} = "
                          f"{format_throughput(read_bytes, read_seconds)}")
+            file_had_encode = False
+            for preset in presets_to_test:
+                dst = diagnose_tagged_dst(src, input_base, args.output_folder, preset,
+                                          args.encoding, args.crf)
+                if dst.exists() and not args.force:
+                    print(f"[{time.strftime('%H:%M:%S')}] Output file exists: {dst}")
+                    logging.info(f"SKIPPED (output file already exists): {dst}")
+                    skipped_existing += 1
+                    continue
+                stats = diagnose_encode_one(src, dst, preset, read_seconds, read_bytes, args)
+                if stats is not None:
+                    file_had_encode = True
+                    encoded_count += 1
+                    total_orig += stats["orig_bytes"]
+                    total_new += stats["new_bytes"]
+                    total_duration_seconds += stats["video_seconds"]
+                    ps = preset_stats[preset]
+                    ps["enc_seconds"] += stats["enc_seconds"]
+                    ps["enc_bytes"] += stats["orig_bytes"]
+                    ps["new_bytes"] += stats["new_bytes"]
+                    ps["video_seconds"] += stats["video_seconds"]
+                    ps["files"] += 1
+                    # For a single-preset diagnose (no sweep), also feed the aggregate
+                    # accumulators that drive the bottleneck-verdict summary. For a
+                    # sweep, that block is replaced by the comparison table, so summing
+                    # encode time across presets there would be meaningless.
+                    if not diag_sweep:
+                        diag_encode_seconds += stats["enc_seconds"]
+                        diag_encode_bytes += stats["orig_bytes"]
+                        diag_encode_new_bytes += stats["new_bytes"]
+                        diag_video_seconds += stats["video_seconds"]
+            # Read stats are per file (shared across presets), so accumulate once.
+            if file_had_encode:
+                diag_read_seconds += read_seconds
+                diag_read_bytes += read_bytes
+            processed_bytes += src_size
+            continue
+        # --- End diagnose sweep ---
 
         call_start = time.monotonic()
         try:
@@ -1487,46 +1640,6 @@ def main():
                 grew_larger_count += 1
             if retried:
                 retried_count += 1
-
-            # Fold the diagnostic numbers in only for files that were actually encoded
-            # (and not retried — a retry inflates call_elapsed with the failed attempt
-            # plus its sleep, which would understate encode speed). call_elapsed is the
-            # whole process_file call: probe + encode, but with the cache warmed by the
-            # pre-read the probe is near-instant, so it's a good stand-in for encode time.
-            if diag_read_this_file is not None and action == "encoded" and not retried:
-                read_seconds, read_bytes = diag_read_this_file
-                diag_read_seconds += read_seconds
-                diag_read_bytes += read_bytes
-                diag_encode_seconds += call_elapsed
-                diag_encode_bytes += orig_size
-                diag_encode_new_bytes += new_size
-                if video_duration is not None:
-                    diag_video_seconds += video_duration
-                read_mbps = read_bytes / (1024 * 1024) / read_seconds if read_seconds > 0 else 0
-                enc_mbps = orig_size / (1024 * 1024) / call_elapsed if call_elapsed > 0 else 0
-                if read_mbps and enc_mbps:
-                    if read_mbps < enc_mbps * 0.9:
-                        verdict = "I/O bound (disk slower than the encoder)"
-                    elif enc_mbps < read_mbps * 0.9:
-                        verdict = "encode bound (encoder slower than the disk)"
-                    else:
-                        verdict = "balanced (disk and encoder are close)"
-                    # Compression achieved on this file, and how fast the encode ran
-                    # relative to the video's own running time (realtime factor) — the
-                    # bitrate-independent way to compare encoder effort across clips.
-                    pct_smaller = (1 - new_size / orig_size) * 100 if orig_size > 0 else 0
-                    size_part = (f"{human_size(orig_size)}->{human_size(new_size)}, "
-                                 f"{pct_smaller:.0f}% smaller")
-                    if video_duration and call_elapsed > 0:
-                        rt_part = f", {video_duration / call_elapsed:.1f}x realtime"
-                    else:
-                        rt_part = ""
-                    diag_line = (f"[DIAGNOSE] {src.name}: "
-                                 f"read {format_throughput(read_bytes, read_seconds)} vs "
-                                 f"encode {format_throughput(orig_size, call_elapsed)}"
-                                 f"{rt_part} | {size_part} -> {verdict}")
-                    logging.info(diag_line)
-                    print(diag_line)
 
             if args.delete_source:
                 if args.dry_run:
@@ -1605,7 +1718,31 @@ def main():
         logging.info(deleted_line)
         print(deleted_line)
 
-    if args.diagnose and diag_encode_bytes > 0 and diag_read_seconds > 0:
+    if args.diagnose and diag_sweep and diag_read_seconds > 0:
+        any_encoded = any(s["files"] > 0 for s in preset_stats.values())
+        if any_encoded:
+            table_header = [
+                "",
+                "=== Preset comparison (--diagnose sweep) ===",
+                f"Disk read (shared, measured once per file): "
+                f"{format_throughput(diag_read_bytes, diag_read_seconds)}",
+                f"Encoders run against a warm cache, so 'enc MB/s' reflects the encoder, "
+                f"not the disk. 'proj. full job' extrapolates each preset's speed over "
+                f"the whole input tree ({human_size(total_size_bytes)}, {total_files} files).",
+                "",
+            ]
+            table_lines = build_preset_comparison_table(preset_stats, tuple(presets_to_test),
+                                                        total_size_bytes)
+            note = ("(A faster preset near the top of the table finishes sooner; a "
+                    "slower one usually compresses a little better at the same CRF. "
+                    "Pick the fastest preset whose 'smaller' % and picture you're "
+                    "happy with. Files larger than free RAM won't fully cache, "
+                    "slightly understating encode speed.)")
+            for line in table_header + table_lines + ["", note]:
+                logging.info(line)
+                print(line)
+
+    if args.diagnose and not diag_sweep and diag_encode_bytes > 0 and diag_read_seconds > 0:
         read_mbps = diag_read_bytes / (1024 * 1024) / diag_read_seconds
         enc_mbps = diag_encode_bytes / (1024 * 1024) / diag_encode_seconds
         bottleneck_mbps = min(read_mbps, enc_mbps)
