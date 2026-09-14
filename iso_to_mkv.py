@@ -300,32 +300,37 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, TextIO
+
+# Type alias for the extraction-progress callback: receives a percentage
+# (0-100) and an optional short stage label, and returns nothing.
+ProgressCallback = Callable[[float, str | None], None]
 
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
 
-DEFAULT_LOG_NAME = "convert.log"  # default log filename; placed in the output folder unless --log overrides
+DEFAULT_LOG_NAME: str = "convert.log"  # default log filename; placed in the output folder unless --log overrides
 
 # MakeMKV robot-mode attribute IDs (see module docstring, point 1)
-ATTR_TYPE = 1  # stream "Type" attribute on SINFO lines - text value "Video"/"Audio"/"Subtitles"
-ATTR_NAME = 2
-ATTR_DURATION = 9
-ATTR_DISKSIZE_BYTES = 11
-ATTR_SOURCE_FILENAME = 16  # title "Source file name" - the source playlist (e.g. "00610.mpls") on Blu-ray
-ATTR_INFO = 30  # title "info/comment" text; carries "(FPL_MainFeature)" when JRE identifies it
+ATTR_TYPE: int = 1  # stream "Type" attribute on SINFO lines - text value "Video"/"Audio"/"Subtitles"
+ATTR_NAME: int = 2
+ATTR_DURATION: int = 9
+ATTR_DISKSIZE_BYTES: int = 11
+ATTR_SOURCE_FILENAME: int = 16  # title "Source file name" - the source playlist (e.g. "00610.mpls") on Blu-ray
+ATTR_INFO: int = 30  # title "info/comment" text; carries "(FPL_MainFeature)" when JRE identifies it
 
 # Exact marker MakeMKV writes into a title's info text when its BD-Java
 # analysis (requires JRE) has identified that title as the main feature.
 # Matched with parentheses so we don't also match variants like
 # "FPL_MainFeature_UR" (seen on some discs with alternate cuts), which
 # need manual disambiguation rather than being silently treated as equal.
-FPL_MAIN_FEATURE_RE = re.compile(r"\(FPL_MainFeature\)")
-FPL_SUBSTRING = "FPL_MainFeature"
+FPL_MAIN_FEATURE_RE: re.Pattern[str] = re.compile(r"\(FPL_MainFeature\)")
+FPL_SUBSTRING: str = "FPL_MainFeature"
 
 # Exact, confirmed MakeMKV message (see e.g. makemkv.com/bdjava/ and its own
 # forums) printed when a disc actually needs BD-Java (fake-playlist
@@ -333,11 +338,11 @@ FPL_SUBSTRING = "FPL_MainFeature"
 # a much stronger, more specific signal than the mere absence of the
 # "Using Java runtime" success line, which also doesn't appear on discs
 # that never needed Java in the first place.
-JRE_MISSING_MARKER = "This disc requires Java runtime (JRE), but none was found"
+JRE_MISSING_MARKER: str = "This disc requires Java runtime (JRE), but none was found"
 
-DVD_MAX_SIZE_GB_DEFAULT = 8.5  # decimal GB (10**9 bytes), matching how DVD-9 capacity is marketed
-DISC_TYPE_DVD = "DVD"
-DISC_TYPE_BLURAY = "BLURAY"
+DVD_MAX_SIZE_GB_DEFAULT: float = 8.5  # decimal GB (10**9 bytes), matching how DVD-9 capacity is marketed
+DISC_TYPE_DVD: str = "DVD"
+DISC_TYPE_BLURAY: str = "BLURAY"
 
 # Sanity floor for "does this look like a real output file", used both to
 # verify a title actually got extracted before deleting the source (safety
@@ -345,14 +350,14 @@ DISC_TYPE_BLURAY = "BLURAY"
 # as "already converted" for resume support (enhancement 4). This is a
 # floor, not a quality check - any real title clearing --min-length will
 # produce something far larger than this.
-MIN_OUTPUT_FILE_BYTES = 1_000_000  # 1 MB
+MIN_OUTPUT_FILE_BYTES: int = 1_000_000  # 1 MB
 
 # Per-output-folder manifest written on a successful conversion, used by
 # resume support (workflow enhancement 4) instead of a plain .mkv file
 # *count* comparison - see selection_fingerprint()/manifest_matches() for
 # why a count alone can't tell "same titles, already done" apart from "a
 # different run left a coincidentally-equal number of files here".
-MANIFEST_FILENAME = ".iso_to_mkv_manifest.json"
+MANIFEST_FILENAME: str = ".iso_to_mkv_manifest.json"
 
 
 # --------------------------------------------------------------------------
@@ -388,7 +393,7 @@ def parse_mkv_duration(value: str) -> float:
     return float(h * 3600 + m * 60 + s)
 
 
-def csv_fields(payload: str) -> List[str]:
+def csv_fields(payload: str) -> list[str]:
     """Parse a single line of MakeMKV robot-mode output (the part after the
     leading TAG: prefix) into fields.
 
@@ -401,12 +406,12 @@ def csv_fields(payload: str) -> List[str]:
     treat the escaped \\" as an early close-quote and mis-split everything
     after it in that line. This parser follows MakeMKV's own convention
     instead, so those fields come through intact."""
-    fields: List[str] = []
+    fields: list[str] = []
     i, n = 0, len(payload)
     while True:
         if i < n and payload[i] == '"':
             i += 1  # skip opening quote
-            buf: List[str] = []
+            buf: list[str] = []
             while i < n and payload[i] != '"':
                 if payload[i] == "\\" and i + 1 < n and payload[i + 1] in ("\\", '"'):
                     buf.append(payload[i + 1])
@@ -430,7 +435,7 @@ def csv_fields(payload: str) -> List[str]:
     return fields
 
 
-def classify_disc(iso_path: Path, max_dvd_bytes: float, override: Optional[str]) -> str:
+def classify_disc(iso_path: Path, max_dvd_bytes: float, override: str | None) -> str:
     """Heuristically classify an ISO as DVD or Blu-ray. See module
     docstring point 2a-DVD for rationale and known limitations."""
     if override:
@@ -439,7 +444,7 @@ def classify_disc(iso_path: Path, max_dvd_bytes: float, override: Optional[str])
     return DISC_TYPE_BLURAY if size > max_dvd_bytes else DISC_TYPE_DVD
 
 
-def preflight_check_makemkvcon() -> Optional[str]:
+def preflight_check_makemkvcon() -> str | None:
     """Confirm makemkvcon can actually be found on PATH before processing
     any files, so a missing install fails fast with one clear message
     instead of every ISO in the batch failing individually with the same
@@ -449,14 +454,14 @@ def preflight_check_makemkvcon() -> Optional[str]:
     return None
 
 
-def snapshot_output_dir(out_dir: Path) -> Dict[str, int]:
+def snapshot_output_dir(out_dir: Path) -> dict[str, int]:
     """Map of filename -> size for every file currently in out_dir."""
     if not out_dir.is_dir():
         return {}
     return {p.name: p.stat().st_size for p in out_dir.iterdir() if p.is_file()}
 
 
-def selection_fingerprint(args: argparse.Namespace) -> dict:
+def selection_fingerprint(args: argparse.Namespace) -> dict[str, Any]:
     """Every argument that can change which titles get picked as candidates
     for a given ISO (independent of the ISO's own content). Used to
     invalidate a previous run's manifest if the command line changes in a
@@ -478,7 +483,7 @@ def selection_fingerprint(args: argparse.Namespace) -> dict:
     }
 
 
-def read_manifest(out_dir: Path) -> Optional[dict]:
+def read_manifest(out_dir: Path) -> dict[str, Any] | None:
     """Best-effort read of a previous run's manifest from out_dir. Returns
     None if there isn't one, or it can't be parsed (treated the same as
     "no manifest" - resume just won't fire, which is the safe direction to
@@ -487,12 +492,15 @@ def read_manifest(out_dir: Path) -> Optional[dict]:
     if not manifest_path.is_file():
         return None
     try:
-        return json.loads(manifest_path.read_text(encoding="utf-8"))
+        data: Any = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return None
+    # A manifest that parsed to something other than an object (e.g. a bare
+    # list or number) is treated as "no valid manifest".
+    return data if isinstance(data, dict) else None
 
 
-def preserve_source_timestamps(src_stat: os.stat_result, dest_paths: List[Path]) -> List[str]:
+def preserve_source_timestamps(src_stat: os.stat_result, dest_paths: list[Path]) -> list[str]:
     """Copy the source ISO's access/modification times onto each output
     file, so an archived .mkv carries the same file date as the disc image
     it came from (useful for chronological sorting and for downstream tools
@@ -500,7 +508,7 @@ def preserve_source_timestamps(src_stat: os.stat_result, dest_paths: List[Path])
     filesystem supports it. Best-effort per file: returns the names of any
     files whose timestamp couldn't be set (e.g. a read-only filesystem), so
     the caller can warn without failing the conversion."""
-    failed: List[str] = []
+    failed: list[str] = []
     for p in dest_paths:
         try:
             os.utime(p, ns=(src_stat.st_atime_ns, src_stat.st_mtime_ns))
@@ -512,7 +520,7 @@ def preserve_source_timestamps(src_stat: os.stat_result, dest_paths: List[Path])
 def stamp_outputs_with_source_date(
     iso_path: Path,
     out_dir: Path,
-    filenames: List[str],
+    filenames: list[str],
     logger: "DualLogger",
     stats: "Stats",
 ) -> None:
@@ -531,7 +539,7 @@ def stamp_outputs_with_source_date(
         stats.warnings += 1
         return
 
-    to_set: List[Path] = []
+    to_set: list[Path] = []
     for name in filenames:
         p = out_dir / name
         try:
@@ -562,16 +570,16 @@ def stamp_outputs_with_source_date(
 def write_manifest(
     out_dir: Path,
     iso_path: Path,
-    candidate_tids: List[int],
-    output_filenames: List[str],
+    candidate_tids: list[int],
+    output_filenames: list[str],
     args: argparse.Namespace,
 ) -> None:
     """Record exactly what this run extracted, and under what selection
     settings, so a future run can tell whether an existing output folder
     really is "this ISO, fully converted with today's settings" rather
     than just "the right number of .mkv files happen to be sitting here"."""
-    stat = iso_path.stat()
-    manifest = {
+    stat: os.stat_result = iso_path.stat()
+    manifest: dict[str, Any] = {
         "iso_size": stat.st_size,
         "iso_mtime": stat.st_mtime,
         "candidate_title_ids": sorted(candidate_tids),
@@ -585,9 +593,9 @@ def write_manifest(
 
 
 def manifest_matches(
-    manifest: Optional[dict],
+    manifest: dict[str, Any] | None,
     iso_path: Path,
-    candidate_tids: List[int],
+    candidate_tids: list[int],
     out_dir: Path,
     args: argparse.Namespace,
 ) -> bool:
@@ -624,7 +632,7 @@ def manifest_matches(
     return True
 
 
-def resolve_probe_tool() -> Optional[str]:
+def resolve_probe_tool() -> str | None:
     """Which external tool (if any) is available to verify an extracted
     .mkv file's actual audio/subtitle track counts and duration against
     what MakeMKV reported for the source title (workflow enhancement 7).
@@ -639,7 +647,7 @@ def resolve_probe_tool() -> Optional[str]:
     return None
 
 
-def probe_output_tracks_and_duration(mkv_path: Path, tool: str) -> Optional[Tuple[int, int, float]]:
+def probe_output_tracks_and_duration(mkv_path: Path, tool: str) -> tuple[int, int, float] | None:
     """Best-effort probe of an already-extracted .mkv file's audio track
     count, subtitle track count, and duration (seconds), using whichever
     external tool resolve_probe_tool() found. Returns None on any
@@ -681,7 +689,7 @@ def probe_output_tracks_and_duration(mkv_path: Path, tool: str) -> Optional[Tupl
     return None
 
 
-def check_free_space(out_dir: Path, output_root: Path, required_bytes: int, margin_pct: float) -> Optional[str]:
+def check_free_space(out_dir: Path, output_root: Path, required_bytes: int, margin_pct: float) -> str | None:
     """Return None if there's enough free space on the output volume for
     an extraction of about required_bytes (plus a safety margin), else an
     error message. Checks whichever of out_dir/output_root already exists,
@@ -708,12 +716,12 @@ class DualLogger:
     """Writes to console (ISO name only, no path) and to a log file
     (full ISO path), per the requested behavior."""
 
-    def __init__(self, log_path: Path):
-        self.log_path = log_path
+    def __init__(self, log_path: Path) -> None:
+        self.log_path: Path = log_path
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         # Append mode: successive runs accumulate in one log rather than
         # overwriting. The "Run started" banner below separates runs.
-        self._fh = open(self.log_path, "a", encoding="utf-8")
+        self._fh: TextIO = open(self.log_path, "a", encoding="utf-8")
         self._raw(f"==== Run started {datetime.now().isoformat(timespec='seconds')} ====")
 
     def _timestamp(self) -> str:
@@ -726,14 +734,14 @@ class DualLogger:
     def append_raw_to_file(self, line: str) -> None:
         self._raw(line)
 
-    def _log(self, level: str, message: str, iso_path: Optional[Path]) -> None:
+    def _log(self, level: str, message: str, iso_path: Path | None) -> None:
         ts = self._timestamp()
         console_target = f" {iso_path.name}:" if iso_path is not None else ""
         file_target = f" {iso_path}:" if iso_path is not None else ""
         print(f"{ts} [{level}]{console_target} {message}")
         self._raw(f"{ts} [{level}]{file_target} {message}")
 
-    def file_only(self, level: str, message: str, iso_path: Optional[Path] = None) -> None:
+    def file_only(self, level: str, message: str, iso_path: Path | None = None) -> None:
         """Same formatting as _log, but never printed to the console - for
         detail (like a verbatim command line) that's worth having in the
         log for troubleshooting but would just be noise on-screen."""
@@ -741,13 +749,13 @@ class DualLogger:
         file_target = f" {iso_path}:" if iso_path is not None else ""
         self._raw(f"{ts} [{level}]{file_target} {message}")
 
-    def info(self, message: str, iso_path: Optional[Path] = None) -> None:
+    def info(self, message: str, iso_path: Path | None = None) -> None:
         self._log("INFO", message, iso_path)
 
-    def warning(self, message: str, iso_path: Optional[Path] = None) -> None:
+    def warning(self, message: str, iso_path: Path | None = None) -> None:
         self._log("WARNING", message, iso_path)
 
-    def error(self, message: str, iso_path: Optional[Path] = None) -> None:
+    def error(self, message: str, iso_path: Path | None = None) -> None:
         self._log("ERROR", message, iso_path)
 
     def close(self) -> None:
@@ -758,7 +766,7 @@ class DualLogger:
 # makemkvcon interaction
 # --------------------------------------------------------------------------
 
-def run_cmd(cmd: List[str]) -> Tuple[int, str]:
+def run_cmd(cmd: list[str]) -> tuple[int, str]:
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         return proc.returncode, proc.stdout or ""
@@ -766,7 +774,7 @@ def run_cmd(cmd: List[str]) -> Tuple[int, str]:
         return 127, f"Could not execute command {cmd!r}: {e}"
 
 
-def run_cmd_with_progress(cmd: List[str], on_progress=None) -> Tuple[int, str]:
+def run_cmd_with_progress(cmd: list[str], on_progress: ProgressCallback | None = None) -> tuple[int, str]:
     """Like run_cmd, but streams output line-by-line so PRGT/PRGV progress
     lines can be reported live via on_progress(percent, label) while a
     long title extraction is running (workflow enhancement 5), instead of
@@ -783,8 +791,8 @@ def run_cmd_with_progress(cmd: List[str], on_progress=None) -> Tuple[int, str]:
     except FileNotFoundError as e:
         return 127, f"Could not execute command {cmd!r}: {e}"
 
-    lines: List[str] = []
-    current_label: Optional[str] = None
+    lines: list[str] = []
+    current_label: str | None = None
     try:
         assert proc.stdout is not None
         for raw_line in proc.stdout:
@@ -793,11 +801,11 @@ def run_cmd_with_progress(cmd: List[str], on_progress=None) -> Tuple[int, str]:
             if on_progress is None:
                 continue
             if line.startswith("PRGT:"):
-                fields = csv_fields(line[len("PRGT:"):])
+                fields = csv_fields(line.removeprefix("PRGT:"))
                 if len(fields) >= 3:
                     current_label = fields[2]
             elif line.startswith("PRGV:"):
-                fields = csv_fields(line[len("PRGV:"):])
+                fields = csv_fields(line.removeprefix("PRGV:"))
                 if len(fields) >= 3:
                     try:
                         _current, total, maxv = int(fields[0]), int(fields[1]), int(fields[2])
@@ -821,16 +829,16 @@ def run_cmd_with_progress(cmd: List[str], on_progress=None) -> Tuple[int, str]:
     return proc.returncode, "\n".join(lines)
 
 
-def make_progress_printer(iso_name: str, title_id: int):
+def make_progress_printer(iso_name: str, title_id: int) -> ProgressCallback | None:
     """Returns an on_progress callback that prints a live-updating
     progress line to the console (never to the log file - that would just
     be noise). Only prints when stdout is a real terminal, since a \\r
     updating line doesn't make sense when output is redirected to a file."""
     if not sys.stdout.isatty():
         return None
-    state = {"last_pct": -1}
+    state: dict[str, int] = {"last_pct": -1}
 
-    def _cb(pct: float, label: Optional[str]) -> None:
+    def _cb(pct: float, label: str | None) -> None:
         pct_int = int(pct)
         if pct_int == state["last_pct"]:
             return
@@ -849,16 +857,16 @@ class Title:
     title_id: int
     duration_sec: float = 0.0
     size_bytes: int = 0
-    name: Optional[str] = None
-    info_text: Optional[str] = None  # attribute 30; may contain "(FPL_MainFeature)"
-    source_filename: Optional[str] = None  # attribute 16; the source playlist e.g. "00610.mpls" on Blu-ray
+    name: str | None = None
+    info_text: str | None = None  # attribute 30; may contain "(FPL_MainFeature)"
+    source_filename: str | None = None  # attribute 16; the source playlist e.g. "00610.mpls" on Blu-ray
     audio_track_count: int = 0       # from SINFO lines - used by the post-extraction cross-check
     subtitle_track_count: int = 0    # from SINFO lines - used by the post-extraction cross-check
 
 
 def get_disc_titles(
     iso_path: Path, logger: "DualLogger"
-) -> Tuple[int, str, Dict[int, Title], bool, bool]:
+) -> tuple[int, str, dict[int, Title], bool, bool]:
     """Run `makemkvcon info` on the ISO and parse the title table.
 
     Returns (returncode, raw_output, titles, jre_engaged, jre_required_missing).
@@ -869,17 +877,17 @@ def get_disc_titles(
     could not find a JRE to use - a much stronger signal than jre_engaged
     simply being False, which is also true for every disc that never
     needed Java at all."""
-    cmd = ["makemkvcon", "-r", "--cache=1", "info", f"iso:{iso_path}"]
+    cmd: list[str] = ["makemkvcon", "-r", "--cache=1", "info", f"iso:{iso_path}"]
     logger.file_only("CMD", " ".join(cmd), iso_path)
     rc, output = run_cmd(cmd)
-    titles: Dict[int, Title] = {}
-    jre_engaged = "Using Java runtime" in output
-    jre_required_missing = JRE_MISSING_MARKER in output
+    titles: dict[int, Title] = {}
+    jre_engaged: bool = "Using Java runtime" in output
+    jre_required_missing: bool = JRE_MISSING_MARKER in output
 
     for line in output.splitlines():
         line = line.strip()
         if line.startswith("TINFO:"):
-            fields = csv_fields(line[len("TINFO:"):])
+            fields = csv_fields(line.removeprefix("TINFO:"))
             if len(fields) < 4:
                 continue
             try:
@@ -907,7 +915,7 @@ def get_disc_titles(
             # inserted after title_id. Only the Type attribute is used
             # here, to count audio/subtitle tracks per title for the
             # post-extraction cross-check (workflow enhancement 7).
-            fields = csv_fields(line[len("SINFO:"):])
+            fields = csv_fields(line.removeprefix("SINFO:"))
             if len(fields) < 5:
                 continue
             try:
@@ -926,7 +934,7 @@ def get_disc_titles(
     return rc, output, titles, jre_engaged, jre_required_missing
 
 
-def looks_like_warning(output: str) -> Optional[str]:
+def looks_like_warning(output: str) -> str | None:
     """Best-effort scan of makemkvcon output for non-fatal warning lines,
     even when the overall command succeeded."""
     for line in output.splitlines():
@@ -949,12 +957,10 @@ def normalize_playlist_name(name: str) -> str:
     all compare equal."""
     n = name.strip().lower().replace("\\", "/")
     n = n.rsplit("/", 1)[-1]  # keep only the basename
-    if n.endswith(".mpls"):
-        n = n[: -len(".mpls")]
-    return n
+    return n.removesuffix(".mpls")
 
 
-def find_title_by_playlist(titles: Dict[int, Title], requested: str) -> List[int]:
+def find_title_by_playlist(titles: dict[int, Title], requested: str) -> list[int]:
     """Return the title IDs whose source playlist filename matches
     `requested` (normalized). Normally exactly one; more than one would
     mean two titles share a source playlist (unusual), which the caller
@@ -968,8 +974,8 @@ def find_title_by_playlist(titles: Dict[int, Title], requested: str) -> List[int
 
 
 def detect_obfuscation(
-    titles: Dict[int, Title], threshold: int, tolerance_sec: float
-) -> Tuple[bool, float, int]:
+    titles: dict[int, Title], threshold: int, tolerance_sec: float
+) -> tuple[bool, float, int]:
     """Find the largest cluster of titles whose durations all fall within
     a single tolerance_sec-wide window; if that cluster is at least
     `threshold` titles, suspect playlist obfuscation. Returns
@@ -1005,15 +1011,15 @@ def detect_obfuscation(
     return best_count >= threshold, best_center, best_count
 
 
-MIN_CANDIDATES_FOR_PLAYALL_DETECTION = 3  # need the concat title plus >= 2 episodes
+MIN_CANDIDATES_FOR_PLAYALL_DETECTION: int = 3  # need the concat title plus >= 2 episodes
 
 
 def detect_playall_title(
-    candidates: List[int],
-    titles: Dict[int, Title],
+    candidates: list[int],
+    titles: dict[int, Title],
     tolerance_sec: float,
     cluster_tolerance_pct: float,
-) -> Optional[Tuple[int, List[int]]]:
+) -> tuple[int, list[int]] | None:
     """Detect a "Play All" concatenation title: common on TV-show DVDs,
     where one title is just all the individual episodes stitched together
     back-to-back so a DVD player can play the whole disc as one stream.
@@ -1066,7 +1072,7 @@ def detect_playall_title(
     return None
 
 
-def unique_output_dir(output_root: Path, relative_dir: Path, stem: str, used: set) -> Path:
+def unique_output_dir(output_root: Path, relative_dir: Path, stem: str, used: set[str]) -> Path:
     """Mirrors the ISO's directory structure relative to --input under
     output_root, so e.g. <input>/Show/S1E1/s1e1.iso produces
     <output>/Show/S1E1/s1e1/ rather than flattening everything directly
@@ -1123,8 +1129,8 @@ def process_iso(
     args: argparse.Namespace,
     logger: DualLogger,
     stats: Stats,
-    used_output_names: set,
-    probe_tool: Optional[str],
+    used_output_names: set[str],
+    probe_tool: str | None,
 ) -> ProcessResult:
     """Returns a ProcessResult describing what happened, so main() can
     drive --limit accounting, source deletion, and the info-scan
@@ -1175,7 +1181,7 @@ def process_iso(
     # one. That title's output gets named "main_title.mkv" (see the
     # per-title loop) so other tools can trust the filename rather than
     # re-deriving which title was the main feature.
-    fpl_identified_main_tid: Optional[int] = None
+    fpl_identified_main_tid: int | None = None
 
     if args.main_playlist:
         # --- Manual main-title override (one-off for unresolvable obfuscation) ---
@@ -1396,8 +1402,8 @@ def process_iso(
         out_dir.mkdir(parents=True, exist_ok=True)
 
     all_ok = True
-    stop_reason: Optional[str] = None  # set when all_ok is False for a reason other than a title outright failing
-    output_filenames: List[str] = []  # populated on success, written into the manifest below
+    stop_reason: str | None = None  # set when all_ok is False for a reason other than a title outright failing
+    output_filenames: list[str] = []  # populated on success, written into the manifest below
     # Tracks whether EVERY extracted title was affirmatively verified clean
     # by the track/duration cross-check. Starts True only if a probe tool is
     # available at all; any title that can't be probed, or that shows a
@@ -1660,9 +1666,12 @@ def process_iso(
 # Argument parsing
 # --------------------------------------------------------------------------
 
-def compile_regex_arg(value: str) -> re.Pattern:
+def compile_regex_arg(value: str) -> re.Pattern[str]:
+    # Case-insensitive per the filtering contract (requirement 2). Anchoring
+    # to the start of the input-relative path is done at match time with
+    # .match() (requirement 1), not here.
     try:
-        return re.compile(value)
+        return re.compile(value, re.IGNORECASE)
     except re.error as e:
         raise argparse.ArgumentTypeError(f"Invalid regular expression {value!r}: {e}")
 
@@ -1673,9 +1682,9 @@ class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
     which reads as if the disabling flag were itself on by default, when
     it's actually detect_playall (the setting it controls) that defaults
     to True/enabled."""
-    def _get_help_string(self, action):
+    def _get_help_string(self, action: argparse.Action) -> str | None:
         if action.dest == "detect_playall":
-            return action.help + " (default: enabled)"
+            return (action.help or "") + " (default: enabled)"
         return super()._get_help_string(action)
 
 
@@ -1711,13 +1720,16 @@ def parse_args() -> argparse.Namespace:
     filter_group = p.add_mutually_exclusive_group()
     filter_group.add_argument(
         "-I", "--include", type=compile_regex_arg, default=None, metavar="REGEX",
-        help="Only process ISOs whose full path matches this regex; all others are skipped. "
-             "Mutually exclusive with --exclude",
+        help="Only process ISOs whose path, relative to the input folder (-i), matches this "
+             "regex. Anchored at the start (a partial match from the first character counts, "
+             "a match further down the path does not) and case-insensitive. E.g. with -i d:/tmp, "
+             "'ab' matches tmp/abcdef.iso but not tmp/xy/ab.iso. Mutually exclusive with --exclude",
     )
     filter_group.add_argument(
         "-X", "--exclude", type=compile_regex_arg, default=None, metavar="REGEX",
-        help="Skip any ISO whose full path matches this regex; all others are processed. "
-             "Mutually exclusive with --include",
+        help="Skip any ISO whose path, relative to the input folder (-i), matches this regex "
+             "(same anchored-at-start, case-insensitive matching as --include); all others are "
+             "processed. Mutually exclusive with --include",
     )
     p.add_argument(
         "--obfuscation-threshold", type=int, default=30, metavar="N",
@@ -1867,16 +1879,24 @@ def main() -> int:
         {p for p in input_root.rglob("*") if p.is_file() and p.suffix.lower() == ".iso"}
     )
 
+    # --include/--exclude match against each ISO's path RELATIVE to the
+    # input folder, as a forward-slash string (so patterns are the same on
+    # Windows and Unix), and are anchored at the start via .match() - a
+    # partial match from the first character counts, but a match further
+    # down the path does not. So with -i d:/tmp, --include=ab matches
+    # d:/tmp/abcdef.iso (relative "abcdef.iso") but not d:/tmp/xy/ab.iso
+    # (relative "xy/ab.iso"). Matching is case-insensitive (see
+    # compile_regex_arg).
     if args.include:
         before = len(iso_files)
-        iso_files = [p for p in iso_files if args.include.search(str(p))]
+        iso_files = [p for p in iso_files if args.include.match(p.relative_to(input_root).as_posix())]
         logger.info(
             f"--include={args.include.pattern!r} applied: {len(iso_files)} of {before} "
             f"ISO(s) matched and will be processed"
         )
     elif args.exclude:
         before = len(iso_files)
-        iso_files = [p for p in iso_files if not args.exclude.search(str(p))]
+        iso_files = [p for p in iso_files if not args.exclude.match(p.relative_to(input_root).as_posix())]
         logger.info(
             f"--exclude={args.exclude.pattern!r} applied: {before - len(iso_files)} of {before} "
             f"ISO(s) matched and will be skipped"
@@ -1912,14 +1932,14 @@ def main() -> int:
         f"under {input_root}"
     )
 
-    stats = Stats()
-    used_output_names: set = set()
+    stats: Stats = Stats()
+    used_output_names: set[str] = set()
 
-    start_time = time.time()
-    bytes_time_processed = 0
-    bytes_converted_running = 0
-    consecutive_info_scan_failures = 0
-    interrupted = False
+    start_time: float = time.time()
+    bytes_time_processed: int = 0
+    bytes_converted_running: int = 0
+    consecutive_info_scan_failures: int = 0
+    interrupted: bool = False
 
     try:
         for idx, iso_path in enumerate(iso_files, start=1):
