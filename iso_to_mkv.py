@@ -1749,8 +1749,17 @@ def parse_args() -> argparse.Namespace:
         description="Batch-convert .iso files to .mkv using makemkvcon.",
         formatter_class=_HelpFormatter,
     )
-    p.add_argument("-i", "--input", default=".", help="Input folder to search recursively for .iso files")
-    p.add_argument("-o", "--output", default=".", help="Output root folder")
+    # Defaults are a sentinel (None) rather than "." so we can tell whether
+    # the user actually supplied the flag: at least one of -i/-o must be
+    # given (see the validation at the end of parse_args), and whichever is
+    # omitted then defaults to ".".
+    p.add_argument("-i", "--input", default=None,
+                   help="Input folder to search recursively for .iso files (default: '.', but "
+                        "at least one of -i/-o must be given, and it must be a separate tree "
+                        "from -o)")
+    p.add_argument("-o", "--output", default=None,
+                   help="Output root folder (default: '.', but at least one of -i/-o must be "
+                        "given, and it must be a separate tree from -i)")
     p.add_argument(
         "-m", "--min-length", type=float, default=10.0, metavar="MINUTES",
         help="Minimum title length (in minutes) to extract",
@@ -1866,7 +1875,37 @@ def parse_args() -> argparse.Namespace:
              "an output longer than reported is a normal measurement discrepancy and is never "
              "flagged; only a shortfall beyond this many seconds is",
     )
-    return p.parse_args()
+    args = p.parse_args()
+
+    # At least one of -i/-o must be supplied - otherwise both would default
+    # to "." and the input and output trees would be identical, which the
+    # separation rule below forbids anyway.
+    if args.input is None and args.output is None:
+        p.error("at least one of -i/--input or -o/--output must be provided")
+    if args.input is None:
+        args.input = "."
+    if args.output is None:
+        args.output = "."
+
+    # The input and output folders must be separate trees: not the same
+    # folder, and neither nested inside the other. Nesting output under
+    # input would drop conversions into the source tree; nesting input
+    # under output invites a later run treating produced files as sources
+    # and generally muddles which tree is which. Compare resolved absolute
+    # paths so "." vs an equivalent absolute path, symlinks, and ".." are
+    # all normalized first.
+    in_res = Path(args.input).resolve()
+    out_res = Path(args.output).resolve()
+    if in_res == out_res:
+        p.error(f"input and output folders must be different (both resolve to {in_res})")
+    if out_res.is_relative_to(in_res):
+        p.error(f"output folder ({out_res}) must not be inside the input folder ({in_res}) - "
+                f"use separate trees")
+    if in_res.is_relative_to(out_res):
+        p.error(f"input folder ({in_res}) must not be inside the output folder ({out_res}) - "
+                f"use separate trees")
+
+    return args
 
 
 # --------------------------------------------------------------------------
