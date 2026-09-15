@@ -10,6 +10,11 @@ If -i/-o are omitted they default to the current folder, but the input and outpu
 folders must be different and neither may be nested inside the other, so at least one
 of -i/-o must be given explicitly.
 
+Unless --delete-source is given, the script never modifies anything in the input path:
+it only reads source files and writes to the output folder (including its log). This
+means it runs fine on a read-only input path. --delete-source is the sole exception —
+it removes each source file after that file has been successfully written to output.
+
 Requires: ffmpeg and ffprobe available on PATH.
 """
 
@@ -1651,6 +1656,13 @@ def main() -> None:
                                          f"successful {action}: {src}")
                         continue
                     try:
+                        # Guarantee: this is the ONLY operation in the script that
+                        # modifies anything in the input path, and it must never run
+                        # without --delete-source. Asserting it here keeps that promise
+                        # self-enforcing against future edits — without --delete-source
+                        # the input tree is untouched and the script runs fine on a
+                        # read-only input.
+                        assert args.delete_source, "source deletion requires --delete-source"
                         src.unlink()
                         deleted_source_count += 1
                         deleted_source_bytes += orig_size
