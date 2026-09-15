@@ -23,9 +23,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 
-def _enable_windows_ansi_support():
+def _enable_windows_ansi_support() -> None:
     """On Windows, ANSI/VT escape sequences are only rendered as colors if
     ENABLE_VIRTUAL_TERMINAL_PROCESSING is turned on for the relevant console
     output handle. Modern Windows Terminal (the Windows 11 default for both
@@ -40,7 +41,7 @@ def _enable_windows_ansi_support():
         return
     try:
         import ctypes
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]  # windll exists only on Windows
         ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
         for std_handle in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
             handle = kernel32.GetStdHandle(std_handle)
@@ -58,15 +59,15 @@ _enable_windows_ansi_support()
 # only enabled when stderr is a real terminal, so piping/redirecting output (or
 # the log file, which uses a separate plain-text handler) never ends up with
 # raw escape codes.
-_SUPPORTS_COLOR = sys.stderr.isatty()
-COLOR_WARNING = "\033[93m" if _SUPPORTS_COLOR else ""  # yellow
-COLOR_ERROR = "\033[91m" if _SUPPORTS_COLOR else ""    # red
-COLOR_RESET = "\033[0m" if _SUPPORTS_COLOR else ""
+_SUPPORTS_COLOR: bool = sys.stderr.isatty()
+COLOR_WARNING: str = "\033[93m" if _SUPPORTS_COLOR else ""  # yellow
+COLOR_ERROR: str = "\033[91m" if _SUPPORTS_COLOR else ""    # red
+COLOR_RESET: str = "\033[0m" if _SUPPORTS_COLOR else ""
 
 
 class ConversionError(Exception):
     """Raised when ffprobe or ffmpeg fails for a given file."""
-    def __init__(self, file: Path, reason: str):
+    def __init__(self, file: Path, reason: str) -> None:
         self.file = file
         self.reason = reason
         super().__init__(f"{file}: {reason}")
@@ -84,13 +85,13 @@ class ConversionTimeoutError(ConversionError):
 
 # Minimum timeout for any single ffprobe call, regardless of file size, so very small
 # files still get a sane floor rather than a near-zero allowance.
-TIMEOUT_FLOOR_SECONDS = 30 * 60  # 30 minutes
+TIMEOUT_FLOOR_SECONDS: int = 30 * 60  # 30 minutes
 
 # Additional timeout allowance per GB of source file size, covering slow reads on
 # large files over network mounts or spinning disks. Deliberately generous: ffprobe
 # only reads container metadata, so taking longer than this points at a stuck process
 # rather than merely slow work.
-TIMEOUT_SECONDS_PER_GB = 15 * 60  # 15 minutes per GB
+TIMEOUT_SECONDS_PER_GB: int = 15 * 60  # 15 minutes per GB
 
 # Hardware (Quick Sync) encodes launched back-to-back can occasionally hit a
 # transient session/driver hiccup that a bare re-run of the same command doesn't
@@ -100,8 +101,8 @@ TIMEOUT_SECONDS_PER_GB = 15 * 60  # 15 minutes per GB
 # Software (libx265) encode failures aren't retried: they're far more likely to
 # indicate a real problem, and retrying would be costly given how much slower a
 # software encode is.
-HARDWARE_ENCODE_MAX_ATTEMPTS = 3
-HARDWARE_ENCODE_RETRY_DELAY_SECONDS = 5
+HARDWARE_ENCODE_MAX_ATTEMPTS: int = 3
+HARDWARE_ENCODE_RETRY_DELAY_SECONDS: int = 5
 
 # Valid -preset values differ by encoder: hevc_qsv (hardware) maps preset names onto
 # Intel's numeric TargetUsage scale, running from "veryfast" to "veryslow"; libx265
@@ -109,16 +110,30 @@ HARDWARE_ENCODE_RETRY_DELAY_SECONDS = 5
 # defines "placebo", but it's deliberately excluded here — negligible gains for a huge
 # time cost). These roughly bracket each encoder's default before our own defaults
 # below, which favor quality over speed for both.
-QSV_PRESETS = ("veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow")
-X265_PRESETS = ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium",
-                "slow", "slower", "veryslow")
+QSV_PRESETS: tuple[str, ...] = ("veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow")
+X265_PRESETS: tuple[str, ...] = ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium",
+                                 "slow", "slower", "veryslow")
 
 # Our defaults when --preset isn't given: veryslow for hardware (paired with
 # look_ahead, this maximizes quality-per-bit on QSV — see build_ffmpeg_cmd) and slow
 # for software (a common sweet spot; veryslow's software gains are usually small
 # relative to the extra time — see xcodecpack.com's HEVC settings guide).
-DEFAULT_QSV_PRESET = "veryslow"
-DEFAULT_X265_PRESET = "slow"
+DEFAULT_QSV_PRESET: str = "veryslow"
+DEFAULT_X265_PRESET: str = "slow"
+
+# Per-preset accumulator shape used by the --diagnose sweep: preset name (or None for
+# the encoder default) -> stats. Values mix ints (byte counts, file counts) and floats
+# (seconds), so the value type is broad.
+type PresetStats = dict[str | None, dict[str, float]]
+
+# process_file's success/preview result:
+# (original_size, new_size, video_duration_seconds_or_None, action, downscaled,
+#  grew_larger, retried). action is "encoded" or "copied".
+type ProcessResult = tuple[int, int, float | None, str, bool, bool, bool]
+
+# One row of the --compare-crf table:
+# (crf, output_size_bytes_or_None, elapsed_seconds, error_or_None, skipped).
+type CrfRow = tuple[int, int | None, float, str | None, bool]
 
 
 def compute_timeout_seconds(src_size_bytes: int) -> float:
@@ -149,13 +164,14 @@ def relpath_for_matching(src: Path, input_folder: Path) -> str:
     return src.relative_to(input_folder).as_posix()
 
 
-def filter_files(files, input_folder: Path, include_re, exclude_re):
+def filter_files(files: list[Path], input_folder: Path,
+                 include_re: re.Pattern | None, exclude_re: re.Pattern | None) -> list[Path]:
     """Apply the compiled --include/--exclude patterns to a list of source paths and
     return the ones to keep. Each is matched (start-anchored, via re.match) against the
     file's path relative to input_folder in forward-slash form. A file is kept when it
     matches include (or include is None) AND does not match exclude; exclude wins any
     tie. include_re/exclude_re are compiled patterns (already case-insensitive) or None."""
-    kept = []
+    kept: list[Path] = []
     for src in files:
         rel = relpath_for_matching(src, input_folder)
         if include_re is not None and not include_re.match(rel):
@@ -166,7 +182,7 @@ def filter_files(files, input_folder: Path, include_re, exclude_re):
     return kept
 
 
-def build_parser():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Recursively re-encode .mp4/.mkv files to H.265 (hardware via Intel "
                     "Quick Sync by default; use --encoding=software for libx265). Files "
@@ -299,7 +315,7 @@ def build_parser():
     return parser
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     return build_parser().parse_args()
 
 
@@ -307,7 +323,7 @@ class ColorConsoleFormatter(logging.Formatter):
     """Colors WARNING messages yellow and ERROR/CRITICAL messages red when printed
     to the console. COLOR_WARNING/COLOR_ERROR/COLOR_RESET are empty strings when
     stderr isn't a real terminal, so redirected/piped output stays plain text."""
-    def format(self, record):
+    def format(self, record: logging.LogRecord) -> str:
         message = super().format(record)
         if record.levelno >= logging.ERROR:
             return f"{COLOR_ERROR}{message}{COLOR_RESET}"
@@ -350,7 +366,7 @@ def setup_logging(output_folder: Path, name_suffix: str = "") -> Path:
 COVER_ART_CODECS = {"mjpeg", "png", "bmp", "gif"}
 
 
-def probe_media(path: Path, timeout_seconds: float) -> dict:
+def probe_media(path: Path, timeout_seconds: float) -> dict[str, Any]:
     """Probe a media file with a single ffprobe call, returning:
       {
         "video": {"codec_name": str, "width": int, "height": int, "duration": float|None,
@@ -363,7 +379,7 @@ def probe_media(path: Path, timeout_seconds: float) -> dict:
     that precedes the real video stream isn't mistaken for it.
     Raises ConversionError if ffprobe fails or no real video stream is found, or
     ConversionTimeoutError if it doesn't finish within timeout_seconds."""
-    cmd = [
+    cmd: list[str] = [
         "ffprobe", "-v", "error",
         "-show_entries",
         "stream=codec_name,codec_type,width,height,disposition:stream_tags=language:format=duration",
@@ -379,10 +395,10 @@ def probe_media(path: Path, timeout_seconds: float) -> dict:
     except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as e:
         raise ConversionError(path, f"ffprobe failed: {e}")
 
-    video_candidates = []  # every non-cover-art video stream seen, in order, with its 0:v:i index
-    fallback_video_info = None  # first video stream at all, in case every one looks like cover art
-    audio_languages = []
-    subtitle_tracks = []
+    video_candidates: list[dict[str, Any]] = []  # every non-cover-art video stream seen, in order, with its 0:v:i index
+    fallback_video_info: dict[str, Any] | None = None  # first video stream at all, in case every one looks like cover art
+    audio_languages: list[str | None] = []
+    subtitle_tracks: list[tuple[str | None, str]] = []
     video_stream_count = 0
 
     for s in data.get("streams", []):
@@ -435,12 +451,12 @@ def probe_media(path: Path, timeout_seconds: float) -> dict:
     }
 
 
-def probe_duration(path: Path, timeout_seconds: float) -> float:
+def probe_duration(path: Path, timeout_seconds: float) -> float | None:
     """Return the duration (seconds) of a media file via a lightweight ffprobe call, or
     None if duration could not be determined. Raises ConversionError if ffprobe itself
     fails to read the file (a strong signal of a corrupt/incomplete output), or
     ConversionTimeoutError if it doesn't finish within timeout_seconds."""
-    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)]
+    cmd: list[str] = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True,
                                  timeout=timeout_seconds)
@@ -458,7 +474,7 @@ def probe_duration(path: Path, timeout_seconds: float) -> float:
 
 
 def measure_loudness(src: Path, duration: float, loudnorm_target: float,
-                      audio_stream_index: int) -> dict:
+                      audio_stream_index: int) -> dict[str, Any]:
     """Runs loudnorm's analysis pass (decode + filter, no output file written) against
     the given audio stream to measure its actual loudness stats, for feeding into a
     second, exact pass of EBU R128 normalization. Returns the parsed stats dict
@@ -467,7 +483,7 @@ def measure_loudness(src: Path, duration: float, loudnorm_target: float,
     so callers can fall back to one-pass normalization for this file. No timeout is
     applied: a full decode pass on a large file can legitimately run a long time, and
     a wall-clock cap produced false positives on slow-but-healthy work."""
-    cmd = ["ffmpeg", "-i", str(src)]
+    cmd: list[str] = ["ffmpeg", "-i", str(src)]
     if duration != -1:
         cmd += ["-t", str(duration)]
     cmd += [
@@ -492,7 +508,7 @@ def measure_loudness(src: Path, duration: float, loudnorm_target: float,
         raise ConversionError(src, f"could not parse loudness measurement stats: {e}")
 
 
-def human_size(num_bytes: int) -> str:
+def human_size(num_bytes: float) -> str:
     size = float(num_bytes)
     for unit in ("B", "KB", "MB", "GB"):
         if size < 1024:
@@ -530,7 +546,7 @@ def human_duration(seconds: float, include_seconds: bool = False) -> str:
     return f"{minutes}m"
 
 
-def measure_read_speed(path: Path, chunk_size: int = 8 * 1024 * 1024) -> tuple:
+def measure_read_speed(path: Path, chunk_size: int = 8 * 1024 * 1024) -> tuple[float, int]:
     """Sequentially read the whole file from disk, timed, and discard the bytes.
     Returns (elapsed_seconds, bytes_read). Two purposes: (1) measure the disk's
     delivered read throughput for this file, and (2) warm the OS page cache so an
@@ -540,7 +556,7 @@ def measure_read_speed(path: Path, chunk_size: int = 8 * 1024 * 1024) -> tuple:
     the comparison stays self-consistent (a file that won't cache is exactly one that
     stays I/O bound in production), just less cleanly separated."""
     start = time.monotonic()
-    total = 0
+    total: int = 0
     with open(path, "rb") as f:
         while True:
             chunk = f.read(chunk_size)
@@ -556,7 +572,7 @@ def mbps_to_gb_per_day(mbps: float) -> float:
     return mbps * 86400 / 1024
 
 
-def format_throughput(bytes_moved: int, seconds: float) -> str:
+def format_throughput(bytes_moved: float, seconds: float) -> str:
     """A 'X.X MB/s (Y GB/day)' string for a byte count moved over a wall-clock span."""
     if seconds <= 0:
         return "n/a"
@@ -564,8 +580,9 @@ def format_throughput(bytes_moved: int, seconds: float) -> str:
     return f"{mbps:.1f} MB/s ({mbps_to_gb_per_day(mbps):.0f} GB/day)"
 
 
-def build_preset_comparison_table(preset_stats: dict, presets_order: tuple,
-                                   total_size_bytes: int) -> list:
+def build_preset_comparison_table(preset_stats: PresetStats,
+                                   presets_order: tuple[str | None, ...],
+                                   total_size_bytes: int) -> list[str]:
     """Render a fixed-width table comparing each tested preset, one row per preset, in
     the given order. preset_stats maps preset name -> dict with keys enc_seconds,
     enc_bytes (source bytes encoded), new_bytes (output bytes), video_seconds, files.
@@ -573,10 +590,10 @@ def build_preset_comparison_table(preset_stats: dict, presets_order: tuple,
     preset from that preset's measured encode speed. Returns a list of text lines.
     Presets with no successfully-encoded files are shown with '-' placeholders so the
     row still appears (useful to see which presets errored out)."""
-    header = (f"{'preset':<10} {'enc MB/s':>9} {'GB/day':>8} {'realtime':>9} "
-              f"{'smaller':>8} {'ratio':>6} {'proj. full job':>16}")
-    sep = "-" * len(header)
-    lines = [header, sep]
+    header: str = (f"{'preset':<10} {'enc MB/s':>9} {'GB/day':>8} {'realtime':>9} "
+                   f"{'smaller':>8} {'ratio':>6} {'proj. full job':>16}")
+    sep: str = "-" * len(header)
+    lines: list[str] = [header, sep]
     for preset in presets_order:
         s = preset_stats.get(preset)
         if not s or s["files"] == 0 or s["enc_seconds"] <= 0:
@@ -599,7 +616,8 @@ def build_preset_comparison_table(preset_stats: dict, presets_order: tuple,
     return lines
 
 
-def diagnose_encode_one(src, dst, preset, read_seconds, read_bytes, args):
+def diagnose_encode_one(src: Path, dst: Path, preset: str | None, read_seconds: float,
+                         read_bytes: int, args: argparse.Namespace) -> dict[str, float] | None:
     """Encode a single file under a single preset for diagnostics, with the OS cache
     assumed already warmed by a prior read of src. Returns a dict of this encode's
     stats (enc_seconds, orig_bytes, new_bytes, video_seconds) on success, or None if
@@ -609,10 +627,11 @@ def diagnose_encode_one(src, dst, preset, read_seconds, read_bytes, args):
     encode-and-measure of one (file, preset) pair."""
     call_start = time.monotonic()
     try:
-        result = process_file(src, dst, args.crf, args.duration, args.min_size_mb,
-                               False, args.dry_run, args.encoding,
-                               args.normalize_audio, args.loudnorm_target, args.downscale,
-                               args.strip_no_english_audio, preset)
+        result: ProcessResult | None = process_file(
+            src, dst, args.crf, args.duration, args.min_size_mb,
+            False, args.dry_run, args.encoding,
+            args.normalize_audio, args.loudnorm_target, args.downscale,
+            args.strip_no_english_audio, preset)
     except ConversionError as e:
         logging.error(f"CONVERSION FAILED (preset {preset}): {e.file.resolve()}\n{e.reason}")
         return None
@@ -626,7 +645,7 @@ def diagnose_encode_one(src, dst, preset, read_seconds, read_bytes, args):
         # failed attempt) — not a clean encode-speed sample.
         return None
 
-    label = preset if preset is not None else "default"
+    label: str = preset if preset is not None else "default"
     read_mbps = read_bytes / (1024 * 1024) / read_seconds if read_seconds > 0 else 0
     enc_mbps = orig_size / (1024 * 1024) / call_elapsed if call_elapsed > 0 else 0
     pct_smaller = (1 - new_size / orig_size) * 100 if orig_size > 0 else 0
@@ -643,7 +662,8 @@ def diagnose_encode_one(src, dst, preset, read_seconds, read_bytes, args):
             "video_seconds": video_duration or 0.0}
 
 
-def diagnose_tagged_dst(src, input_base, output_folder, preset, encoding, crf):
+def diagnose_tagged_dst(src: Path, input_base: Path, output_folder: Path,
+                         preset: str | None, encoding: str, crf: int) -> Path:
     """The name-tagged output path for a diagnostic encode of src under a given preset,
     landing flat-relative to input_base in output_folder as '<stem>_<preset>_crf<crf>'.
     Uses the effective preset name (resolving None to the encoder default) so default
@@ -655,7 +675,7 @@ def diagnose_tagged_dst(src, input_base, output_folder, preset, encoding, crf):
     return dst.with_name(f"{dst.stem}_{effective_preset}_crf{crf}{dst.suffix}")
 
 
-def format_cmd_for_log(cmd: list) -> str:
+def format_cmd_for_log(cmd: list[str]) -> str:
     """Join a subprocess argv list into a loggable command string, wrapping file/
     folder path arguments — the input path after -i, and a real output path at
     the end — in double quotes, so paths containing spaces are unambiguous when
@@ -663,7 +683,7 @@ def format_cmd_for_log(cmd: list) -> str:
     Flags and their non-path values are left unquoted. The trailing "-" ffmpeg
     uses for a null/pipe output (as in the loudness measurement pass) is left
     unquoted too, since it isn't actually a path."""
-    parts = []
+    parts: list[str] = []
     for i, token in enumerate(cmd):
         is_input_path = i > 0 and cmd[i - 1] == "-i"
         is_output_path = (i == len(cmd) - 1) and token not in ("-", "pipe:", "pipe:1")
@@ -676,10 +696,13 @@ def format_cmd_for_log(cmd: list) -> str:
 
 def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_downscale: bool,
                       encoding: str = "software", normalize_audio: bool = True,
-                      loudnorm_target: float = -16, audio_stream_indices: list = None,
-                      subtitle_stream_indices: list = None, video_stream_index: int = 0,
-                      measured_loudness: dict = None, preset: str = None) -> list:
-    cmd = ["ffmpeg", "-y", "-i", str(src)]
+                      loudnorm_target: float = -16,
+                      audio_stream_indices: list[int] | None = None,
+                      subtitle_stream_indices: list[int] | None = None,
+                      video_stream_index: int = 0,
+                      measured_loudness: dict[str, Any] | None = None,
+                      preset: str | None = None) -> list[str]:
+    cmd: list[str] = ["ffmpeg", "-y", "-i", str(src)]
 
     if duration != -1:
         cmd += ["-t", str(duration)]
@@ -771,7 +794,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                   same_location: bool, dry_run: bool = False, encoding: str = "software",
                   normalize_audio: bool = True, loudnorm_target: float = -16,
                   downscale: bool = False, strip_non_english_audio: bool = False,
-                  preset: str = None):
+                  preset: str | None = None) -> ProcessResult | None:
     """Returns (original_size, new_size, video_duration_seconds, action, downscaled,
     grew_larger, retried) on success or dry-run preview, or None only when the caller
     already decided to skip the file entirely before calling this (not used internally
@@ -1069,8 +1092,9 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
              attempt > 1)
 
 
-def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duration: float,
-                        encoding: str, downscale: bool, preset: str = None) -> tuple:
+def run_crf_comparison(src: Path, output_folder: Path, crf_values: list[int], duration: float,
+                        encoding: str, downscale: bool,
+                        preset: str | None = None) -> tuple[int, list[CrfRow]]:
     """Comparison mode for a single source file: test-encodes src once per CRF value in
     crf_values, all other settings held fixed (audio normalization off, all audio/
     subtitle tracks kept), and prints/logs a size + encode-time table so the effect
@@ -1139,7 +1163,7 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
     keep_audio_indices = list(range(len(media["audio_languages"])))
     keep_subtitle_indices = list(range(len(media["subtitle_tracks"])))
 
-    rows = []  # (crf, size_bytes_or_None, elapsed_seconds, error_or_None, skipped)
+    rows: list[CrfRow] = []  # (crf, size_bytes_or_None, elapsed_seconds, error_or_None, skipped)
     for crf in crf_values:
         dst = output_folder / f"{src.stem}_crf{crf}_{encoding}{src.suffix}"
 
@@ -1172,6 +1196,7 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
             lines.append(f"{crf:>5}  {err:>10}  {'--':>13}  "
                          f"{human_duration(elapsed, include_seconds=True):>8}")
         else:
+            assert size is not None  # a non-error row always carries a size
             pct = f"{(src_size - size) / src_size * 100:.1f}%" if src_size else "--"
             time_col = "existing" if skipped else human_duration(elapsed, include_seconds=True)
             lines.append(f"{crf:>5}  {human_size(size):>10}  {pct:>13}  {time_col:>8}")
@@ -1187,7 +1212,8 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list, duratio
     return (src_size, rows)
 
 
-def print_crf_aggregate_summary(aggregate: dict, crf_values: list, files_compared: int) -> None:
+def print_crf_aggregate_summary(aggregate: dict[int, dict[str, float]],
+                                 crf_values: list[int], files_compared: int) -> None:
     """Prints/logs one summary table folding every file's CRF comparison together, so
     the best CRF for a whole batch of varied content is easy to read off in one place
     rather than eyeballing each file's individual table. aggregate maps crf -> {orig,
@@ -1197,12 +1223,12 @@ def print_crf_aggregate_summary(aggregate: dict, crf_values: list, files_compare
     file's elapsed=0 doesn't drag the average down. failed/timed-out attempts are
     reported as a count, not folded into the size/time totals, since they contributed
     no size or a meaningless partial time."""
-    header = f"\nAggregate CRF comparison across {files_compared} file(s):"
+    header: str = f"\nAggregate CRF comparison across {files_compared} file(s):"
     print(header)
     logging.info(header.strip())
 
-    lines = [f"{'CRF':>5}  {'Files OK':>8}  {'Total Size':>11}  "
-             f"{'% Reduction':>13}  {'Avg Time':>9}"]
+    lines: list[str] = [f"{'CRF':>5}  {'Files OK':>8}  {'Total Size':>11}  "
+                        f"{'% Reduction':>13}  {'Avg Time':>9}"]
     for crf in crf_values:
         stats = aggregate[crf]
         files_str = f"{stats['ok']}/{files_compared}"
@@ -1229,10 +1255,10 @@ def print_crf_aggregate_summary(aggregate: dict, crf_values: list, files_compare
         logging.info(note)
 
 
-def main():
+def main() -> None:
     args = parse_args()
 
-    video_extensions = ("*.mp4", "*.MP4", "*.mkv", "*.MKV")
+    video_extensions: tuple[str, ...] = ("*.mp4", "*.MP4", "*.mkv", "*.MKV")
 
     # -i may name either a folder (recurse into it, as usual) or a single video file.
     # If a name is somehow BOTH a directory and a file on disk, the directory wins
@@ -1240,6 +1266,8 @@ def main():
     # relative to: the input folder itself for a folder run, or the file's parent for
     # a single-file run (so its output lands flat in the output folder, no structure to
     # mirror).
+    input_base: Path
+    mp4_files: list[Path]
     if args.input_folder.is_dir():
         input_base = args.input_folder
         mp4_files = sorted(set().union(*(input_base.rglob(pat) for pat in video_extensions)))
@@ -1267,7 +1295,8 @@ def main():
                   f"{', '.join(valid_presets)}.", file=sys.stderr)
             sys.exit(1)
 
-    include_re = exclude_re = None
+    include_re: re.Pattern | None = None
+    exclude_re: re.Pattern | None = None
     try:
         if args.include is not None:
             include_re = re.compile(args.include, re.IGNORECASE)
@@ -1296,7 +1325,7 @@ def main():
               "files are never overwritten with a partial encode.", file=sys.stderr)
         sys.exit(1)
 
-    crf_values = None
+    crf_values: list[int] | None = None
     if args.compare_crf is not None:
         if args.output_folder is None:
             print("Error: -o/--output is required when --compare-crf is set.",
@@ -1388,8 +1417,9 @@ def main():
         # fails or times out on a file still gets counted in "failed" for that CRF.
         # "timed_ok" tracks only freshly-encoded successes (not reused existing output),
         # so a skipped-existing file's elapsed=0 doesn't drag down the avg-time column.
-        aggregate = {crf: {"orig": 0, "new": 0, "time": 0.0, "ok": 0, "failed": 0, "timed_ok": 0}
-                     for crf in crf_values}
+        aggregate: dict[int, dict[str, float]] = {
+            crf: {"orig": 0, "new": 0, "time": 0.0, "ok": 0, "failed": 0, "timed_ok": 0}
+            for crf in crf_values}
         files_compared = 0
         total_files = len(mp4_files)
         for index, src in enumerate(mp4_files, start=1):
@@ -1410,6 +1440,7 @@ def main():
             files_compared += 1
             for crf, size, elapsed, err, skipped in rows:
                 if err is None:
+                    assert size is not None  # a non-error row always carries a size
                     aggregate[crf]["orig"] += src_size
                     aggregate[crf]["new"] += size
                     aggregate[crf]["ok"] += 1
@@ -1453,10 +1484,10 @@ def main():
 
     logging.info(f"Found {len(mp4_files)} .mp4/.mkv file(s) to process.")
 
-    total_orig = 0
-    total_new = 0
+    total_orig: float = 0
+    total_new: float = 0
     total_duration_seconds = 0.0
-    failed_files = []
+    failed_files: list[Path] = []
     skipped_existing = 0
     encoded_count = 0
     copied_count = 0
@@ -1469,8 +1500,8 @@ def main():
     diag_read_seconds = 0.0
     diag_read_bytes = 0
     diag_encode_seconds = 0.0
-    diag_encode_bytes = 0
-    diag_encode_new_bytes = 0
+    diag_encode_bytes: float = 0
+    diag_encode_new_bytes: float = 0
     diag_video_seconds = 0.0
 
     # When --diagnose is set WITHOUT an explicit --preset, sweep every preset for the
@@ -1478,16 +1509,17 @@ def main():
     # runs (the explicit one, or the encoder default via None). diag_sweep flags the
     # multi-preset case, which produces the comparison table instead of the single
     # bottleneck block. preset_stats accumulates per-preset numbers for the table.
+    presets_to_test: list[str | None]
     if args.diagnose and args.preset is None:
         presets_to_test = list(QSV_PRESETS if args.encoding == "hardware" else X265_PRESETS)
         diag_sweep = True
     else:
         presets_to_test = [args.preset]
         diag_sweep = False
-    preset_stats = {p: {"enc_seconds": 0.0, "enc_bytes": 0, "new_bytes": 0,
-                        "video_seconds": 0.0, "files": 0} for p in presets_to_test}
+    preset_stats: PresetStats = {p: {"enc_seconds": 0.0, "enc_bytes": 0, "new_bytes": 0,
+                                     "video_seconds": 0.0, "files": 0} for p in presets_to_test}
 
-    limit_bytes = float("inf") if args.limit == -1 else args.limit * 1024 ** 3
+    limit_bytes: float = float("inf") if args.limit == -1 else args.limit * 1024 ** 3
     limit_reached = False
 
     total_files = len(mp4_files)
