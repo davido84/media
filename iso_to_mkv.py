@@ -176,7 +176,9 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        .mkv file actually appeared/changed in the output directory for
        each extracted title - a 0-exit-code from makemkvcon is treated as
        necessary but not sufficient. See MIN_OUTPUT_FILE_BYTES.
-     - A pre-flight check confirms makemkvcon can be found on PATH
+     - A pre-flight check confirms makemkvcon64.exe (the 64-bit MakeMKV
+       CLI, required deliberately over the memory-limited 32-bit build)
+       can be found on PATH
        before any files are touched. Beyond that, if
        --max-consecutive-failures (default 3) ISOs in a row fail at the
        initial title-info scan, the whole run stops early rather than
@@ -445,12 +447,20 @@ def classify_disc(iso_path: Path, max_dvd_bytes: float, override: str | None) ->
 
 
 def preflight_check_makemkvcon() -> str | None:
-    """Confirm makemkvcon can actually be found on PATH before processing
-    any files, so a missing install fails fast with one clear message
-    instead of every ISO in the batch failing individually with the same
-    root cause (safety enhancement 2)."""
-    if shutil.which("makemkvcon") is None:
-        return "makemkvcon not found on PATH - install MakeMKV and ensure makemkvcon is in your PATH"
+    """Confirm makemkvcon64.exe (the 64-bit MakeMKV CLI) can be found on
+    PATH before processing any files, so a missing install fails fast with
+    one clear message instead of every ISO in the batch failing
+    individually with the same root cause (safety enhancement 2). The
+    64-bit binary is required deliberately: the 32-bit makemkvcon.exe is
+    memory-limited and can choke on large Blu-ray/UHD discs, so this script
+    will not silently fall back to it."""
+    if shutil.which("makemkvcon64.exe") is None:
+        return (
+            "makemkvcon64.exe (the 64-bit MakeMKV CLI) was not found on PATH. This script "
+            "requires the 64-bit binary specifically - it will not use the 32-bit makemkvcon.exe. "
+            "Install MakeMKV and add its folder (typically C:\\Program Files (x86)\\MakeMKV) to "
+            "your PATH, or copy makemkvcon64.exe somewhere already on PATH."
+        )
     return None
 
 
@@ -890,7 +900,7 @@ def get_disc_titles(
     could not find a JRE to use - a much stronger signal than jre_engaged
     simply being False, which is also true for every disc that never
     needed Java at all."""
-    cmd: list[str] = ["makemkvcon", "-r", "--cache=1", "info", f"iso:{iso_path}"]
+    cmd: list[str] = ["makemkvcon64.exe", "-r", "--cache=1", "info", f"iso:{iso_path}"]
     logger.file_only("CMD", " ".join(cmd), iso_path)
     rc, output = run_cmd(cmd)
     titles: dict[int, Title] = {}
@@ -1282,9 +1292,7 @@ def process_iso(
         candidates = [tid for tid, t in titles.items() if t.duration_sec >= min_length_sec]
 
     else:
-        if jre_engaged:
-            logger.info("MakeMKV engaged the Java runtime for BD-Java main-feature analysis", iso_path)
-        elif jre_required_missing:
+        if jre_required_missing:
             logger.warning(
                 "This disc requires a Java runtime (JRE) for BD-Java processing (fake-playlist "
                 "protection, a BD+ handshake, or Soft-KCD), but MakeMKV could not find one - "
@@ -1345,10 +1353,13 @@ def process_iso(
 
         else:
             # --- Signal 2 (fallback): duration-clustering heuristic ---
-            logger.info(
-                "MakeMKV did not identify a main title via (FPL_MainFeature) for this disc",
-                iso_path,
-            )
+            # No "did not identify a main title" line is logged here on
+            # purpose: on many discs MakeMKV never emits an (FPL_MainFeature)
+            # marker, so logging its absence every time is pure noise. The
+            # positive case is logged above ("...identified title N as
+            # (FPL_MainFeature)"); anything genuinely actionable on this
+            # fallback path (obfuscation, ambiguity) still logs its own
+            # warning below.
             candidates = [tid for tid, t in titles.items() if t.duration_sec >= min_length_sec]
 
             if suspected:
@@ -1475,7 +1486,7 @@ def process_iso(
         # filtering (makemkvcon has no CLI mechanism for it at all, and a
         # prior mkvmerge-based workaround was deliberately removed in
         # favor of leaving track curation to a later encoding pass).
-        cmd = ["makemkvcon", "-r", "--cache=1", "mkv", f"iso:{iso_path}", str(tid), str(out_dir)]
+        cmd = ["makemkvcon64.exe", "-r", "--cache=1", "mkv", f"iso:{iso_path}", str(tid), str(out_dir)]
 
         if args.dry_run:
             logger.info(f"[DRY RUN] Would run: {' '.join(cmd)}", iso_path)
@@ -1932,7 +1943,7 @@ def main() -> int:
     preflight_error = preflight_check_makemkvcon()
     if preflight_error:
         logger.error(preflight_error)
-        logger.error("Aborting before processing any files - ensure makemkvcon is in your PATH")
+        logger.error("Aborting before processing any files - ensure makemkvcon64.exe is in your PATH")
         logger.close()
         return 1
 
