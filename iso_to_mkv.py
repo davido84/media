@@ -203,14 +203,42 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        only if that manifest exists AND matches this exact ISO, this
        exact candidate-title selection, and these exact settings, AND
        every recorded output file is still present and still looks like
-       real output. This is deliberately stricter than just counting
-       .mkv files in the folder: a folder that happens to hold the
-       "right number" of files from a *different* configuration (a
-       looser --min-length, a forced --disc-type, etc.) is no longer
-       mistaken for a completed run of the current one - it's logged
-       and redone instead. This is whole-ISO granularity only - an
-       interrupted multi-title disc is safely redone in full rather
-       than partially resumed. Force a redo with -f/--force.
+       real output. The source-ISO match is size plus mtime (never a
+       content hash - hashing a multi-GB image every run would be far too
+       slow), and the mtime comparison allows a couple of seconds of
+       slack rather than requiring bit-exact equality, so filesystem
+       timestamp jitter (exFAT/FAT's 2s granularity, network-share or
+       backup/restore rounding) can't spuriously force a huge disc to be
+       re-converted while still catching a genuinely replaced source. When
+       a manifest exists but doesn't match, the specific reason is logged
+       (size changed, mtime changed, title set changed, a setting changed,
+       an output file missing) so an unexpected re-conversion is easy to
+       diagnose. Note --limit is deliberately NOT part of the match, so
+       the common "convert up to a byte budget, then re-run to continue"
+       workflow reliably skips everything already done. This is
+       deliberately stricter than just counting .mkv files in the folder:
+       a folder that happens to hold the "right number" of files from a
+       *different* configuration (a looser --min-length, a forced
+       --disc-type, etc.) is no longer mistaken for a completed run of the
+       current one - it's logged and redone instead. This is whole-ISO
+       granularity only - an interrupted multi-title disc is safely redone
+       in full rather than partially resumed. Force a redo with
+       -f/--force.
+     - Idempotent re-extraction: whenever an ISO is (re)extracted rather
+       than resume-skipped (no matching manifest, or --force), the output
+       folder is first cleared of that ISO's previous output (its .mkv
+       files and the resume manifest) so the conversion starts from a
+       clean slate. makemkvcon writes each title under its own
+       disc-label-derived name (e.g. MovieTitle_t00.mkv) which this script
+       then renames to the standardized title_NN.mkv / main_title.mkv;
+       without the pre-clear, re-extracting into a folder that still held
+       the previous run's title_NN.mkv hit the rename's collision guard
+       and left MakeMKV's raw name in place, so identical input could
+       yield title_NN.mkv on one run and MovieTitle_t00.mkv on the next
+       (plus an orphaned stale file). Clearing first makes output naming
+       deterministic. Only this script's own artifacts are removed;
+       anything else in the folder (hand-added cover art, external
+       subtitles, etc.) is left untouched.
      - Runaway-output failsafe: the running total size of everything
        extracted from an ISO so far is checked after each title. If it
        ever exceeds the input ISO's own size - which should never
@@ -362,10 +390,23 @@ MIN_OUTPUT_FILE_BYTES: int = 1_000_000  # 1 MB
 
 # Per-output-folder manifest written on a successful conversion, used by
 # resume support (workflow enhancement 4) instead of a plain .mkv file
-# *count* comparison - see selection_fingerprint()/manifest_matches() for
-# why a count alone can't tell "same titles, already done" apart from "a
+# *count* comparison - see selection_fingerprint()/manifest_mismatch_reason()
+# for why a count alone can't tell "same titles, already done" apart from "a
 # different run left a coincidentally-equal number of files here".
 MANIFEST_FILENAME: str = ".iso_to_mkv_manifest.json"
+
+# Tolerance (seconds) for comparing a stored source-ISO mtime against a
+# freshly stat'd one during the resume check. Exact float equality is too
+# brittle: mtime precision is not stable across filesystems (exFAT/FAT round
+# to 2s, some network shares and backup/restore round-trips drop sub-second
+# precision), so an unchanged ISO can stat a hair different between the run
+# that wrote the manifest and a later run that reads it - which, under exact
+# equality, would needlessly re-convert a multi-GB disc that was already
+# done. A couple of seconds absorbs that jitter while still catching a
+# genuine re-authoring of the source (which moves mtime by far more). This
+# mirrors the same-purpose tolerance already used when stamping output
+# files with the source date.
+MTIME_MATCH_TOLERANCE_SEC: float = 2.0
 
 
 # --------------------------------------------------------------------------
@@ -477,6 +518,55 @@ def snapshot_output_dir(out_dir: Path) -> dict[str, int]:
     return {p.name: p.stat().st_size for p in out_dir.iterdir() if p.is_file()}
 
 
+def clear_previous_outputs(out_dir: Path, logger: "DualLogger", stats: "Stats") -> None:
+    """Remove a previous run's output artifacts (every .mkv plus the resume
+    manifest) from out_dir before re-extracting into it, so each conversion
+    starts from a clean slate.
+
+    Why this is needed: makemkvcon always writes its output under its own
+    disc-label-derived name (e.g. MovieTitle_t00.mkv), which this script then
+    renames to the standardized title_NN.mkv / main_title.mkv. That rename
+    has a collision guard that keeps MakeMKV's raw name if the target already
+    exists. When an ISO is re-extracted into a folder that still holds the
+    previous run's title_NN.mkv (resume didn't skip it - no matching
+    manifest, or --force), that guard would fire on the ISO's OWN prior
+    output, leaving the movie-named file plus an orphaned stale one - i.e.
+    identical input producing title_NN.mkv one run and MovieTitle_t00.mkv the
+    next. Clearing first makes the whole operation idempotent.
+
+    Scoped deliberately to this script's own artifacts (*.mkv and the
+    manifest), not a blanket wipe, so anything the user added to the folder
+    by hand (cover art, external subtitles, notes) is left untouched. The
+    manifest is removed too: once its .mkv files are gone it describes state
+    that no longer exists, and leaving it could let a later run 'resume-skip'
+    against files this one deleted.
+
+    A file we can't delete would let the collision bug recur, so a removal
+    failure is treated as a hard error (which, with fail-fast, aborts the
+    run) rather than being swallowed."""
+    if not out_dir.is_dir():
+        return
+    stale = [
+        p for p in out_dir.iterdir()
+        if p.is_file() and (p.suffix.lower() == ".mkv" or p.name == MANIFEST_FILENAME)
+    ]
+    if not stale:
+        return
+    logger.info(
+        f"Re-extracting into a folder with {len(stale)} file(s) from a previous run - "
+        f"clearing them first for a clean, idempotent conversion: "
+        f"{', '.join(sorted(p.name for p in stale))}"
+    )
+    for p in stale:
+        try:
+            p.unlink()
+        except OSError as e:
+            # logger.error() is fail-fast: this aborts the run. Leaving a
+            # stale title_NN.mkv in place would reproduce the exact naming
+            # inconsistency this clearing exists to prevent.
+            logger.error(f"Could not remove previous output file {p} before re-extracting: {e}")
+
+
 def selection_fingerprint(args: argparse.Namespace) -> dict[str, Any]:
     """Every argument that can change which titles get picked as candidates
     for a given ISO (independent of the ISO's own content). Used to
@@ -561,9 +651,11 @@ def stamp_outputs_with_source_date(
         try:
             if not p.is_file():
                 continue
-            # 2s tolerance absorbs FAT/exFAT's 2-second mtime granularity
-            # so matching files aren't needlessly re-stamped on every run.
-            if abs(p.stat().st_mtime - src_stat.st_mtime) > 2:
+            # A tolerance (MTIME_MATCH_TOLERANCE_SEC) absorbs FAT/exFAT's
+            # 2-second mtime granularity so matching files aren't needlessly
+            # re-stamped on every run - the same jitter the resume check
+            # tolerates when matching the source ISO's mtime.
+            if abs(p.stat().st_mtime - src_stat.st_mtime) > MTIME_MATCH_TOLERANCE_SEC:
                 to_set.append(p)
         except OSError:
             to_set.append(p)  # can't compare - attempt the set anyway
@@ -589,11 +681,21 @@ def write_manifest(
     candidate_tids: list[int],
     output_filenames: list[str],
     args: argparse.Namespace,
+    logger: "DualLogger",
+    stats: "Stats",
 ) -> None:
     """Record exactly what this run extracted, and under what selection
     settings, so a future run can tell whether an existing output folder
     really is "this ISO, fully converted with today's settings" rather
-    than just "the right number of .mkv files happen to be sitting here"."""
+    than just "the right number of .mkv files happen to be sitting here".
+
+    A failure to write this is warned about rather than silently ignored:
+    the conversion itself succeeded (so aborting the run would be wrong),
+    but without the manifest a later run can't resume-skip this ISO and
+    will re-convert it - exactly the reliability problem the "--limit then
+    re-run" workflow depends on avoiding. Surfacing it lets the user notice
+    a persistent cause (e.g. a read-only output tree) instead of silently
+    redoing hours of work every run."""
     stat: os.stat_result = iso_path.stat()
     manifest: dict[str, Any] = {
         "iso_size": stat.st_size,
@@ -604,48 +706,75 @@ def write_manifest(
     }
     try:
         (out_dir / MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    except OSError:
-        pass  # best-effort only - worst case, a future run just won't be able to resume this one
+    except OSError as e:
+        logger.warning(
+            f"Conversion succeeded but the resume manifest couldn't be written "
+            f"({out_dir / MANIFEST_FILENAME}: {e}). This ISO will be re-converted instead of "
+            f"skipped on the next run - check that the output folder is writable.",
+            iso_path,
+        )
+        stats.warnings += 1
 
 
-def manifest_matches(
+def manifest_mismatch_reason(
     manifest: dict[str, Any] | None,
     iso_path: Path,
     candidate_tids: list[int],
     out_dir: Path,
     args: argparse.Namespace,
-) -> bool:
-    """True only if a previous run's manifest describes exactly this ISO
-    (by size + mtime), exactly this candidate title selection, exactly
-    this run's selection-relevant settings, AND every file it recorded is
-    still present and still looks like real output (not truncated/deleted
-    since). This replaces the old "count the .mkv files, compare to the
-    number of candidates" check, which couldn't distinguish a genuinely
-    completed run from a differently-configured previous run (or leftover
-    files from something else entirely) that happened to leave behind the
-    same number of files."""
+) -> str | None:
+    """Decide whether a previous run's manifest lets us safely resume-skip
+    this ISO. Returns None when it's a clean match (skip is safe); otherwise
+    a short human-readable reason it doesn't match, so the caller can log
+    *why* an ISO is being re-converted instead of skipped - which matters a
+    lot for the "--limit, then re-run" workflow, where an ISO silently
+    failing to skip is the difference between resuming and redoing hours of
+    work.
+
+    A clean match means the manifest describes exactly this ISO (by size and
+    - within a tolerance - mtime), exactly this candidate title selection,
+    exactly this run's selection-relevant settings, AND every file it
+    recorded is still present and still looks like real output. This is
+    deliberately identity-by-metadata (size + mtime), never a content hash:
+    hashing a multi-GB ISO on every run would be ruinously slow and
+    disk-bound, defeating the point of a fast resume check."""
     if manifest is None:
-        return False
+        return "no manifest from a previous run"
     try:
         stat = iso_path.stat()
-    except OSError:
-        return False
-    if manifest.get("iso_size") != stat.st_size:
-        return False
-    if manifest.get("iso_mtime") != stat.st_mtime:
-        return False
+    except OSError as e:
+        return f"could not read the source ISO to compare against the manifest ({e})"
+
+    recorded_size = manifest.get("iso_size")
+    if recorded_size != stat.st_size:
+        return f"source ISO size changed since conversion ({recorded_size} -> {stat.st_size} bytes)"
+
+    # Tolerant mtime comparison - see MTIME_MATCH_TOLERANCE_SEC for why exact
+    # float equality was too brittle to rely on for skipping.
+    recorded_mtime = manifest.get("iso_mtime")
+    if not isinstance(recorded_mtime, (int, float)):
+        return "manifest is missing a usable source modification time"
+    if abs(float(recorded_mtime) - stat.st_mtime) > MTIME_MATCH_TOLERANCE_SEC:
+        return "source ISO modification time changed since conversion (the file looks replaced/re-authored)"
+
     if manifest.get("candidate_title_ids") != sorted(candidate_tids):
-        return False
+        return (
+            "the set of selected titles differs from last time (e.g. --min-length or --disc-type "
+            "changed, or the disc now scans to a different title set)"
+        )
     if manifest.get("selection_fingerprint") != selection_fingerprint(args):
-        return False
+        return "a title-selection setting changed since the last run"
+
     for name in manifest.get("output_filenames", []):
         p = out_dir / name
         try:
-            if not p.is_file() or p.stat().st_size < MIN_OUTPUT_FILE_BYTES:
-                return False
-        except OSError:
-            return False
-    return True
+            if not p.is_file():
+                return f"a recorded output file is missing ({name})"
+            if p.stat().st_size < MIN_OUTPUT_FILE_BYTES:
+                return f"a recorded output file looks truncated ({name})"
+        except OSError as e:
+            return f"a recorded output file couldn't be verified ({name}: {e})"
+    return None
 
 
 def resolve_probe_tool() -> str | None:
@@ -1458,11 +1587,14 @@ def process_iso(
 
     # Resume check happens here, once we know exactly which titles we'd
     # extract - compared against a previous run's manifest (see
-    # manifest_matches docstring for why this is more reliable than the
+    # manifest_mismatch_reason() for why this is more reliable than the
     # old "count the .mkv files" approach: it checks the ISO itself, the
     # exact set of title IDs, and every selection-relevant argument, not
     # just a number that could match by coincidence).
-    if manifest_matches(previous_manifest, iso_path, candidates, natural_out_dir, args):
+    resume_mismatch = manifest_mismatch_reason(
+        previous_manifest, iso_path, candidates, natural_out_dir, args
+    )
+    if resume_mismatch is None:
         logger.info(
             f"{natural_out_dir} already has a matching completed conversion for this exact "
             f"title selection and these settings - skipping. Use --force to redo.",
@@ -1479,10 +1611,13 @@ def process_iso(
         stats.already_converted_skipped += 1
         return ProcessResult(skipped_already_done=True)
     elif previous_manifest is not None:
+        # A manifest existed but didn't clear the resume check. Log the
+        # specific reason (not a vague list of possibilities), so an
+        # unexpected re-conversion during a "--limit then re-run" workflow
+        # is diagnosable at a glance rather than a mystery.
         logger.warning(
-            f"{natural_out_dir} has a previous-run manifest, but it doesn't match this ISO, "
-            f"title selection, or settings (e.g. --min-length/--disc-type changed since, or "
-            f"output files went missing) - redoing rather than trusting stale output",
+            f"{natural_out_dir} has a previous-run manifest but it doesn't match, so this ISO "
+            f"will be redone rather than skipped. Reason: {resume_mismatch}",
             iso_path,
         )
         stats.warnings += 1
@@ -1490,6 +1625,12 @@ def process_iso(
     out_dir = unique_output_dir(output_root, relative_dir, iso_path.stem, used_output_names)
     if not args.dry_run:
         out_dir.mkdir(parents=True, exist_ok=True)
+        # Reaching here means we've committed to (re)extracting this ISO
+        # rather than resume-skipping it. If a previous run left output in
+        # this folder, remove it first so extraction starts clean - this is
+        # what makes identical input produce identical output names (see
+        # clear_previous_outputs() for the full rationale).
+        clear_previous_outputs(out_dir, logger, stats)
 
     all_ok = True
     stop_reason: str | None = None  # set when all_ok is False for a reason other than a title outright failing
@@ -1591,10 +1732,13 @@ def process_iso(
         # becomes main_title.mkv; every other extracted title becomes
         # title_NN.mkv, where NN is its MakeMKV title number - stable,
         # sortable, and important for TV discs where each title is an
-        # episode and the number is how you tell episodes apart. On a name
-        # collision (e.g. a leftover file from a previous run) or a rename
-        # error, we keep MakeMKV's original filename and warn rather than
-        # clobbering anything.
+        # episode and the number is how you tell episodes apart. The output
+        # folder is cleared of any previous run's files before extraction
+        # (see clear_previous_outputs()), so a same-name collision from a
+        # prior run can't happen here anymore; this guard is now just a
+        # backstop against an unexpected in-run collision or a foreign file,
+        # in which case we keep MakeMKV's original filename and warn rather
+        # than clobbering anything.
         desired_name = "main_title.mkv" if tid == fpl_identified_main_tid else f"title_{tid:02d}.mkv"
         final_name = qualifying_new_mkvs[0]  # overwritten below only if the rename actually succeeds
         src_path = out_dir / qualifying_new_mkvs[0]
@@ -1730,8 +1874,8 @@ def process_iso(
     if not args.dry_run:
         # Recorded so a future run can tell "already done, same settings"
         # apart from "coincidentally the same file count" - see
-        # manifest_matches().
-        write_manifest(out_dir, iso_path, candidates, output_filenames, args)
+        # manifest_mismatch_reason().
+        write_manifest(out_dir, iso_path, candidates, output_filenames, args, logger, stats)
 
         # Stamp each output .mkv with the source ISO's file date. Done
         # before any source deletion (the source still exists here) and
