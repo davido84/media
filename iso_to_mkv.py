@@ -178,13 +178,16 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        necessary but not sufficient. See MIN_OUTPUT_FILE_BYTES.
      - A pre-flight check confirms makemkvcon64.exe (the 64-bit MakeMKV
        CLI, required deliberately over the memory-limited 32-bit build)
-       can be found on PATH
-       before any files are touched. Beyond that, if
-       --max-consecutive-failures (default 3) ISOs in a row fail at the
-       initial title-info scan, the whole run stops early rather than
-       grinding through the rest of the batch with what's almost always
-       a systemic problem (bad path, expired registration key,
-       permissions) rather than bad media.
+       can be found on PATH before any files are touched.
+     - Fail-fast: the run is NOT resilient to per-disc failures. The
+       moment any error is logged - a failed title-info scan, a failed
+       title extraction, insufficient free space, an unexpected
+       exception, etc. - the error is written to the log and console as
+       usual and the whole run stops immediately (nonzero exit). There is
+       no "skip this one bad disc and keep going"; a single failure ends
+       the batch. This lives in one place (DualLogger.error()) so it
+       applies uniformly everywhere an error is logged, current or
+       future.
      - Free space on the output volume is checked before each title
        extraction (using MakeMKV's own reported title size plus
        --free-space-margin-pct headroom), so a nearly-full output drive
@@ -237,14 +240,16 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        or with ZERO audio when the disc had audio, is flagged. Tune the
        duration slack with --duration-tolerance-sec (default 15s);
        disable the whole cross-check with --no-verify-tracks.
-     - Non-zero process exit status: the script exits 1 if any real
-       conversion error occurred during the run (a title that failed to
-       extract, a disc whose title info couldn't be read, an unexpected
-       exception), 130 if interrupted with Ctrl+C, and 0 otherwise -
-       including runs where discs were legitimately skipped (ambiguous
-       obfuscation, no qualifying titles, etc.), since those are normal
-       outcomes, not failures. This makes the run's success/failure
-       visible to cron, systemd, or any other wrapper via $?.
+     - Non-zero process exit status: the script exits 1 the moment any
+       real error is logged (see "Fail-fast" above - a title that failed
+       to extract, a disc whose title info couldn't be read, an
+       unexpected exception, etc.), 130 if interrupted with Ctrl+C, and 0
+       if the whole run completes with no errors - including runs where
+       discs were legitimately skipped for benign, expected reasons
+       (ambiguous obfuscation, no qualifying titles, etc.), since those
+       are normal outcomes, not failures. This makes the run's
+       success/failure visible to cron, systemd, or any other wrapper via
+       $?.
      - Title extraction streams makemkvcon's progress output live
        (parsing PRGT/PRGV robot-mode lines) instead of going silent for
        the whole extraction; only shown when stdout is a real terminal.
@@ -780,7 +785,22 @@ class DualLogger:
         self._log("WARNING", message, iso_path)
 
     def error(self, message: str, iso_path: Path | None = None) -> None:
+        """Log the error, then fail fast: abort the whole run immediately.
+
+        Every failure path in this script (a title-info scan failure, a
+        failed extraction, an unexpected exception, etc.) already funnels
+        through this method before deciding what to do next, so putting
+        the exit here - rather than at each of those call sites - makes
+        "log an error -> stop the run" apply everywhere at once. Nothing
+        after the logger.error(...) call that triggered this will run
+        (SystemExit isn't caught by the `except Exception` blocks used
+        elsewhere in this script, so it propagates straight out). Only
+        logger.warning() still lets the batch continue.
+        """
         self._log("ERROR", message, iso_path)
+        self._raw(f"==== Run aborted after error (fail-fast) {self._timestamp()} ====")
+        self.close()
+        sys.exit(1)
 
     def close(self) -> None:
         self._fh.close()
@@ -1135,13 +1155,20 @@ class Stats:
 @dataclass
 class ProcessResult:
     """Outcome of process_iso, richer than a plain bool so main() can
-    drive the resume/limit/circuit-breaker logic around it - and, in
-    dry-run, assemble a pre-flight plan (space forecast, needs-attention
-    list, and summary) without extracting anything."""
+    drive the resume/limit logic around it - and, in dry-run, assemble a
+    pre-flight plan (space forecast, needs-attention list, and summary)
+    without extracting anything.
+
+    info_scan_failed and unexpected_error are set but no longer acted on
+    in main(): any error that would set one of these fields is logged via
+    DualLogger.error() first, which already aborts the run before
+    process_iso() gets a chance to return. They're kept on the dataclass
+    (harmlessly unreachable) rather than ripped out, in case a future
+    change makes some category of failure non-fatal again."""
     converted: bool = False           # fully converted this run (counts toward --limit, eligible for deletion)
     skipped_already_done: bool = False  # resume: output already existed, nothing was done
-    info_scan_failed: bool = False    # couldn't even read title info - used for the circuit breaker
-    unexpected_error: bool = False    # an unhandled exception was caught around this ISO - also feeds the circuit breaker
+    info_scan_failed: bool = False    # couldn't even read title info
+    unexpected_error: bool = False    # an unhandled exception was caught around this ISO
     # --- dry-run planning fields (populated on every path, consumed only by the dry-run report) ---
     titles_selected: int = 0          # how many titles would be / were extracted
     estimated_output_bytes: int = 0   # sum of selected titles' MakeMKV-reported sizes (output-size estimate)
@@ -1885,12 +1912,6 @@ def parse_args() -> argparse.Namespace:
              "on the output volume before extracting that title",
     )
     p.add_argument(
-        "--max-consecutive-failures", type=int, default=3, metavar="N",
-        help="Abort the whole run if this many ISOs in a row fail at the initial title-info "
-             "scan (a strong sign of a systemic problem - bad registration key or permissions - "
-             "permissions - rather than one bad disc). 0 disables this circuit breaker",
-    )
-    p.add_argument(
         "--no-verify-tracks", dest="verify_tracks", action="store_false", default=True,
         help="Disable the post-extraction audio/subtitle track-count and duration cross-check "
              "against what MakeMKV reported for the title (requires mkvmerge or ffprobe to be "
@@ -2061,7 +2082,6 @@ def main() -> int:
     start_time: float = time.time()
     bytes_time_processed: int = 0
     bytes_converted_running: int = 0
-    consecutive_info_scan_failures: int = 0
     interrupted: bool = False
 
     # --- Dry-run plan accumulators (consumed only when args.dry_run) ---
@@ -2098,11 +2118,12 @@ def main() -> int:
             )
 
             # A crash while processing one ISO (a malformed robot-mode
-            # line, an unexpected filesystem error, etc.) should not take
-            # down the rest of an otherwise-fine batch. Only
-            # KeyboardInterrupt is allowed to propagate - everything else
-            # is logged against this specific ISO, counted as an error,
-            # and the batch moves on to the next file.
+            # line, an unexpected filesystem error, etc.) is caught here so
+            # it's logged against this specific ISO rather than surfacing
+            # as a raw traceback - but logger.error() below still aborts
+            # the whole run immediately (fail-fast). Only KeyboardInterrupt
+            # is allowed to propagate past this without going through the
+            # logger first.
             try:
                 result = process_iso(
                     iso_path, input_root, output_root, args, logger, stats, used_output_names, probe_tool
@@ -2111,35 +2132,17 @@ def main() -> int:
                 raise
             except Exception as e:
                 logger.error(
-                    f"Unexpected error while processing this ISO - skipping it and continuing "
-                    f"with the rest of the batch: {e!r}",
+                    f"Unexpected error while processing this ISO: {e!r}",
                     iso_path,
                 )
                 stats.conversions_error += 1
                 result = ProcessResult(unexpected_error=True)
 
-            # --- Circuit breaker (safety enhancement 2, cont'd) ---
-            # A single bad disc failing to scan (or crashing outright) is
-            # normal; several in a row almost always means something
-            # systemic (expired registration key, permissions, wrong
-            # binary) rather than unlucky media, so stop instead of
-            # burning through the rest of the batch with the same failure.
-            if result.info_scan_failed or result.unexpected_error:
-                consecutive_info_scan_failures += 1
-                if (
-                    args.max_consecutive_failures > 0
-                    and consecutive_info_scan_failures >= args.max_consecutive_failures
-                ):
-                    logger.error(
-                        f"{consecutive_info_scan_failures} ISOs in a row failed (title-info scan "
-                        f"or an unexpected error) - this usually means a systemic problem "
-                        f"(makemkvcon registration/key or permissions) rather than bad discs. "
-                        f"rather than bad discs. Stopping early; fix the underlying issue and "
-                        f"re-run (already-converted ISOs will be skipped via resume support)."
-                    )
-                    break
-            else:
-                consecutive_info_scan_failures = 0
+            # Note: there's no circuit breaker here anymore. Since
+            # DualLogger.error() now aborts the run immediately, any
+            # failure inside process_iso() (or the "unexpected error"
+            # except block above) already stops everything before
+            # execution gets back to this point.
 
             bytes_time_processed += iso_size
             if result.converted:
