@@ -220,21 +220,22 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        can eat through the rest of the disc's titles or the output
        drive's free space.
      - Post-extraction track-count/duration cross-check: after each
-       title is extracted, its actual audio/subtitle track counts and
-       duration (via mkvmerge, or ffprobe if mkvmerge isn't installed)
-       are compared against what MakeMKV itself reported for that title.
-       This catches a class of silent partial failure the size/existence
-       check above can't: a file that's missing tracks or truncated but
-       still comfortably clears MIN_OUTPUT_FILE_BYTES. It's best-effort
+       title is extracted, its actual duration and track counts (via
+       mkvmerge, or ffprobe if mkvmerge isn't installed) are checked
+       against what MakeMKV reported for that title. It's best-effort
        (silently skipped for the whole run if neither tool is found -
        see the warning logged at startup) and warning-level rather than
-       a hard stop, since a mismatch isn't as rock-solid an invariant as
-       the size failsafe above. The duration comparison is one-sided:
-       only an output SHORTER than the reported duration (the truncation
-       direction) is flagged; an output slightly longer is a routine
-       measurement discrepancy (MakeMKV reports the playlist duration,
-       the probe measures the muxed stream) and is ignored. Tune the
-       shortfall slack with --duration-tolerance-sec (default 15s);
+       a hard stop. The duration comparison is one-sided: only an output
+       SHORTER than the reported duration (the truncation direction) is
+       flagged; an output slightly longer is a routine measurement
+       discrepancy (MakeMKV reports the playlist duration, the probe
+       measures the muxed stream) and is ignored. Track counts are NOT
+       checked for exact equality, because MakeMKV applies its own
+       track-selection rules at extraction time (language preferences,
+       etc.), so the output legitimately holds a subset of the disc's
+       streams - only an output with MORE tracks than the disc reports,
+       or with ZERO audio when the disc had audio, is flagged. Tune the
+       duration slack with --duration-tolerance-sec (default 15s);
        disable the whole cross-check with --no-verify-tracks.
      - Non-zero process exit status: the script exits 1 if any real
        conversion error occurred during the run (a title that failed to
@@ -1593,28 +1594,44 @@ def process_iso(
 
         # --- Post-extraction track-count/duration cross-check (workflow enhancement 7) ---
         # The size/existence check above only confirms *something* real-
-        # sized landed on disk - it wouldn't catch a file that's missing
-        # half its audio tracks but is still well over MIN_OUTPUT_FILE_BYTES.
-        # This compares the actual output file's audio/subtitle track
-        # counts and duration against what MakeMKV itself reported for the
-        # source title. Best-effort only (skipped entirely if neither
-        # mkvmerge nor ffprobe is installed) and warning-level rather than
-        # a hard stop: unlike the size failsafe below, a mismatch here
-        # isn't a rock-solid invariant - it can occasionally have benign
-        # explanations - so it's surfaced for a manual look rather than
-        # treated as certain corruption.
+        # sized landed on disk. This adds a duration check (the reliable
+        # truncation signal) plus a couple of conservative track-count
+        # sanity checks against what MakeMKV reported for the source title.
+        # Best-effort only (skipped entirely if neither mkvmerge nor ffprobe
+        # is installed) and warning-level rather than a hard stop.
+        #
+        # Track counts are deliberately NOT checked for exact equality:
+        # MakeMKV applies its own track-selection rules at extraction time
+        # (language preferences, default selection string, etc.), so the
+        # output legitimately contains a SUBSET of the streams the info scan
+        # lists - foreign-language audio and subtitle tracks are commonly
+        # dropped. Flagging "fewer tracks than the disc" therefore produced
+        # false positives on ordinary discs. We only flag what track
+        # selection cannot explain: MORE tracks in the output than the disc
+        # reports (impossible for MakeMKV to produce - likely the wrong file
+        # probed or a miscount), and an output with ZERO audio when the disc
+        # had audio (a genuinely broken extraction). A zero-subtitle output
+        # is NOT flagged, since stripping all subtitles is a legitimate
+        # setting.
         if probe_tool is not None:
             probe = probe_output_tracks_and_duration(out_dir / final_name, probe_tool)
             if probe is not None:
                 out_audio, out_subs, out_duration = probe
                 mismatches = []
-                if out_audio != title.audio_track_count:
+                if out_audio > title.audio_track_count:
                     mismatches.append(
-                        f"audio tracks: expected {title.audio_track_count}, found {out_audio}"
+                        f"audio tracks: output has {out_audio}, more than the "
+                        f"{title.audio_track_count} the disc reports"
                     )
-                if out_subs != title.subtitle_track_count:
+                elif title.audio_track_count > 0 and out_audio == 0:
                     mismatches.append(
-                        f"subtitle tracks: expected {title.subtitle_track_count}, found {out_subs}"
+                        f"audio tracks: output has none, but the disc reports "
+                        f"{title.audio_track_count}"
+                    )
+                if out_subs > title.subtitle_track_count:
+                    mismatches.append(
+                        f"subtitle tracks: output has {out_subs}, more than the "
+                        f"{title.subtitle_track_count} the disc reports"
                     )
                 # Duration is checked ASYMMETRICALLY: only an output that
                 # is meaningfully SHORTER than MakeMKV's reported duration
@@ -1636,9 +1653,9 @@ def process_iso(
                     )
                 if mismatches:
                     logger.warning(
-                        f"Title {tid}: post-extraction cross-check found a mismatch against what "
+                        f"Title {tid}: post-extraction cross-check flagged an issue against what "
                         f"MakeMKV reported for this title ({'; '.join(mismatches)}) - the output "
-                        f"may be missing tracks or truncated; worth a manual look",
+                        f"may be truncated or have an unexpected track layout; worth a manual look",
                         iso_path,
                     )
                     stats.warnings += 1
