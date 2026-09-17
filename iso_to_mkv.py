@@ -255,15 +255,17 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        --no-dedupe-duplicate-titles, and ignored under --main-playlist.
      - Runaway-output failsafe: the running total size of everything
        extracted from an ISO so far is checked after each title. If it
-       ever exceeds the input ISO's own size - which should never
-       legitimately happen, since MKV remuxing doesn't meaningfully
-       inflate size and titles are non-overlapping subsets of the same
-       disc - extraction of that ISO stops immediately, a warning is
-       logged, and the source ISO is left in place (not deleted). With
-       duplicate main titles now collapsed during selection (above), this
-       is a backstop for anything that slips past: a genuinely looping
-       extraction, or overlapping playlists too dissimilar in size to
-       dedupe.
+       grossly exceeds the expected size - the larger of the summed
+       per-title MakeMKV estimates and the ISO's own size, plus a margin
+       (--runaway-output-margin-pct, default 20%) - extraction of that ISO
+       stops immediately, a warning is logged, and the source ISO is left
+       in place (not deleted). The margin matters: honest MKV output runs a
+       little larger than the raw stream bytes (container overhead plus
+       estimate slack), so on a disc whose selected titles nearly fill it
+       the total can legitimately tip just over the ISO's own size - the
+       failsafe is only meant to catch a GROSS overrun (a looping/duplicate
+       extraction, or overlapping playlists that slipped past the
+       duplicate-title dedup above), which lands well past the margin.
      - Post-extraction track-count/duration cross-check: after each
        title is extracted, its actual duration and track counts (via
        mkvmerge, or ffprobe if mkvmerge isn't installed) are checked
@@ -402,6 +404,16 @@ DISC_TYPE_BLURAY: str = "BLURAY"
 # near-identical duplicate playlists.
 DEDUPE_DURATION_TOL_SEC_DEFAULT: float = 2.0
 DEDUPE_SIZE_TOL_PCT_DEFAULT: float = 2.0
+
+# Margin for the runaway-output failsafe (see the check in process_iso).
+# Extracted MKV output legitimately runs a little larger than the raw stream
+# bytes MakeMKV reports - container overhead (headers, cues/seek index) plus
+# estimate slack - so on a disc whose selected titles nearly fill it, the
+# honest total can tip a fraction of a percent past the ISO's own size. The
+# failsafe only wants to catch GROSS overruns (a looping/duplicate
+# extraction, typically tens of percent to multiples over), so it allows this
+# much headroom above the expected size before tripping.
+RUNAWAY_OUTPUT_MARGIN_PCT_DEFAULT: float = 20.0
 
 # Sanity floor for "does this look like a real output file", used both to
 # verify a title actually got extracted before deleting the source (safety
@@ -1753,6 +1765,18 @@ def process_iso(
     output_verified = probe_tool is not None
     iso_size_bytes = iso_path.stat().st_size
     total_extracted_bytes = 0  # running total across titles - see size failsafe below
+    # Expected output size for the runaway-output failsafe below: the sum of
+    # MakeMKV's per-title byte estimates for exactly the titles we're about to
+    # extract. This is a more meaningful expectation than the whole ISO's size
+    # - it scales to the selected title set and stays correct even when titles
+    # legitimately share/overlap disc content (each still contributes its own
+    # estimate). The failsafe uses whichever of {this, the ISO size} is
+    # larger as its base, so a missing/zero estimate simply falls back to the
+    # ISO-size bound and can never make the check stricter.
+    estimated_total_bytes = sum(titles[t].size_bytes for t in candidates)
+    runaway_output_limit = max(iso_size_bytes, estimated_total_bytes) * (
+        1 + args.runaway_output_margin_pct / 100.0
+    )
     for tid in sorted(candidates):
         title = titles[tid]
         logger.info(
@@ -1947,23 +1971,30 @@ def process_iso(
                 output_verified = False
 
         # --- Runaway-output failsafe ---
-        # The combined size of everything extracted from this ISO should
-        # never exceed the ISO itself (MKV remuxing doesn't meaningfully
-        # inflate size, and this script's own titles are non-overlapping
-        # subsets of the same disc). The usual cause of this - a disc that
-        # exposes the main feature as several near-identical copies - is now
-        # collapsed to one copy during selection (see
-        # dedupe_duplicate_titles()), so this is a backstop for whatever that
-        # didn't catch: a genuinely looping/duplicate extraction, or a
-        # title-selection bug pulling overlapping playlists that aren't close
-        # enough in size to dedupe. If it trips, stop pulling more titles from
-        # this ISO and leave the source alone rather than risk deleting it
-        # (if --delete-source is set) after a broken extraction.
+        # The combined size of everything extracted from this ISO shouldn't
+        # grossly exceed what these titles are expected to produce. "Expected"
+        # is max(sum of MakeMKV's per-title estimates, the ISO's own size),
+        # plus a margin (--runaway-output-margin-pct) for the container
+        # overhead and estimate slack that make honest MKV output run a little
+        # larger than the raw stream bytes - without that headroom, a disc
+        # whose titles nearly fill it can tip a fraction of a percent over and
+        # trip this for no reason (e.g. Halloween III: 37.42 GB of legitimate
+        # output vs a 37.30 GB ISO). Duplicate main titles are already
+        # collapsed during selection (see dedupe_duplicate_titles()), so what
+        # remains for this backstop is a GROSS overrun - a genuinely
+        # looping/duplicate extraction, or overlapping playlists that slipped
+        # past dedup - which lands well past the margin. On a trip, stop
+        # pulling more titles from this ISO and leave the source alone rather
+        # than risk deleting it (if --delete-source is set) after a broken
+        # extraction.
         total_extracted_bytes += after_snapshot[qualifying_new_mkvs[0]]
-        if total_extracted_bytes > iso_size_bytes:
+        if total_extracted_bytes > runaway_output_limit:
+            expected_base = max(iso_size_bytes, estimated_total_bytes)
             stop_reason = (
                 f"extracted output so far ({human_bytes(total_extracted_bytes)}) exceeds the "
-                f"input ISO's own size ({human_bytes(iso_size_bytes)})"
+                f"expected size ({human_bytes(expected_base)}) by more than the "
+                f"{args.runaway_output_margin_pct:g}% runaway margin "
+                f"(limit {human_bytes(runaway_output_limit)})"
             )
             logger.warning(
                 f"{stop_reason} - this points to something wrong with the extraction rather "
@@ -2189,6 +2220,15 @@ def parse_args() -> argparse.Namespace:
         "--free-space-margin-pct", type=float, default=10.0, metavar="PCT",
         help="Extra safety margin (as %% of a title's estimated size) required as free space "
              "on the output volume before extracting that title",
+    )
+    p.add_argument(
+        "--runaway-output-margin-pct", type=float, default=RUNAWAY_OUTPUT_MARGIN_PCT_DEFAULT, metavar="PCT",
+        help="How far the combined extracted output may exceed its expected size - the larger of "
+             "the summed per-title estimates and the ISO's own size - before the runaway-output "
+             "failsafe stops the ISO. The headroom absorbs MKV container overhead and estimate "
+             "slack (honest output can run a little over the raw stream bytes); the failsafe is "
+             "only meant to catch gross overruns like a looping/duplicate extraction. Raise it if "
+             "a legitimate disc trips it, lower it to catch smaller overruns",
     )
     p.add_argument(
         "--no-verify-tracks", dest="verify_tracks", action="store_false", default=True,
