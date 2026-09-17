@@ -239,17 +239,31 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        deterministic. Only this script's own artifacts are removed;
        anything else in the folder (hand-added cover art, external
        subtitles, etc.) is left untouched.
+     - Duplicate-main-title dedup: some Blu-rays expose the main feature
+       as several near-identical titles (redundant or seamless-branching
+       playlists, or a mild anti-ripping tactic). When no single
+       (FPL_MainFeature) marker singles one out, the fallback selection
+       would otherwise keep every title over --min-length and extract all
+       the copies - wasting space on identical output and producing a
+       combined size that can exceed the source ISO (tripping the
+       runaway-output failsafe below). Instead, titles that match in BOTH
+       duration and MakeMKV-estimated size (within --dedupe-duration-tol-sec
+       / --dedupe-size-tol-pct) are treated as duplicates and collapsed to
+       one copy (the lowest title id, for deterministic naming). The dual
+       duration+size test keeps genuinely different same-length titles (TV
+       episodes) from being merged. On by default; disable with
+       --no-dedupe-duplicate-titles, and ignored under --main-playlist.
      - Runaway-output failsafe: the running total size of everything
        extracted from an ISO so far is checked after each title. If it
        ever exceeds the input ISO's own size - which should never
        legitimately happen, since MKV remuxing doesn't meaningfully
        inflate size and titles are non-overlapping subsets of the same
        disc - extraction of that ISO stops immediately, a warning is
-       logged, and the source ISO is left in place (not deleted). This
-       catches things like a duplicate/looping extraction or a
-       title-selection bug pulling near-identical playlists, before it
-       can eat through the rest of the disc's titles or the output
-       drive's free space.
+       logged, and the source ISO is left in place (not deleted). With
+       duplicate main titles now collapsed during selection (above), this
+       is a backstop for anything that slips past: a genuinely looping
+       extraction, or overlapping playlists too dissimilar in size to
+       dedupe.
      - Post-extraction track-count/duration cross-check: after each
        title is extracted, its actual duration and track counts (via
        mkvmerge, or ffprobe if mkvmerge isn't installed) are checked
@@ -379,6 +393,15 @@ JRE_MISSING_MARKER: str = "This disc requires Java runtime (JRE), but none was f
 DVD_MAX_SIZE_GB_DEFAULT: float = 8.5  # decimal GB (10**9 bytes), matching how DVD-9 capacity is marketed
 DISC_TYPE_DVD: str = "DVD"
 DISC_TYPE_BLURAY: str = "BLURAY"
+
+# Defaults for duplicate-main-title dedup (see dedupe_duplicate_titles()).
+# Two candidate titles are treated as the same content only if BOTH their
+# durations (within _SEC) and their MakeMKV-estimated sizes (within _PCT)
+# match - tight enough that genuinely different same-length titles (e.g. TV
+# episodes) aren't merged, loose enough to absorb estimate jitter between
+# near-identical duplicate playlists.
+DEDUPE_DURATION_TOL_SEC_DEFAULT: float = 2.0
+DEDUPE_SIZE_TOL_PCT_DEFAULT: float = 2.0
 
 # Sanity floor for "does this look like a real output file", used both to
 # verify a title actually got extracted before deleting the source (safety
@@ -586,6 +609,9 @@ def selection_fingerprint(args: argparse.Namespace) -> dict[str, Any]:
         "detect_playall": args.detect_playall,
         "playall_tolerance_sec": args.playall_tolerance_sec,
         "playall_cluster_tolerance_pct": args.playall_cluster_tolerance_pct,
+        "dedupe_duplicate_titles": args.dedupe_duplicate_titles,
+        "dedupe_duration_tol_sec": args.dedupe_duration_tol_sec,
+        "dedupe_size_tol_pct": args.dedupe_size_tol_pct,
     }
 
 
@@ -1245,6 +1271,61 @@ def detect_playall_title(
     return None
 
 
+def dedupe_duplicate_titles(
+    candidates: list[int],
+    titles: dict[int, "Title"],
+    duration_tol_sec: float,
+    size_tol_pct: float,
+) -> tuple[list[int], list[tuple[int, int]]]:
+    """Collapse duplicate main titles - the same feature exposed as several
+    near-identical titles - down to one copy each.
+
+    Some Blu-rays present the main feature as multiple titles that are
+    effectively the same content (seamless-branching artifacts, redundant
+    playlists, or a mild anti-ripping tactic). When no single (FPL_MainFeature)
+    marker singles one out, the fallback selection keeps every title over
+    --min-length, so all the copies get extracted: identical output written
+    more than once, and a combined size that can exceed the source ISO and
+    trip the runaway-output failsafe. Keeping one copy is almost always what
+    was actually wanted.
+
+    Two candidates are treated as duplicates only when BOTH their durations
+    (within duration_tol_sec) AND their MakeMKV-estimated sizes (within
+    size_tol_pct) match. The dual test is deliberate: matching duration alone
+    would risk merging genuinely different titles that happen to run about the
+    same length (TV episodes, say), whereas a matching duration *and* a
+    matching size together are a reliable signature of the same underlying
+    content. It errs toward keeping titles - a near-duplicate whose size
+    differs by more than the tolerance stays in, with the failsafe as a
+    backstop.
+
+    The lowest title_id of each duplicate group is kept, so output naming
+    stays deterministic run to run. Returns (kept_tids_sorted, dropped) where
+    dropped is a list of (dropped_tid, kept_representative_tid) for logging."""
+    kept: list[int] = []
+    dropped: list[tuple[int, int]] = []
+    for tid in sorted(candidates):
+        t = titles[tid]
+        representative: int | None = None
+        for k in kept:
+            r = titles[k]
+            if abs(t.duration_sec - r.duration_sec) > duration_tol_sec:
+                continue
+            larger = max(t.size_bytes, r.size_bytes)
+            if larger <= 0:
+                size_matches = t.size_bytes == r.size_bytes
+            else:
+                size_matches = abs(t.size_bytes - r.size_bytes) / larger * 100.0 <= size_tol_pct
+            if size_matches:
+                representative = k
+                break
+        if representative is None:
+            kept.append(tid)
+        else:
+            dropped.append((tid, representative))
+    return kept, dropped
+
+
 def unique_output_dir(output_root: Path, relative_dir: Path, stem: str, used: set[str]) -> Path:
     """Mirrors the ISO's directory structure relative to --input under
     output_root, so e.g. <input>/Show/S1E1/s1e1.iso produces
@@ -1585,6 +1666,35 @@ def process_iso(
             attention_reason="only a 'Play All' title found (no individual episodes to keep)",
         )
 
+    # Collapse duplicate main titles (the same feature under multiple
+    # near-identical playlists) down to one copy - see
+    # dedupe_duplicate_titles(). Skipped under --main-playlist for the same
+    # reason play-all detection is: that path is a hand-picked selection and
+    # shouldn't be second-guessed. Without this, a disc exposing 2+ copies of
+    # the main feature extracts all of them, wasting space on identical output
+    # and producing a combined size that can exceed the source ISO and trip
+    # the runaway-output failsafe below.
+    if args.dedupe_duplicate_titles and not args.main_playlist and len(candidates) > 1:
+        deduped, dropped_dupes = dedupe_duplicate_titles(
+            candidates, titles, args.dedupe_duration_tol_sec, args.dedupe_size_tol_pct
+        )
+        for dropped_tid, rep_tid in dropped_dupes:
+            logger.info(
+                f"Title {dropped_tid} (playlist {titles[dropped_tid].source_filename}, "
+                f"{format_duration(titles[dropped_tid].duration_sec)}, "
+                f"{human_bytes(titles[dropped_tid].size_bytes)}) matches title {rep_tid} "
+                f"(playlist {titles[rep_tid].source_filename}) in both duration and size - "
+                f"treating it as a duplicate of the main feature and keeping only title {rep_tid}",
+                iso_path,
+            )
+        if dropped_dupes:
+            logger.info(
+                f"Dropped {len(dropped_dupes)} duplicate title(s); extracting "
+                f"{len(deduped)} title(s) instead of {len(candidates)}",
+                iso_path,
+            )
+        candidates = deduped
+
     # Resume check happens here, once we know exactly which titles we'd
     # extract - compared against a previous run's manifest (see
     # manifest_mismatch_reason() for why this is more reliable than the
@@ -1840,11 +1950,15 @@ def process_iso(
         # The combined size of everything extracted from this ISO should
         # never exceed the ISO itself (MKV remuxing doesn't meaningfully
         # inflate size, and this script's own titles are non-overlapping
-        # subsets of the same disc). If it does, something is badly wrong
-        # (e.g. a duplicate/looping extraction, or a title-selection bug
-        # pulling near-identical playlists) - stop pulling more titles
-        # from this ISO and leave the source alone rather than risk
-        # deleting it (if --delete-source is set) after a broken extraction.
+        # subsets of the same disc). The usual cause of this - a disc that
+        # exposes the main feature as several near-identical copies - is now
+        # collapsed to one copy during selection (see
+        # dedupe_duplicate_titles()), so this is a backstop for whatever that
+        # didn't catch: a genuinely looping/duplicate extraction, or a
+        # title-selection bug pulling overlapping playlists that aren't close
+        # enough in size to dedupe. If it trips, stop pulling more titles from
+        # this ISO and leave the source alone rather than risk deleting it
+        # (if --delete-source is set) after a broken extraction.
         total_extracted_bytes += after_snapshot[qualifying_new_mkvs[0]]
         if total_extracted_bytes > iso_size_bytes:
             stop_reason = (
@@ -2044,6 +2158,27 @@ def parse_args() -> argparse.Namespace:
         "--playall-cluster-tolerance-pct", type=float, default=30.0, metavar="PCT",
         help="How far (as a %% of the median) another title's duration may be from its peers "
              "to still be grouped into the 'episode' cluster for Play All detection",
+    )
+    p.add_argument(
+        "--no-dedupe-duplicate-titles", dest="dedupe_duplicate_titles", action="store_false", default=True,
+        help="Disable collapsing duplicate main titles. By default, when a disc exposes the same "
+             "feature as several near-identical titles (same duration AND size within tolerance - "
+             "common on Blu-rays with redundant/seamless-branching playlists), only one copy is "
+             "extracted instead of all of them. Disable this to extract every qualifying title as-is "
+             "(e.g. if a disc has genuinely distinct titles that happen to match closely). Ignored "
+             "under --main-playlist. On by default",
+    )
+    p.add_argument(
+        "--dedupe-duration-tol-sec", type=float, default=DEDUPE_DURATION_TOL_SEC_DEFAULT, metavar="SECONDS",
+        help="Two titles must be within this many seconds of each other in duration (one of the two "
+             "conditions) to be considered duplicate copies of the same feature",
+    )
+    p.add_argument(
+        "--dedupe-size-tol-pct", type=float, default=DEDUPE_SIZE_TOL_PCT_DEFAULT, metavar="PCT",
+        help="Two titles' MakeMKV-estimated sizes must be within this %% of each other (the second "
+             "of the two conditions, alongside --dedupe-duration-tol-sec) to be considered duplicate "
+             "copies. Requiring a size match as well as a duration match keeps genuinely different "
+             "same-length titles (e.g. TV episodes) from being wrongly merged",
     )
     p.add_argument(
         "-f", "--force", action="store_true",
