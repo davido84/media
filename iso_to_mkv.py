@@ -240,18 +240,26 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        anything else in the folder (hand-added cover art, external
        subtitles, etc.) is left untouched.
      - Duplicate-main-title dedup: some Blu-rays expose the main feature
-       as several near-identical titles (redundant or seamless-branching
-       playlists, or a mild anti-ripping tactic). When no single
-       (FPL_MainFeature) marker singles one out, the fallback selection
-       would otherwise keep every title over --min-length and extract all
-       the copies - wasting space on identical output and producing a
-       combined size that can exceed the source ISO (tripping the
-       runaway-output failsafe below). Instead, titles that match in BOTH
-       duration and MakeMKV-estimated size (within --dedupe-duration-tol-sec
-       / --dedupe-size-tol-pct) are treated as duplicates and collapsed to
-       one copy (the lowest title id, for deterministic naming). The dual
-       duration+size test keeps genuinely different same-length titles (TV
-       episodes) from being merged. On by default; disable with
+       as several titles whose playlists all reference the identical
+       source segments (redundant or seamless-branching playlists, or a
+       mild anti-ripping tactic). When no single (FPL_MainFeature) marker
+       singles one out, the fallback selection would otherwise keep every
+       title over --min-length and extract all the copies - wasting space
+       on identical output and producing a combined size that can exceed
+       the source ISO (tripping the runaway-output failsafe below).
+       Instead, titles are compared by SEGMENT MAP (MakeMKV attribute 26,
+       the ordered list of source segments a playlist references): two
+       titles are duplicates only when their segment maps are identical,
+       and one copy (the lowest title id, for deterministic naming) is
+       kept. This is deliberately NOT duration/size similarity - distinct
+       TV episodes on one disc routinely share a runtime and a size to a
+       fraction of a percent, so any duration/size tolerance loose enough
+       to catch real duplicates would also merge genuinely different
+       episodes; the segment map is a content fingerprint that separates
+       "same content, multiple playlists" from "different content, similar
+       length" outright. It errs toward keeping: a title whose segment map
+       is missing/empty (some discs, and typically DVDs, don't report one)
+       is always kept. On by default; disable with
        --no-dedupe-duplicate-titles, and ignored under --main-playlist.
      - Runaway-output failsafe: the running total size of everything
        extracted from an ISO so far is checked after each title. If it
@@ -374,6 +382,7 @@ ATTR_NAME: int = 2
 ATTR_DURATION: int = 9
 ATTR_DISKSIZE_BYTES: int = 11
 ATTR_SOURCE_FILENAME: int = 16  # title "Source file name" - the source playlist (e.g. "00610.mpls") on Blu-ray
+ATTR_SEGMENTS_MAP: int = 26  # title "Segment map" - the ordered source segments (.m2ts) the playlist references; identical maps == identical content
 ATTR_INFO: int = 30  # title "info/comment" text; carries "(FPL_MainFeature)" when JRE identifies it
 
 # Exact marker MakeMKV writes into a title's info text when its BD-Java
@@ -395,15 +404,6 @@ JRE_MISSING_MARKER: str = "This disc requires Java runtime (JRE), but none was f
 DVD_MAX_SIZE_GB_DEFAULT: float = 8.5  # decimal GB (10**9 bytes), matching how DVD-9 capacity is marketed
 DISC_TYPE_DVD: str = "DVD"
 DISC_TYPE_BLURAY: str = "BLURAY"
-
-# Defaults for duplicate-main-title dedup (see dedupe_duplicate_titles()).
-# Two candidate titles are treated as the same content only if BOTH their
-# durations (within _SEC) and their MakeMKV-estimated sizes (within _PCT)
-# match - tight enough that genuinely different same-length titles (e.g. TV
-# episodes) aren't merged, loose enough to absorb estimate jitter between
-# near-identical duplicate playlists.
-DEDUPE_DURATION_TOL_SEC_DEFAULT: float = 2.0
-DEDUPE_SIZE_TOL_PCT_DEFAULT: float = 2.0
 
 # Margin for the runaway-output failsafe (see the check in process_iso).
 # Extracted MKV output legitimately runs a little larger than the raw stream
@@ -622,8 +622,6 @@ def selection_fingerprint(args: argparse.Namespace) -> dict[str, Any]:
         "playall_tolerance_sec": args.playall_tolerance_sec,
         "playall_cluster_tolerance_pct": args.playall_cluster_tolerance_pct,
         "dedupe_duplicate_titles": args.dedupe_duplicate_titles,
-        "dedupe_duration_tol_sec": args.dedupe_duration_tol_sec,
-        "dedupe_size_tol_pct": args.dedupe_size_tol_pct,
     }
 
 
@@ -1071,6 +1069,7 @@ class Title:
     name: str | None = None
     info_text: str | None = None  # attribute 30; may contain "(FPL_MainFeature)"
     source_filename: str | None = None  # attribute 16; the source playlist e.g. "00610.mpls" on Blu-ray
+    segments_map: str | None = None  # attribute 26; ordered source segments the playlist references (e.g. "1,2,3") - the content-identity signal used for duplicate detection
     audio_track_count: int = 0       # from SINFO lines - used by the post-extraction cross-check
     subtitle_track_count: int = 0    # from SINFO lines - used by the post-extraction cross-check
 
@@ -1118,6 +1117,8 @@ def get_disc_titles(
                 t.name = value
             elif code == ATTR_SOURCE_FILENAME:
                 t.source_filename = value
+            elif code == ATTR_SEGMENTS_MAP:
+                t.segments_map = value
             elif code == ATTR_INFO:
                 t.info_text = value
         elif line.startswith("SINFO:"):
@@ -1283,55 +1284,76 @@ def detect_playall_title(
     return None
 
 
+def normalize_segments_map(raw: str | None) -> str | None:
+    """Canonicalize a title's segment map (MakeMKV attribute 26) for equality
+    comparison. The map is an ordered, comma-separated list of the source
+    segments a playlist references (e.g. "1,2,3"); whitespace around entries
+    is normalized away but ORDER IS PRESERVED, since two playlists that
+    reference the same segments in a different order are not the same content.
+    Returns None for a missing/empty map so callers can treat "no segment
+    information" distinctly from "a real map"."""
+    if raw is None:
+        return None
+    parts = [p.strip() for p in raw.split(",")]
+    parts = [p for p in parts if p]
+    if not parts:
+        return None
+    return ",".join(parts)
+
+
 def dedupe_duplicate_titles(
     candidates: list[int],
     titles: dict[int, "Title"],
-    duration_tol_sec: float,
-    size_tol_pct: float,
 ) -> tuple[list[int], list[tuple[int, int]]]:
     """Collapse duplicate main titles - the same feature exposed as several
-    near-identical titles - down to one copy each.
+    titles - down to one copy each, using each title's SEGMENT MAP (the
+    ordered set of source .m2ts segments its playlist references) as the test
+    for "same content".
 
-    Some Blu-rays present the main feature as multiple titles that are
-    effectively the same content (seamless-branching artifacts, redundant
-    playlists, or a mild anti-ripping tactic). When no single (FPL_MainFeature)
-    marker singles one out, the fallback selection keeps every title over
-    --min-length, so all the copies get extracted: identical output written
-    more than once, and a combined size that can exceed the source ISO and
-    trip the runaway-output failsafe. Keeping one copy is almost always what
-    was actually wanted.
+    Some Blu-rays present the main feature as multiple playlists that all
+    point at the same underlying segments (seamless-branching artifacts,
+    redundant playlists, or a mild anti-ripping tactic). When no single
+    (FPL_MainFeature) marker singles one out, the fallback selection keeps
+    every title over --min-length, so all the copies get extracted: identical
+    output written more than once, and a combined size that can exceed the
+    source ISO and trip the runaway-output failsafe. Keeping one copy is
+    almost always what was wanted.
 
-    Two candidates are treated as duplicates only when BOTH their durations
-    (within duration_tol_sec) AND their MakeMKV-estimated sizes (within
-    size_tol_pct) match. The dual test is deliberate: matching duration alone
-    would risk merging genuinely different titles that happen to run about the
-    same length (TV episodes, say), whereas a matching duration *and* a
-    matching size together are a reliable signature of the same underlying
-    content. It errs toward keeping titles - a near-duplicate whose size
-    differs by more than the tolerance stays in, with the failsafe as a
-    backstop.
+    Crucially, duplicates are detected by segment-map identity, NOT by
+    similar duration and size. Duration+size similarity is the wrong signal
+    for this: distinct TV episodes on the same disc routinely share a runtime
+    to the second and a size to a fraction of a percent (same show, same
+    target length, same encode settings), so any duration/size tolerance
+    loose enough to catch real duplicates also merges genuinely different
+    episodes. The segment map is a content fingerprint instead - two
+    different episodes occupy different segments on the disc, while true
+    duplicate playlists occupy exactly the same ones - so it distinguishes
+    "same content, multiple playlists" from "different content, similar
+    length" with no tolerance to tune and no risk of merging distinct
+    episodes.
 
-    The lowest title_id of each duplicate group is kept, so output naming
-    stays deterministic run to run. Returns (kept_tids_sorted, dropped) where
-    dropped is a list of (dropped_tid, kept_representative_tid) for logging."""
+    Erring toward caution: a title is only ever dropped when its (non-empty)
+    segment map is byte-identical to one already kept. Any title whose
+    segment map is missing/empty (some discs, and typically DVDs, don't
+    report one) is always kept - "can't prove it's a duplicate" resolves to
+    "keep it", never "drop it". The lowest title_id of each duplicate group
+    is kept, so output naming stays deterministic run to run. Returns
+    (kept_tids_sorted, dropped) where dropped is a list of
+    (dropped_tid, kept_representative_tid) for logging."""
     kept: list[int] = []
     dropped: list[tuple[int, int]] = []
+    seen: dict[str, int] = {}  # normalized segment map -> representative tid already kept
     for tid in sorted(candidates):
-        t = titles[tid]
-        representative: int | None = None
-        for k in kept:
-            r = titles[k]
-            if abs(t.duration_sec - r.duration_sec) > duration_tol_sec:
-                continue
-            larger = max(t.size_bytes, r.size_bytes)
-            if larger <= 0:
-                size_matches = t.size_bytes == r.size_bytes
-            else:
-                size_matches = abs(t.size_bytes - r.size_bytes) / larger * 100.0 <= size_tol_pct
-            if size_matches:
-                representative = k
-                break
+        segmap = normalize_segments_map(titles[tid].segments_map)
+        if segmap is None:
+            # No segment information -> cannot establish it's a duplicate ->
+            # keep it. This is the cautious default that protects TV discs
+            # and anything that doesn't report a segment map.
+            kept.append(tid)
+            continue
+        representative = seen.get(segmap)
         if representative is None:
+            seen[segmap] = tid
             kept.append(tid)
         else:
             dropped.append((tid, representative))
@@ -1679,24 +1701,25 @@ def process_iso(
         )
 
     # Collapse duplicate main titles (the same feature under multiple
-    # near-identical playlists) down to one copy - see
-    # dedupe_duplicate_titles(). Skipped under --main-playlist for the same
-    # reason play-all detection is: that path is a hand-picked selection and
-    # shouldn't be second-guessed. Without this, a disc exposing 2+ copies of
-    # the main feature extracts all of them, wasting space on identical output
-    # and producing a combined size that can exceed the source ISO and trip
-    # the runaway-output failsafe below.
+    # playlists that reference the identical source segments) down to one
+    # copy - see dedupe_duplicate_titles(). Skipped under --main-playlist for
+    # the same reason play-all detection is: that path is a hand-picked
+    # selection and shouldn't be second-guessed. Without this, a disc exposing
+    # 2+ copies of the main feature extracts all of them, wasting space on
+    # identical output and producing a combined size that can exceed the
+    # source ISO and trip the runaway-output failsafe below. Detection is by
+    # segment-map identity, not duration/size similarity, so distinct TV
+    # episodes that happen to share a runtime and size are never merged.
     if args.dedupe_duplicate_titles and not args.main_playlist and len(candidates) > 1:
-        deduped, dropped_dupes = dedupe_duplicate_titles(
-            candidates, titles, args.dedupe_duration_tol_sec, args.dedupe_size_tol_pct
-        )
+        deduped, dropped_dupes = dedupe_duplicate_titles(candidates, titles)
         for dropped_tid, rep_tid in dropped_dupes:
             logger.info(
                 f"Title {dropped_tid} (playlist {titles[dropped_tid].source_filename}, "
                 f"{format_duration(titles[dropped_tid].duration_sec)}, "
-                f"{human_bytes(titles[dropped_tid].size_bytes)}) matches title {rep_tid} "
-                f"(playlist {titles[rep_tid].source_filename}) in both duration and size - "
-                f"treating it as a duplicate of the main feature and keeping only title {rep_tid}",
+                f"{human_bytes(titles[dropped_tid].size_bytes)}) references the same source "
+                f"segments as title {rep_tid} (playlist {titles[rep_tid].source_filename}) - "
+                f"treating it as a duplicate copy of the same content and keeping only title "
+                f"{rep_tid}",
                 iso_path,
             )
         if dropped_dupes:
@@ -2193,23 +2216,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no-dedupe-duplicate-titles", dest="dedupe_duplicate_titles", action="store_false", default=True,
         help="Disable collapsing duplicate main titles. By default, when a disc exposes the same "
-             "feature as several near-identical titles (same duration AND size within tolerance - "
-             "common on Blu-rays with redundant/seamless-branching playlists), only one copy is "
-             "extracted instead of all of them. Disable this to extract every qualifying title as-is "
-             "(e.g. if a disc has genuinely distinct titles that happen to match closely). Ignored "
-             "under --main-playlist. On by default",
-    )
-    p.add_argument(
-        "--dedupe-duration-tol-sec", type=float, default=DEDUPE_DURATION_TOL_SEC_DEFAULT, metavar="SECONDS",
-        help="Two titles must be within this many seconds of each other in duration (one of the two "
-             "conditions) to be considered duplicate copies of the same feature",
-    )
-    p.add_argument(
-        "--dedupe-size-tol-pct", type=float, default=DEDUPE_SIZE_TOL_PCT_DEFAULT, metavar="PCT",
-        help="Two titles' MakeMKV-estimated sizes must be within this %% of each other (the second "
-             "of the two conditions, alongside --dedupe-duration-tol-sec) to be considered duplicate "
-             "copies. Requiring a size match as well as a duration match keeps genuinely different "
-             "same-length titles (e.g. TV episodes) from being wrongly merged",
+             "feature as multiple playlists that reference the identical source segments (common on "
+             "Blu-rays with redundant/seamless-branching playlists), only one copy is extracted "
+             "instead of all of them. Duplicates are identified by segment-map identity, not by "
+             "similar duration/size, so distinct TV episodes that share a runtime and size are "
+             "never merged; titles without a reported segment map are always kept. Disable this to "
+             "extract every qualifying title regardless. Ignored under --main-playlist. On by default",
     )
     p.add_argument(
         "-f", "--force", action="store_true",
