@@ -1435,10 +1435,16 @@ def process_iso(
     stats: Stats,
     used_output_names: set[str],
     probe_tool: str | None,
+    bytes_converted_so_far: int = 0,
 ) -> ProcessResult:
     """Returns a ProcessResult describing what happened, so main() can
     drive --limit accounting, source deletion, and the info-scan
-    circuit breaker."""
+    circuit breaker.
+
+    bytes_converted_so_far is the run-wide total of source ISO bytes
+    converted before this ISO (the same figure --limit tracks and the
+    end-of-run summary reports); it's used only to annotate the per-title
+    extraction log with cumulative batch progress."""
 
     min_length_sec = args.min_length * 60.0
 
@@ -1803,7 +1809,8 @@ def process_iso(
     for tid in sorted(candidates):
         title = titles[tid]
         logger.info(
-            f"Extracting title {tid} (duration {format_duration(title.duration_sec)}) -> {out_dir}",
+            f"Extracting title {tid} (duration {format_duration(title.duration_sec)}) -> {out_dir} "
+            f"[{human_bytes(bytes_converted_so_far)} converted so far]",
             iso_path,
         )
 
@@ -2457,7 +2464,8 @@ def main() -> int:
             # logger first.
             try:
                 result = process_iso(
-                    iso_path, input_root, output_root, args, logger, stats, used_output_names, probe_tool
+                    iso_path, input_root, output_root, args, logger, stats, used_output_names, probe_tool,
+                    bytes_converted_so_far=bytes_converted_running,
                 )
             except KeyboardInterrupt:
                 raise
