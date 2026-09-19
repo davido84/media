@@ -800,7 +800,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                   dry_run: bool = False, encoding: str = "software",
                   normalize_audio: bool = True, loudnorm_target: float = -16,
                   downscale: bool = False, strip_non_english_audio: bool = False,
-                  preset: str | None = None) -> ProcessResult | None:
+                  preset: str | None = None,
+                  processed_bytes_so_far: int = 0) -> ProcessResult | None:
     """Returns (original_size, new_size, video_duration_seconds, action, downscaled,
     grew_larger, retried) on success or dry-run preview, or None only when the caller
     already decided to skip the file entirely before calling this (not used internally
@@ -825,7 +826,13 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     to the normal batch path, not run_crf_comparison's test encodes, where seeing
     every CRF's actual size (including growth) is the point. Raises ConversionError if ffprobe or ffmpeg fails on a file
     that must be processed (small below-threshold files are copied regardless of a
-    duration-probe failure, since they were never going to be encoded)."""
+    duration-probe failure, since they were never going to be encoded).
+
+    processed_bytes_so_far is purely cosmetic: the running total (in bytes, across
+    prior files in this batch) the caller reports alongside the pre-encode ENCODING/
+    WOULD ENCODE log line, so someone tailing the log file can see cumulative progress
+    without cross-referencing the console output. It defaults to 0 for callers (e.g.
+    diagnose_encode_one's preset sweep) that don't track a meaningful running total."""
     min_size_bytes = min_size_mb * 1024 * 1024
     src_stat = src.stat()
     src_size = src_stat.st_size
@@ -930,7 +937,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                  f"downscale={'yes' if needs_downscale else 'no'}, crf={crf}, "
                  f"encoding={encoding}, "
                  f"normalize_audio={'yes (' + str(loudnorm_target) + ' LUFS)' if normalize_audio else 'no'}, "
-                 f"duration={'full' if duration == -1 else f'{duration}s'})")
+                 f"duration={'full' if duration == -1 else f'{duration}s'}, "
+                 f"converted so far: {human_size(processed_bytes_so_far)})")
 
     if dry_run:
         # Dry runs never invoke ffmpeg, so there's no measured loudness stats to show
@@ -1599,7 +1607,8 @@ def main() -> None:
             result = process_file(src, dst, args.crf, args.duration, args.min_size_mb,
                                    args.dry_run, args.encoding,
                                    args.normalize_audio, args.loudnorm_target, args.downscale,
-                                   args.strip_no_english_audio, args.preset)
+                                   args.strip_no_english_audio, args.preset,
+                                   processed_bytes)
         except ConversionTimeoutError as e:
             failed_path = e.file.resolve()
             logging.error(f"TIMEOUT: {failed_path}\n{e.reason}")
