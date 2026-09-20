@@ -20,7 +20,7 @@ IMPORTANT ASSUMPTIONS / CAVEATS (please read before relying on this in prod)
        makemkvcon -r info iso:/path/to/disc.iso | less
    and adjust the constants near the top of this file if needed.
 
-2. Playlist-obfuscation ("ScreenPass" / UOPs) handling uses TWO signals,
+2. Playlist-obfuscation ("ScreenPass" / UOPs) handling uses THREE signals,
    checked in this order:
 
      a) MakeMKV's own Java-based detection. If the Java Runtime Environment
@@ -80,35 +80,61 @@ IMPORTANT ASSUMPTIONS / CAVEATS (please read before relying on this in prod)
         When this fallback fires, and after filtering by --min-length
         there is exactly ONE title left that could be the main feature,
         that title is extracted. If more than one plausible candidate
-        remains, we cannot safely guess, so a WARNING is logged and the
-        disc is skipped entirely (source file left untouched).
+        remains, we cannot safely guess: the disc is treated as obfuscated
+        and NOT converted (see the shared handling under (c) below).
 
-     c) Manual override (--main-playlist), for the case where BOTH signals
+     c) A size-based obfuscation signal, checked after the candidate set is
+        finalized (post play-all removal and duplicate dedup) and applied to
+        every automatic path (not just the duration-cluster one). If the
+        selected titles' combined estimated size exceeds the source ISO's
+        own size by more than a large factor (--obfuscation-max-size-ratio,
+        default 3x), that many distinct titles physically cannot fit on the
+        disc, so they must be decoy playlists over the same content. This is
+        what catches discs (e.g. "You're Next") that deliberately spread
+        their decoy runtimes across minutes so no tight duration cluster
+        forms under (b) - the physical size math gives them away regardless.
+        It's guarded by a minimum candidate count (so a couple of genuinely
+        overlapping alternate cuts can't trip it) and runs BEFORE any
+        extraction, so an obfuscated disc is caught up front rather than
+        after grinding out a runaway pile of fake titles.
+
+        Shared handling for (b)-ambiguous and (c): in a normal run this is a
+        fail-fast error - the reason is logged (with guidance to research
+        the correct playlist and re-run with --main-playlist, or exclude the
+        disc) and the run exits, rather than converting a disc's worth of
+        decoys. In --dry-run it is downgraded to a warning and the disc is
+        listed as needing attention, so a survey run reports every problem
+        disc instead of stopping at the first.
+
+     d) Manual override (--main-playlist), for the case where the signals
         above fail - i.e. MakeMKV (even with a working JRE) can't identify
-        the main title, so the disc would otherwise be skipped by (b). If
-        you research the correct playlist for your specific disc (community
-        forums post these per release) you can pass its source playlist
-        filename, e.g. --main-playlist 00610.mpls. This bypasses all
-        automatic detection for that disc and forces that title as the main
-        feature (named main_title.mkv), additionally keeping every title
-        clearly SHORTER than it as extras (deleted scenes, featurettes)
-        while excluding the same-length decoys. Matching is on the source
-        PLAYLIST name - reported by MakeMKV as each title's "Source file
-        name" (attribute 16) - and NOT on MakeMKV's title index, which
-        isn't stable across versions or --min-length settings. Because a
-        playlist name only makes sense for one specific disc, the run must
-        resolve to exactly one ISO - either point --input at a folder
-        containing a single ISO, or narrow a larger folder with
-        --include/--exclude; the script aborts up front otherwise.
+        the main title, so the disc would otherwise be rejected by (b)/(c).
+        If you research the correct playlist for your specific disc
+        (community forums post these per release) you can pass its source
+        playlist filename, e.g. --main-playlist 00610.mpls. This bypasses
+        all automatic detection for that disc (including the (c) size guard)
+        and forces that title as the main feature (named main_title.mkv),
+        additionally keeping every title clearly SHORTER than it as extras
+        (deleted scenes, featurettes) while excluding the same-length
+        decoys. Matching is on the source PLAYLIST name - reported by
+        MakeMKV as each title's "Source file name" (attribute 16) - and NOT
+        on MakeMKV's title index, which isn't stable across versions or
+        --min-length settings. Because a playlist name only makes sense for
+        one specific disc, the run must resolve to exactly one ISO - either
+        point --input at a folder containing a single ISO, or narrow a
+        larger folder with --include/--exclude; the script aborts up front
+        otherwise.
 
    In both cases, makemkvcon is NEVER invoked with "all" - only explicit
    title numbers are ever passed.
 
-   Both signals above are Blu-ray specific (BD-Java doesn't exist on DVD,
+   Signals (a) and (b) are Blu-ray specific (BD-Java doesn't exist on DVD,
    and DVD protection schemes don't produce hundreds of decoy titles), so
    this script first classifies each ISO as DVD or Blu-ray by FILE SIZE
-   and skips this entire section for anything classified as DVD - see
-   point 2a-DVD below.
+   and skips those for anything classified as DVD - see point 2a-DVD below.
+   The size-based signal (c), by contrast, applies to every automatic path
+   including DVD, since its physical-size reasoning holds regardless of disc
+   type.
 
 2a-DVD. DVD vs Blu-ray classification is a SIZE HEURISTIC, not a real
    filesystem inspection (e.g. checking for a BDMV vs VIDEO_TS folder
@@ -414,6 +440,21 @@ DISC_TYPE_BLURAY: str = "BLURAY"
 # extraction, typically tens of percent to multiples over), so it allows this
 # much headroom above the expected size before tripping.
 RUNAWAY_OUTPUT_MARGIN_PCT_DEFAULT: float = 20.0
+
+# Size-based playlist-obfuscation signal (see detect_size_obfuscation). A
+# small disc that reports many large titles whose estimated sizes sum to far
+# more than the disc can physically hold is presenting decoy playlists over
+# the same underlying content - the sizes only sum so high because the decoys
+# overlap. This complements the duration-cluster signal (detect_obfuscation),
+# which only fires when the decoys share a duration; some discs (e.g. "You're
+# Next") deliberately spread decoy durations across minutes to defeat exactly
+# that, but can't hide from the physical size math. Two guards, to stay off
+# legitimate discs: at least this many candidate titles (so a handful of
+# genuinely overlapping cuts can't trip it), AND a combined estimate this
+# many times the ISO size (distinct real titles - movie+extras, TV episodes,
+# even multi-angle - sum to about the disc size, i.e. a ratio near 1).
+OBFUSCATION_SIZE_MIN_TITLES: int = 8
+OBFUSCATION_MAX_SIZE_RATIO_DEFAULT: float = 3.0
 
 # Sanity floor for "does this look like a real output file", used both to
 # verify a title actually got extracted before deleting the source (safety
@@ -1223,6 +1264,41 @@ def detect_obfuscation(
     return best_count >= threshold, best_center, best_count
 
 
+def detect_size_obfuscation(
+    candidates: list[int],
+    titles: dict[int, Title],
+    iso_size_bytes: int,
+    min_titles: int,
+    max_size_ratio: float,
+) -> tuple[bool, int, float]:
+    """Detect playlist obfuscation from the physical size math rather than
+    from duration clustering. Returns (suspected, estimated_total_bytes,
+    ratio).
+
+    Rationale: every candidate playlist reports an estimated size (the sum of
+    the segments it references). Distinct, real titles reference distinct
+    segments, so their estimates sum to roughly what's physically on the disc
+    - a combined-estimate-to-ISO ratio near 1 (a movie plus extras, a set of
+    TV episodes, even multiple camera angles, all sit around there). Decoy
+    playlists instead reference the SAME underlying segments over and over, so
+    each one still reports near-main-feature size and the estimates sum to a
+    large multiple of what the disc can actually hold. A ratio far above 1 is
+    therefore a reliable obfuscation signature - and unlike duration
+    clustering, it doesn't care whether the decoys share a runtime, so it
+    catches discs that spread decoy durations out to dodge that check.
+
+    Guarded twice to stay off legitimate discs: it needs at least min_titles
+    candidates (so a couple of genuinely overlapping alternate cuts can't trip
+    it) AND a ratio above max_size_ratio. Returns suspected=False (never a
+    false alarm) when the ISO size is unknown."""
+    estimated_total = sum(titles[t].size_bytes for t in candidates)
+    if iso_size_bytes <= 0:
+        return False, estimated_total, 0.0
+    ratio = estimated_total / iso_size_bytes
+    suspected = len(candidates) >= min_titles and ratio > max_size_ratio
+    return suspected, estimated_total, ratio
+
+
 MIN_CANDIDATES_FOR_PLAYALL_DETECTION: int = 3  # need the concat title plus >= 2 episodes
 
 
@@ -1425,6 +1501,40 @@ class ProcessResult:
 # --------------------------------------------------------------------------
 # Per-ISO processing
 # --------------------------------------------------------------------------
+
+
+def obfuscation_stop(
+    logger: "DualLogger",
+    stats: "Stats",
+    args: argparse.Namespace,
+    iso_path: Path,
+    reason: str,
+    jre_missing: bool,
+) -> "ProcessResult":
+    """Handle a disc that looks obfuscated and can't be safely converted -
+    dozens of decoy playlists with no resolvable main feature.
+
+    In a real run this is a fail-fast error: it logs the reason (with guidance
+    on how to proceed for this disc) and exits, so the run doesn't grind
+    through extracting a runaway pile of fake titles. In dry-run it instead
+    logs a warning and returns a needs-attention result, so the survey keeps
+    going and lists every problem disc rather than aborting at the first one.
+    The returned ProcessResult is only reached in dry-run; in a real run
+    logger.error() exits before the return."""
+    guidance = (
+        " - not converting this ISO. If you can research the correct main-feature playlist for "
+        "this disc, re-run it with --main-playlist <name>; otherwise exclude it from the batch."
+    )
+    if args.dry_run:
+        logger.warning(f"{reason}{guidance} (dry-run: skipping, not aborting)", iso_path)
+        stats.warnings += 1
+    else:
+        logger.error(f"{reason}{guidance}", iso_path)  # fail-fast: exits the run here
+    return ProcessResult(
+        needs_attention=True,
+        attention_reason=reason,
+        jre_missing=jre_missing,
+    )
 
 def process_iso(
     iso_path: Path,
@@ -1654,16 +1764,16 @@ def process_iso(
                 )
                 stats.warnings += 1
                 if len(candidates) != 1:
-                    logger.warning(
-                        f"Cannot reliably determine the correct main title "
-                        f"({len(candidates)} candidates >= min length) - skipping disc",
-                        iso_path,
-                    )
-                    stats.warnings += 1
-                    return ProcessResult(
-                        needs_attention=True,
-                        attention_reason="playlist obfuscation - main title ambiguous (research the "
-                                         "correct playlist and re-run with --main-playlist)",
+                    # Ambiguous obfuscation: many same-length candidates and no
+                    # way to tell which is the real feature. Fail-fast in a real
+                    # run (or note it and continue in dry-run).
+                    return obfuscation_stop(
+                        logger, stats, args, iso_path,
+                        reason=(
+                            f"Suspected playlist obfuscation: {len(candidates)} candidate titles "
+                            f"share ~{format_duration(dup_duration)} and no (FPL_MainFeature) marker "
+                            f"resolves the main feature"
+                        ),
                         jre_missing=jre_required_missing,
                     )
                 # Exactly one unambiguous candidate remains - safe to proceed.
@@ -1735,6 +1845,34 @@ def process_iso(
                 iso_path,
             )
         candidates = deduped
+
+    # --- Size-based obfuscation guard ---
+    # A last check before committing to extraction: if the titles we're about
+    # to extract have a combined estimated size far larger than the ISO can
+    # physically hold, they're decoy playlists over the same content, not that
+    # many distinct titles (see detect_size_obfuscation). This catches the
+    # obfuscated discs the duration-cluster signal misses - ones that spread
+    # decoy runtimes out by minutes so no tight duration cluster forms - and
+    # it does so BEFORE extracting anything (the runaway-output failsafe would
+    # otherwise let this run for a long time first, since the inflated
+    # per-title estimates also inflate its threshold). Skipped under
+    # --main-playlist, where the user has hand-resolved the disc.
+    if not args.main_playlist:
+        size_obfuscated, est_total, ratio = detect_size_obfuscation(
+            candidates, titles, iso_path.stat().st_size,
+            OBFUSCATION_SIZE_MIN_TITLES, args.obfuscation_max_size_ratio,
+        )
+        if size_obfuscated:
+            return obfuscation_stop(
+                logger, stats, args, iso_path,
+                reason=(
+                    f"Suspected playlist obfuscation: {len(candidates)} candidate titles have a "
+                    f"combined estimated size of {human_bytes(est_total)}, {ratio:.1f}x the "
+                    f"{human_bytes(iso_path.stat().st_size)} source ISO - impossible for that many "
+                    f"distinct titles, so these are decoy/fake playlists over the same content"
+                ),
+                jre_missing=jre_required_missing,
+            )
 
     # Resume check happens here, once we know exactly which titles we'd
     # extract - compared against a previous run's manifest (see
@@ -2184,6 +2322,17 @@ def parse_args() -> argparse.Namespace:
              "for obfuscation detection. Decoy playlists are often only *similar* in length, not "
              "frame-identical; this groups them instead of splitting near-equal durations across "
              "buckets. 0 requires (near-)exact duration matches",
+    )
+    p.add_argument(
+        "--obfuscation-max-size-ratio", type=float, default=OBFUSCATION_MAX_SIZE_RATIO_DEFAULT, metavar="X",
+        help=f"Second, size-based obfuscation signal (catches decoys whose durations are spread out "
+             f"to dodge the duration-cluster check). If the selected titles' combined estimated size "
+             f"exceeds the source ISO's size by more than this factor - impossible for that many "
+             f"distinct titles, so a sign of decoy playlists over the same content - the disc is "
+             f"flagged as obfuscated and not converted (errors out in a real run, noted in dry-run). "
+             f"Only applies once there are at least {OBFUSCATION_SIZE_MIN_TITLES} candidate titles, "
+             f"so a few genuinely overlapping alternate cuts won't trip it. Default "
+             f"{OBFUSCATION_MAX_SIZE_RATIO_DEFAULT:g}",
     )
     p.add_argument(
         "--main-playlist", default=None, metavar="MPLS",
