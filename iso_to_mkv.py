@@ -328,15 +328,14 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        are normal outcomes, not failures. This makes the run's
        success/failure visible to cron, systemd, or any other wrapper via
        $?.
-     - Title extraction streams makemkvcon's progress output live
-       (parsing PRGT/PRGV robot-mode lines) instead of going silent for
-       the whole extraction. Shown on the CONSOLE ONLY (never written to the
-       log file), as a single self-overwriting line carrying percent,
-       elapsed time, and an estimated throughput - enough to tell a slow
-       disc ("~8 MB/s") from a hung one ("stuck at 34%"). It overwrites
-       itself in place, so a normal title leaves no trail in the scrollback.
-       Requires stdout to be a real terminal: when output is redirected or
-       piped to a file it is suppressed (isatty is false), by design.
+     - Title extraction streams makemkvcon's progress output line-by-line
+       and parses it internally (the PRGV robot-mode percentage) purely to
+       drive the stall timeout below. There is no progress display - not on
+       the console, not in the log - so a run is quiet during a title and
+       reports only start/finish per title; visibility into a slow title
+       comes from the stall timeout stopping a genuinely stuck one, or from
+       watching makemkvcon's disk activity / the growing output file
+       externally.
      - Stall timeout: the same progress stream feeds a watchdog. If a
        title's overall percentage makes no forward progress for
        --stall-timeout-min minutes (default 15), makemkvcon is terminated
@@ -400,15 +399,10 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, TextIO
-
-# Type alias for the extraction-progress callback: receives a percentage
-# (0-100) and an optional short stage label, and returns nothing.
-ProgressCallback = Callable[[float, str | None], None]
 
 # --------------------------------------------------------------------------
 # Constants
@@ -476,13 +470,6 @@ OBFUSCATION_MAX_SIZE_RATIO_DEFAULT: float = 3.0
 # so a legitimately large, slow-but-progressing title isn't killed - only a
 # genuinely stuck one. 0 disables it (see --stall-timeout-min).
 STALL_TIMEOUT_MIN_DEFAULT: float = 15.0
-
-# Minimum interval between redraws of the single self-overwriting progress
-# line, so that on a slow title the elapsed time and estimated rate keep
-# ticking even while the whole-number percent sits still - without rewriting
-# the line on every one of makemkvcon's frequent progress updates. Console
-# only - never written to the log file.
-PROGRESS_REDRAW_MIN_SEC: float = 2.0
 
 # How often the stall watchdog wakes to check for lack of progress. Small
 # relative to the stall timeout so a stall is caught promptly after it starts.
@@ -1068,23 +1055,21 @@ def _terminate_proc(proc: "subprocess.Popen[str]") -> None:
 
 def run_cmd_with_progress(
     cmd: list[str],
-    on_progress: ProgressCallback | None = None,
     stall_timeout_sec: float | None = None,
 ) -> tuple[int, str, bool]:
-    """Like run_cmd, but streams output line-by-line so PRGT/PRGV progress
-    lines can be reported live via on_progress(percent, label) while a
-    long title extraction is running (workflow enhancement 5), instead of
-    going silent until the whole title finishes. Still returns the full
+    """Like run_cmd, but streams output line-by-line while a long title
+    extraction runs, parsing makemkvcon's PRGV robot-mode progress lines to
+    drive a stall watchdog. There is no console/progress reporting - progress
+    is consumed purely internally for the stall guard. Still returns the full
     captured output for post-hoc error diagnostics, same as run_cmd.
 
     Returns (returncode, output, stalled). When stall_timeout_sec is set, a
     watchdog thread aborts the child if makemkvcon's overall percentage makes
     no forward progress for that long - a genuinely hung extraction - and
-    stalled comes back True (the returncode will be nonzero from the kill).
-    Progress is tracked here regardless of whether on_progress is provided, so
-    the stall guard works even with no console printer attached. A stall is
-    the *lack of percentage advance*, not merely the absence of output, so a
-    process wedged at a fixed percent while still chattering is still caught.
+    stalled comes back True (the returncode will be nonzero from the kill). A
+    stall is the *lack of percentage advance*, not merely the absence of
+    output, so a process wedged at a fixed percent while still chattering is
+    still caught.
 
     On Ctrl+C, explicitly terminates (then kills, if needed) the child
     process before re-raising, so an interrupt doesn't leave an orphaned
@@ -1097,7 +1082,6 @@ def run_cmd_with_progress(
         return 127, f"Could not execute command {cmd!r}: {e}", False
 
     lines: list[str] = []
-    current_label: str | None = None
     last_advance = [time.monotonic()]  # mutable holder shared with the watchdog thread
     highest_pct = [-1.0]
     stalled = threading.Event()
@@ -1119,11 +1103,8 @@ def run_cmd_with_progress(
         for raw_line in proc.stdout:
             line = raw_line.rstrip("\n")
             lines.append(line)
-            if line.startswith("PRGT:"):
-                fields = csv_fields(line.removeprefix("PRGT:"))
-                if len(fields) >= 3:
-                    current_label = fields[2]
-            elif line.startswith("PRGV:"):
+            # Parse overall-progress lines only to feed the stall watchdog.
+            if line.startswith("PRGV:"):
                 fields = csv_fields(line.removeprefix("PRGV:"))
                 if len(fields) >= 3:
                     try:
@@ -1137,8 +1118,6 @@ def run_cmd_with_progress(
                         if pct > highest_pct[0]:
                             highest_pct[0] = pct
                             last_advance[0] = time.monotonic()
-                        if on_progress is not None:
-                            on_progress(pct, current_label)
     except KeyboardInterrupt:
         stop_watchdog.set()
         _terminate_proc(proc)
@@ -1153,55 +1132,6 @@ def run_cmd_with_progress(
             watchdog.join(timeout=5)
 
     return proc.returncode, "\n".join(lines), stalled.is_set()
-
-
-def make_progress_printer(
-    iso_name: str, title_id: int, estimated_bytes: int = 0
-) -> ProgressCallback | None:
-    """Returns an on_progress callback that prints extraction progress to the
-    CONSOLE ONLY (never to the log file - that would just be noise, and
-    progress output is deliberately kept out of the persistent log). Only
-    prints when stdout is a real terminal, since a \\r updating line doesn't
-    make sense when output is redirected to a file or piped.
-
-    A single self-overwriting (\\r) line carries everything: percent, elapsed
-    time, and an estimated throughput - enough to tell "crawling at ~8 MB/s"
-    from "stuck at 34%" at a glance. Because it overwrites itself in place,
-    nothing accumulates in the scrollback: a normal fast title leaves no
-    trail, and only the one live line is ever on screen. It's redrawn when
-    the whole-number percent changes, or at least every
-    PROGRESS_REDRAW_MIN_SEC so elapsed/rate keep moving on a slow title.
-
-    estimated_bytes is MakeMKV's size estimate for this title, used only to
-    turn the percentage into a rough MB/s; if it's unknown (0) the throughput
-    is simply omitted."""
-    if not sys.stdout.isatty():
-        return None
-    start = time.monotonic()
-    state: dict[str, float] = {"last_pct": -1.0, "last_draw": 0.0}
-
-    def _cb(pct: float, label: str | None) -> None:
-        now = time.monotonic()
-        pct_int = int(pct)
-        if pct_int == int(state["last_pct"]) and (now - state["last_draw"]) < PROGRESS_REDRAW_MIN_SEC:
-            return
-        state["last_pct"] = float(pct_int)
-        state["last_draw"] = now
-        elapsed = now - start
-        rate = ""
-        # Only show a rate once enough time has passed for it to mean anything;
-        # in the first few seconds (pct and elapsed both tiny) the estimate is
-        # noise and can spike absurdly.
-        if estimated_bytes > 0 and elapsed >= 5.0:
-            mbps = (pct / 100.0 * estimated_bytes) / elapsed / 1_000_000.0
-            rate = f", ~{mbps:.0f} MB/s"
-        text = f"    {iso_name} title {title_id}: {pct_int:3d}% ({format_duration(elapsed)}{rate})"
-        if label:
-            text += f" {label}"
-        sys.stdout.write("\r" + text.ljust(90))
-        sys.stdout.flush()
-
-    return _cb
 
 
 @dataclass
@@ -2088,13 +2018,7 @@ def process_iso(
 
         before_snapshot = snapshot_output_dir(out_dir)
         logger.file_only("CMD", " ".join(cmd), iso_path)
-        progress_cb = make_progress_printer(iso_path.name, tid, title.size_bytes)
-        rc, mkv_output, stalled = run_cmd_with_progress(
-            cmd, on_progress=progress_cb, stall_timeout_sec=stall_timeout_sec
-        )
-        if progress_cb is not None:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+        rc, mkv_output, stalled = run_cmd_with_progress(cmd, stall_timeout_sec=stall_timeout_sec)
 
         if stalled:
             # No forward progress for the stall-timeout window: makemkvcon was
