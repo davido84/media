@@ -283,10 +283,15 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        to catch real duplicates would also merge genuinely different
        episodes; the segment map is a content fingerprint that separates
        "same content, multiple playlists" from "different content, similar
-       length" outright. It errs toward keeping: a title whose segment map
-       is missing/empty (some discs, and typically DVDs, don't report one)
-       is always kept. On by default; disable with
-       --no-dedupe-duplicate-titles, and ignored under --main-playlist.
+       length" outright. This runs on BLU-RAY ONLY: on DVD a title's
+       segment map reflects shared VOB files rather than distinct streams,
+       so MakeMKV reports matching maps for genuinely different episodes -
+       untrustworthy for this purpose - and DVDs don't have the
+       duplicate-main-title obfuscation this undoes anyway, so DVDs are
+       never deduped (every title kept). It also errs toward keeping on
+       Blu-ray: a title whose segment map is missing/empty is always kept.
+       On by default; disable with --no-dedupe-duplicate-titles, and
+       ignored under --main-playlist.
      - Runaway-output failsafe: the running total size of everything
        extracted from an ISO so far is checked after each title. If it
        grossly exceeds the expected size - the larger of the summed
@@ -1418,6 +1423,17 @@ def dedupe_duplicate_titles(
     ordered set of source .m2ts segments its playlist references) as the test
     for "same content".
 
+    INTENDED FOR BLU-RAY ONLY; the caller must gate this on disc type. The
+    segment map (MakeMKV attribute 26) is a trustworthy content fingerprint on
+    Blu-ray, where each title is a playlist over its own distinct .m2ts stream
+    segments. It is NOT trustworthy on DVD: a DVD's titles (PGCs) within one
+    VTS all reference the same shared VOB files, so MakeMKV reports identical
+    or overlapping segment maps for genuinely different episodes - which would
+    make this function merge distinct episodes (as seen on "V (2009)" S2D2).
+    This function itself can't tell the two formats apart from the title data,
+    so it trusts the segment map at face value; keeping it Blu-ray-only is the
+    caller's responsibility.
+
     Some Blu-rays present the main feature as multiple playlists that all
     point at the same underlying segments (seamless-branching artifacts,
     redundant playlists, or a mild anti-ripping tactic). When no single
@@ -1433,20 +1449,16 @@ def dedupe_duplicate_titles(
     to the second and a size to a fraction of a percent (same show, same
     target length, same encode settings), so any duration/size tolerance
     loose enough to catch real duplicates also merges genuinely different
-    episodes. The segment map is a content fingerprint instead - two
-    different episodes occupy different segments on the disc, while true
-    duplicate playlists occupy exactly the same ones - so it distinguishes
-    "same content, multiple playlists" from "different content, similar
-    length" with no tolerance to tune and no risk of merging distinct
-    episodes.
+    episodes. On Blu-ray the segment map is a content fingerprint instead -
+    two different episodes occupy different .m2ts segments, while true
+    duplicate playlists occupy exactly the same ones.
 
     Erring toward caution: a title is only ever dropped when its (non-empty)
     segment map is byte-identical to one already kept. Any title whose
-    segment map is missing/empty (some discs, and typically DVDs, don't
-    report one) is always kept - "can't prove it's a duplicate" resolves to
-    "keep it", never "drop it". The lowest title_id of each duplicate group
-    is kept, so output naming stays deterministic run to run. Returns
-    (kept_tids_sorted, dropped) where dropped is a list of
+    segment map is missing/empty is always kept - "can't prove it's a
+    duplicate" resolves to "keep it", never "drop it". The lowest title_id of
+    each duplicate group is kept, so output naming stays deterministic run to
+    run. Returns (kept_tids_sorted, dropped) where dropped is a list of
     (dropped_tid, kept_representative_tid) for logging."""
     kept: list[int] = []
     dropped: list[tuple[int, int]] = []
@@ -1858,7 +1870,24 @@ def process_iso(
     # source ISO and trip the runaway-output failsafe below. Detection is by
     # segment-map identity, not duration/size similarity, so distinct TV
     # episodes that happen to share a runtime and size are never merged.
-    if args.dedupe_duplicate_titles and not args.main_playlist and len(candidates) > 1:
+    #
+    # BLU-RAY ONLY. The segment map (MakeMKV attribute 26) is a reliable
+    # content fingerprint on Blu-ray, where each title's playlist references
+    # its own distinct .m2ts stream segments. On DVD it is NOT: a DVD's titles
+    # (PGCs) within one VTS all reference the same shared VOB files, so
+    # MakeMKV reports identical/overlapping segment maps for genuinely
+    # DIFFERENT episodes (observed on "V (2009)" S2D2, where 5 distinct
+    # episodes collapsed to 2). DVDs also don't have the duplicate-main-title
+    # obfuscation this exists to undo, so there's nothing to gain and real
+    # episodes to lose - we simply don't dedup DVDs, erring toward keeping
+    # every title. (The play-all concatenation title is still removed
+    # separately, and the runaway/size-obfuscation guards still apply.)
+    if (
+        args.dedupe_duplicate_titles
+        and not args.main_playlist
+        and disc_type == DISC_TYPE_BLURAY
+        and len(candidates) > 1
+    ):
         deduped, dropped_dupes = dedupe_duplicate_titles(candidates, titles)
         for dropped_tid, rep_tid in dropped_dupes:
             logger.info(
