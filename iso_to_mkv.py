@@ -333,21 +333,25 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        are normal outcomes, not failures. This makes the run's
        success/failure visible to cron, systemd, or any other wrapper via
        $?.
-     - Title extraction streams makemkvcon's progress output line-by-line
-       and parses it internally (the PRGV robot-mode percentage) purely to
-       drive the stall timeout below. There is no progress display - not on
-       the console, not in the log - so a run is quiet during a title and
-       reports only start/finish per title; visibility into a slow title
-       comes from the stall timeout stopping a genuinely stuck one, or from
-       watching makemkvcon's disk activity / the growing output file
-       externally.
-     - Stall timeout: the same progress stream feeds a watchdog. If a
-       title's overall percentage makes no forward progress for
-       --stall-timeout-min minutes (default 15), makemkvcon is terminated
-       and the run fails fast with an error, so a hung extraction or an
-       unreadable disc stops for investigation instead of blocking forever.
-       It keys on *lack of percentage advance*, not wall-clock time, so a
-       slow-but-progressing large title is never killed; set 0 to disable.
+     - No progress display - not on the console, not in the log - so a run
+       is quiet during a title and reports only start/finish per title;
+       visibility into a slow title comes from the stall timeout stopping a
+       genuinely stuck one, or from watching makemkvcon's disk activity /
+       the growing output file externally.
+     - Stall timeout: a watchdog aborts a genuinely hung extraction so it
+       can't block the batch forever. It watches the OUTPUT .mkv FILE
+       GROWING ON DISK - not makemkvcon's progress messages - because
+       makemkvcon block-buffers its robot-mode output when piped, so those
+       messages arrive in unpredictable bursts (or barely at all) during a
+       long extraction and keying on them produced false stalls on healthy
+       titles. Bytes landing in the output file are the ground truth of
+       real work and immune to that buffering. If neither the output file
+       grows nor makemkvcon's percentage advances for --stall-timeout-min
+       minutes (default 15), makemkvcon is terminated and the run fails
+       fast with an error (reporting how much was written and how long it
+       ran, to tell a real stall from a slow disc). Set 0 to disable. It's
+       a stall detector, not a wall-clock limit, so a slow-but-progressing
+       large title is never killed.
      - Ctrl+C during a run terminates the in-flight makemkvcon child
        process cleanly, then still prints the summary-so-far and closes
        the log, rather than leaving an orphaned process or a truncated
@@ -476,9 +480,11 @@ OBFUSCATION_MAX_SIZE_RATIO_DEFAULT: float = 3.0
 # genuinely stuck one. 0 disables it (see --stall-timeout-min).
 STALL_TIMEOUT_MIN_DEFAULT: float = 15.0
 
-# How often the stall watchdog wakes to check for lack of progress. Small
-# relative to the stall timeout so a stall is caught promptly after it starts.
-STALL_CHECK_INTERVAL_SEC: float = 5.0
+# How often the stall watchdog wakes to measure output-file growth. Small
+# relative to the (minutes-long) stall timeout so a stall is caught promptly,
+# but not so frequent that polling the output directory's size adds needless
+# metadata I/O on a busy disk.
+STALL_CHECK_INTERVAL_SEC: float = 15.0
 
 # Sanity floor for "does this look like a real output file", used both to
 # verify a title actually got extracted before deleting the source (safety
@@ -1080,23 +1086,50 @@ def _terminate_proc(proc: "subprocess.Popen[str]") -> None:
         proc.wait()
 
 
+def _output_bytes(out_dir: Path | None) -> int:
+    """Total size of the .mkv files currently in out_dir (0 if unknown or
+    unreadable). Used by the stall watchdog to observe real extraction
+    progress - bytes landing on disk - independently of makemkvcon's progress
+    messages."""
+    if out_dir is None:
+        return 0
+    try:
+        return sum(
+            p.stat().st_size
+            for p in out_dir.iterdir()
+            if p.is_file() and p.suffix.lower() == ".mkv"
+        )
+    except OSError:
+        return 0
+
+
 def run_cmd_with_progress(
     cmd: list[str],
     stall_timeout_sec: float | None = None,
+    out_dir: Path | None = None,
 ) -> tuple[int, str, bool]:
-    """Like run_cmd, but streams output line-by-line while a long title
-    extraction runs, parsing makemkvcon's PRGV robot-mode progress lines to
-    drive a stall watchdog. There is no console/progress reporting - progress
-    is consumed purely internally for the stall guard. Still returns the full
-    captured output for post-hoc error diagnostics, same as run_cmd.
+    """Like run_cmd, but streams output while a long title extraction runs and
+    drives a stall watchdog, so a genuinely hung makemkvcon is aborted instead
+    of blocking the batch forever. Returns (returncode, output, stalled);
+    stalled is True when the watchdog killed the child (returncode will be
+    nonzero from the kill).
 
-    Returns (returncode, output, stalled). When stall_timeout_sec is set, a
-    watchdog thread aborts the child if makemkvcon's overall percentage makes
-    no forward progress for that long - a genuinely hung extraction - and
-    stalled comes back True (the returncode will be nonzero from the kill). A
-    stall is the *lack of percentage advance*, not merely the absence of
-    output, so a process wedged at a fixed percent while still chattering is
-    still caught.
+    IMPORTANT - what "progress" means here. The stall clock is reset by the
+    OUTPUT .mkv FILE GROWING ON DISK (polled from out_dir), NOT by makemkvcon's
+    progress *messages*. This is deliberate: makemkvcon's stdout is block-
+    buffered when it's a pipe rather than a console, so its robot-mode PRGV
+    lines can arrive in irregular bursts - or barely at all - during a long
+    extraction even while it's working perfectly. Keying the stall detector on
+    those messages produced false stalls on healthy long titles (different
+    ones each run, since flush timing is nondeterministic). Bytes hitting the
+    output file are the ground truth of real work and are immune to that
+    buffering. Received PRGV advances still count as activity too (a secondary
+    reset, covering the brief pre-save phase before the file exists), but the
+    file growth is the workhorse. A stall - and a kill - happens only when
+    NEITHER the output file grew NOR progress advanced for stall_timeout_sec.
+
+    We still drain stdout (so makemkvcon never blocks on a full pipe) and keep
+    the full captured output for post-hoc error diagnostics, same as run_cmd.
 
     On Ctrl+C, explicitly terminates (then kills, if needed) the child
     process before re-raising, so an interrupt doesn't leave an orphaned
@@ -1109,7 +1142,7 @@ def run_cmd_with_progress(
         return 127, f"Could not execute command {cmd!r}: {e}", False
 
     lines: list[str] = []
-    last_advance = [time.monotonic()]  # mutable holder shared with the watchdog thread
+    last_activity = [time.monotonic()]  # reset on output-file growth OR progress advance
     highest_pct = [-1.0]
     stalled = threading.Event()
     stop_watchdog = threading.Event()
@@ -1117,8 +1150,13 @@ def run_cmd_with_progress(
     watchdog: threading.Thread | None = None
     if stall_timeout_sec is not None and stall_timeout_sec > 0:
         def _watch() -> None:
+            last_size = _output_bytes(out_dir)
             while not stop_watchdog.wait(STALL_CHECK_INTERVAL_SEC):
-                if time.monotonic() - last_advance[0] > stall_timeout_sec:
+                size = _output_bytes(out_dir)
+                if size > last_size:  # real bytes written since last check
+                    last_size = size
+                    last_activity[0] = time.monotonic()
+                if time.monotonic() - last_activity[0] > stall_timeout_sec:
                     stalled.set()
                     _terminate_proc(proc)
                     return
@@ -1127,10 +1165,17 @@ def run_cmd_with_progress(
 
     try:
         assert proc.stdout is not None
-        for raw_line in proc.stdout:
+        # readline() rather than "for line in proc.stdout" so lines are handed
+        # over as they arrive instead of waiting for Python's iterator read-
+        # ahead buffer to fill - one less layer of buffering between us and
+        # makemkvcon.
+        for raw_line in iter(proc.stdout.readline, ""):
             line = raw_line.rstrip("\n")
             lines.append(line)
-            # Parse overall-progress lines only to feed the stall watchdog.
+            # A received progress advance is a secondary "still alive" signal
+            # (see docstring); the output-file growth in the watchdog is the
+            # primary one. Only a real advance counts, so a fixed-percent
+            # process that keeps re-emitting the same PRGV doesn't mask a stall.
             if line.startswith("PRGV:"):
                 fields = csv_fields(line.removeprefix("PRGV:"))
                 if len(fields) >= 3:
@@ -1140,11 +1185,9 @@ def run_cmd_with_progress(
                         continue
                     if maxv > 0:
                         pct = min(100.0, max(0.0, (total / maxv) * 100.0))
-                        # Only a real advance resets the stall clock, so a
-                        # process stuck at a fixed percent still trips it.
                         if pct > highest_pct[0]:
                             highest_pct[0] = pct
-                            last_advance[0] = time.monotonic()
+                            last_activity[0] = time.monotonic()
     except KeyboardInterrupt:
         stop_watchdog.set()
         _terminate_proc(proc)
@@ -2068,20 +2111,30 @@ def process_iso(
             break  # further titles for this ISO won't fare any better
 
         before_snapshot = snapshot_output_dir(out_dir)
+        before_bytes = sum(before_snapshot.values())
+        extract_start = time.monotonic()
         logger.file_only("CMD", " ".join(cmd), iso_path)
-        rc, mkv_output, stalled = run_cmd_with_progress(cmd, stall_timeout_sec=stall_timeout_sec)
+        rc, mkv_output, stalled = run_cmd_with_progress(
+            cmd, stall_timeout_sec=stall_timeout_sec, out_dir=out_dir
+        )
 
         if stalled:
-            # No forward progress for the stall-timeout window: makemkvcon was
+            # The output file stopped growing (and no progress advanced) for the
+            # stall-timeout window: makemkvcon is genuinely hung, so it was
             # terminated. Fail-fast so the run stops and this title can be
             # investigated (a hung makemkvcon, a bad-sector disc, etc.) rather
-            # than silently moving on or hanging indefinitely.
+            # than silently moving on or hanging indefinitely. The elapsed time
+            # and bytes-written figures make a genuine stall ("wrote 12 GB then
+            # stopped") easy to distinguish from a spurious one at a glance.
+            elapsed = time.monotonic() - extract_start
+            written = max(0, sum(snapshot_output_dir(out_dir).values()) - before_bytes)
             logger.append_raw_to_file(mkv_output)
             logger.error(
-                f"Title {tid} extraction made no progress for {args.stall_timeout_min:g} minute(s) "
-                f"(stall timeout) - makemkvcon was terminated. The disc may have bad sectors or "
-                f"makemkvcon may be hung; investigate this title. Raise or disable the limit with "
-                f"--stall-timeout-min if this title is just genuinely slow.",
+                f"Title {tid} extraction stalled - the output file stopped growing for "
+                f"{args.stall_timeout_min:g} minute(s) (wrote {human_bytes(written)} in "
+                f"{format_duration(elapsed)} before stalling), so makemkvcon was terminated. The "
+                f"disc may have bad sectors or makemkvcon may be hung; investigate this title. "
+                f"Raise or disable the limit with --stall-timeout-min if it was just genuinely slow.",
                 iso_path,
             )
             # logger.error() is fail-fast: this exits the run.
