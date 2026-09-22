@@ -972,11 +972,16 @@ def free_bytes_on_volume(path: Path) -> int | None:
 # --------------------------------------------------------------------------
 
 class DualLogger:
-    """Writes to console (ISO name only, no path) and to a log file
-    (full ISO path), per the requested behavior."""
+    """Writes to the console (a short ISO label) and to a log file (full ISO
+    path). The console label is the ISO's path relative to the scanned input
+    root (e.g. 'Breaking Bad/1-1.ISO', or just '1-1.ISO' for an ISO directly
+    in the root), so which show/movie a line refers to is visible at a glance
+    without the full path's noise. Pass iso_root (the --input root) to enable
+    that; without it, the label is the filename only."""
 
-    def __init__(self, log_path: Path) -> None:
+    def __init__(self, log_path: Path, iso_root: Path | None = None) -> None:
         self.log_path: Path = log_path
+        self.iso_root: Path | None = iso_root
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         # Append mode: successive runs accumulate in one log rather than
         # overwriting. The "Run started" banner below separates runs.
@@ -993,9 +998,26 @@ class DualLogger:
     def append_raw_to_file(self, line: str) -> None:
         self._raw(line)
 
+    def _console_label(self, iso_path: Path) -> str:
+        """The ISO identifier for console lines: its path RELATIVE TO the
+        scanned input root, so which show/movie a line refers to is visible
+        without the full absolute path's noise. For '<root>/Breaking Bad/
+        1-1.ISO' that's 'Breaking Bad/1-1.ISO'; for an ISO sitting directly
+        in the root it's just '1-1.ISO' (no prefix); deeper nesting shows the
+        whole relative path. Forward slashes regardless of platform, matching
+        how --include/--exclude render paths. Falls back to the filename
+        alone when no input root is known or the ISO isn't under it. The log
+        file always records the full absolute path regardless."""
+        if self.iso_root is not None:
+            try:
+                return iso_path.relative_to(self.iso_root).as_posix()
+            except ValueError:
+                pass
+        return iso_path.name
+
     def _log(self, level: str, message: str, iso_path: Path | None) -> None:
         ts = self._timestamp()
-        console_target = f" {iso_path.name}:" if iso_path is not None else ""
+        console_target = f" {self._console_label(iso_path)}:" if iso_path is not None else ""
         file_target = f" {iso_path}:" if iso_path is not None else ""
         print(f"{ts} [{level}]{console_target} {message}")
         self._raw(f"{ts} [{level}]{file_target} {message}")
@@ -2543,7 +2565,7 @@ def main() -> int:
     # given) is honored as-is, relative to the current directory.
     log_path = (output_root / DEFAULT_LOG_NAME) if args.log is None else Path(args.log).resolve()
 
-    logger = DualLogger(log_path)
+    logger = DualLogger(log_path, iso_root=input_root)
 
     if args.dry_run:
         logger.info("Running in DRY RUN mode - no files will be changed")
