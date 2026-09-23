@@ -339,19 +339,22 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        genuinely stuck one, or from watching makemkvcon's disk activity /
        the growing output file externally.
      - Stall timeout: a watchdog aborts a genuinely hung extraction so it
-       can't block the batch forever. It watches the OUTPUT .mkv FILE
-       GROWING ON DISK - not makemkvcon's progress messages - because
-       makemkvcon block-buffers its robot-mode output when piped, so those
-       messages arrive in unpredictable bursts (or barely at all) during a
-       long extraction and keying on them produced false stalls on healthy
-       titles. Bytes landing in the output file are the ground truth of
-       real work and immune to that buffering. If neither the output file
-       grows nor makemkvcon's percentage advances for --stall-timeout-min
-       minutes (default 15), makemkvcon is terminated and the run fails
-       fast with an error (reporting how much was written and how long it
-       ran, to tell a real stall from a slow disc). Set 0 to disable. It's
-       a stall detector, not a wall-clock limit, so a slow-but-progressing
-       large title is never killed.
+       can't block the batch forever. It watches makemkvcon's PROCESS I/O
+       BYTE COUNTERS (the kernel's own per-process read+write accounting,
+       via GetProcessIoCounters) - not makemkvcon's progress messages, and
+       not the output file's size. This is immune to two separate problems:
+       makemkvcon block-buffers its robot-mode output when piped (so those
+       messages arrive in unpredictable bursts, and keying on them produced
+       false stalls on healthy titles), AND some filesystems report a
+       growing file's size lazily (notably a StableBit DrivePool pool). The
+       kernel's byte counters tick up in real time as makemkvcon actually
+       moves data, regardless of output filesystem. If the process moves no
+       bytes AND makemkvcon's percentage doesn't advance for
+       --stall-timeout-min minutes (default 15), makemkvcon is terminated
+       and the run fails fast with an error (reporting how much was written
+       and how long it ran, to tell a real stall from a slow disc). Set 0
+       to disable. It's a stall detector, not a wall-clock limit, so a
+       slow-but-progressing large title is never killed.
      - Ctrl+C during a run terminates the in-flight makemkvcon child
        process cleanly, then still prints the summary-so-far and closes
        the log, rather than leaving an orphaned process or a truncated
@@ -400,6 +403,7 @@ script. See organize_media.py's own docstring for details.
 """
 
 import argparse
+import ctypes
 import json
 import os
 import re
@@ -480,10 +484,9 @@ OBFUSCATION_MAX_SIZE_RATIO_DEFAULT: float = 3.0
 # genuinely stuck one. 0 disables it (see --stall-timeout-min).
 STALL_TIMEOUT_MIN_DEFAULT: float = 15.0
 
-# How often the stall watchdog wakes to measure output-file growth. Small
-# relative to the (minutes-long) stall timeout so a stall is caught promptly,
-# but not so frequent that polling the output directory's size adds needless
-# metadata I/O on a busy disk.
+# How often the stall watchdog wakes to sample makemkvcon's process I/O
+# counters. Small relative to the (minutes-long) stall timeout so a stall is
+# caught promptly; the sample itself is a cheap in-memory kernel query.
 STALL_CHECK_INTERVAL_SEC: float = 15.0
 
 # Sanity floor for "does this look like a real output file", used both to
@@ -1086,27 +1089,65 @@ def _terminate_proc(proc: "subprocess.Popen[str]") -> None:
         proc.wait()
 
 
-def _output_bytes(out_dir: Path | None) -> int:
-    """Total size of the .mkv files currently in out_dir (0 if unknown or
-    unreadable). Used by the stall watchdog to observe real extraction
-    progress - bytes landing on disk - independently of makemkvcon's progress
-    messages."""
-    if out_dir is None:
-        return 0
+class _IO_COUNTERS(ctypes.Structure):
+    """Mirror of the Win32 IO_COUNTERS struct filled by GetProcessIoCounters.
+    All six fields are cumulative-since-process-start ULONGLONGs."""
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_ulonglong),
+        ("WriteOperationCount", ctypes.c_ulonglong),
+        ("OtherOperationCount", ctypes.c_ulonglong),
+        ("ReadTransferCount", ctypes.c_ulonglong),
+        ("WriteTransferCount", ctypes.c_ulonglong),
+        ("OtherTransferCount", ctypes.c_ulonglong),
+    ]
+
+
+# Lazily-bound kernel32.GetProcessIoCounters: None = not yet tried, False =
+# tried and unavailable, else the callable. Bound on first use (rather than at
+# import) so the module still imports anywhere for tooling/tests, without a
+# platform check in the hot path.
+_get_process_io_counters: "object | None" = None
+
+
+def _process_io_bytes(proc: "subprocess.Popen[str]") -> int:
+    """Total bytes this process has transferred so far (read + write + other),
+    via Windows GetProcessIoCounters - the kernel's own per-process I/O
+    accounting. This is the stall watchdog's ground-truth "is makemkvcon
+    actually doing work" signal: it updates in real time as makemkvcon reads
+    the ISO and writes the MKV, independently of (a) makemkvcon's stdout
+    buffering and (b) whatever filesystem the output lands on - so it behaves
+    identically on a StableBit DrivePool pool and on plain NTFS, sidestepping
+    any pool-layer file-size caching. Returns -1 if the counters can't be read.
+
+    Note: counts only the makemkvcon process we launched, not any child
+    processes it might spawn; makemkvcon64.exe does its own I/O, so this holds
+    in practice."""
+    global _get_process_io_counters
+    if _get_process_io_counters is None:
+        try:
+            fn = ctypes.WinDLL("kernel32", use_last_error=True).GetProcessIoCounters
+            fn.restype = ctypes.c_int  # BOOL
+            fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_IO_COUNTERS)]
+            _get_process_io_counters = fn
+        except Exception:
+            _get_process_io_counters = False
+    if not _get_process_io_counters:
+        return -1
     try:
-        return sum(
-            p.stat().st_size
-            for p in out_dir.iterdir()
-            if p.is_file() and p.suffix.lower() == ".mkv"
-        )
-    except OSError:
-        return 0
+        handle = int(proc._handle)  # Popen's process handle (Windows)
+    except Exception:
+        return -1
+    counters = _IO_COUNTERS()
+    if not _get_process_io_counters(ctypes.c_void_p(handle), ctypes.byref(counters)):
+        return -1
+    return int(
+        counters.ReadTransferCount + counters.WriteTransferCount + counters.OtherTransferCount
+    )
 
 
 def run_cmd_with_progress(
     cmd: list[str],
     stall_timeout_sec: float | None = None,
-    out_dir: Path | None = None,
 ) -> tuple[int, str, bool]:
     """Like run_cmd, but streams output while a long title extraction runs and
     drives a stall watchdog, so a genuinely hung makemkvcon is aborted instead
@@ -1115,18 +1156,24 @@ def run_cmd_with_progress(
     nonzero from the kill).
 
     IMPORTANT - what "progress" means here. The stall clock is reset by the
-    OUTPUT .mkv FILE GROWING ON DISK (polled from out_dir), NOT by makemkvcon's
-    progress *messages*. This is deliberate: makemkvcon's stdout is block-
-    buffered when it's a pipe rather than a console, so its robot-mode PRGV
-    lines can arrive in irregular bursts - or barely at all - during a long
-    extraction even while it's working perfectly. Keying the stall detector on
-    those messages produced false stalls on healthy long titles (different
-    ones each run, since flush timing is nondeterministic). Bytes hitting the
-    output file are the ground truth of real work and are immune to that
-    buffering. Received PRGV advances still count as activity too (a secondary
-    reset, covering the brief pre-save phase before the file exists), but the
-    file growth is the workhorse. A stall - and a kill - happens only when
-    NEITHER the output file grew NOR progress advanced for stall_timeout_sec.
+    makemkvcon PROCESS'S I/O BYTE COUNTERS advancing (the kernel's own
+    per-process read+write accounting, via GetProcessIoCounters), NOT by
+    makemkvcon's progress *messages* and NOT by the output file's size. This is
+    deliberate and defends against two independent problems at once:
+      - makemkvcon block-buffers its stdout when it's a pipe, so its robot-mode
+        PRGV progress lines arrive in irregular bursts (or barely at all)
+        during a long extraction even while it's working perfectly - keying on
+        them produced false stalls on healthy titles (random across runs, as
+        flush timing is nondeterministic); and
+      - the output file's *size* can be reported lazily by some filesystems
+        (notably a StableBit DrivePool pool, which updates real-time size
+        tracking oriented around file close), which could look like a stall.
+    The kernel's I/O byte counters have neither problem: they tick up as
+    makemkvcon actually moves bytes to/from disk, in real time, regardless of
+    output filesystem. Received PRGV advances still count as a secondary "still
+    alive" reset (harmless - it can only prevent a false kill, never cause
+    one). A stall - and a kill - happens only when NEITHER the process moved
+    any bytes NOR progress advanced for stall_timeout_sec.
 
     We still drain stdout (so makemkvcon never blocks on a full pipe) and keep
     the full captured output for post-hoc error diagnostics, same as run_cmd.
@@ -1142,7 +1189,7 @@ def run_cmd_with_progress(
         return 127, f"Could not execute command {cmd!r}: {e}", False
 
     lines: list[str] = []
-    last_activity = [time.monotonic()]  # reset on output-file growth OR progress advance
+    last_activity = [time.monotonic()]  # reset on process I/O advance OR progress advance
     highest_pct = [-1.0]
     stalled = threading.Event()
     stop_watchdog = threading.Event()
@@ -1150,11 +1197,11 @@ def run_cmd_with_progress(
     watchdog: threading.Thread | None = None
     if stall_timeout_sec is not None and stall_timeout_sec > 0:
         def _watch() -> None:
-            last_size = _output_bytes(out_dir)
+            last_io = _process_io_bytes(proc)
             while not stop_watchdog.wait(STALL_CHECK_INTERVAL_SEC):
-                size = _output_bytes(out_dir)
-                if size > last_size:  # real bytes written since last check
-                    last_size = size
+                io = _process_io_bytes(proc)
+                if io >= 0 and io > last_io:  # process moved real bytes since last check
+                    last_io = io
                     last_activity[0] = time.monotonic()
                 if time.monotonic() - last_activity[0] > stall_timeout_sec:
                     stalled.set()
@@ -1173,7 +1220,7 @@ def run_cmd_with_progress(
             line = raw_line.rstrip("\n")
             lines.append(line)
             # A received progress advance is a secondary "still alive" signal
-            # (see docstring); the output-file growth in the watchdog is the
+            # (see docstring); the process I/O counters in the watchdog are the
             # primary one. Only a real advance counts, so a fixed-percent
             # process that keeps re-emitting the same PRGV doesn't mask a stall.
             if line.startswith("PRGV:"):
@@ -2114,9 +2161,7 @@ def process_iso(
         before_bytes = sum(before_snapshot.values())
         extract_start = time.monotonic()
         logger.file_only("CMD", " ".join(cmd), iso_path)
-        rc, mkv_output, stalled = run_cmd_with_progress(
-            cmd, stall_timeout_sec=stall_timeout_sec, out_dir=out_dir
-        )
+        rc, mkv_output, stalled = run_cmd_with_progress(cmd, stall_timeout_sec=stall_timeout_sec)
 
         if stalled:
             # The output file stopped growing (and no progress advanced) for the
