@@ -205,15 +205,18 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
      - A pre-flight check confirms makemkvcon64.exe (the 64-bit MakeMKV
        CLI, required deliberately over the memory-limited 32-bit build)
        can be found on PATH before any files are touched.
-     - Fail-fast: the run is NOT resilient to per-disc failures. The
-       moment any error is logged - a failed title-info scan, a failed
+     - Fail-fast: the run is NOT generally resilient to per-disc failures.
+       The moment an error is logged - a failed title-info scan, a failed
        title extraction, insufficient free space, an unexpected
        exception, etc. - the error is written to the log and console as
-       usual and the whole run stops immediately (nonzero exit). There is
-       no "skip this one bad disc and keep going"; a single failure ends
-       the batch. This lives in one place (DualLogger.error()) so it
-       applies uniformly everywhere an error is logged, current or
-       future.
+       usual and the whole run stops immediately (nonzero exit). This
+       lives in one place (DualLogger.error()) so it applies uniformly
+       everywhere an error is logged, current or future.
+       The ONE deliberate exception is the stall timeout (below), which
+       uses DualLogger.error_continue(): a hung disc is known to be
+       isolated to that ISO, so it's logged as an error, that ISO is
+       abandoned with its source retained, and the batch continues. The
+       run still exits nonzero.
      - Free space on the output volume is checked before each title
        extraction (using MakeMKV's own reported title size plus
        --free-space-margin-pct headroom), so a nearly-full output drive
@@ -351,10 +354,16 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        moves data, regardless of output filesystem. If the process moves no
        bytes AND makemkvcon's percentage doesn't advance for
        --stall-timeout-min minutes (default 15), makemkvcon is terminated
-       and the run fails fast with an error (reporting how much was written
-       and how long it ran, to tell a real stall from a slow disc). Set 0
-       to disable. It's a stall detector, not a wall-clock limit, so a
-       slow-but-progressing large title is never killed.
+       (reporting how much was written and how long it ran, to tell a real
+       stall from a slow disc). Set 0 to disable. It's a stall detector,
+       not a wall-clock limit, so a slow-but-progressing large title is
+       never killed.
+       A stall is the one ERROR that does NOT abort the run: a single hung
+       or unreadable disc shouldn't cost the rest of a multi-TB batch, so
+       the rest of that ISO's titles are skipped, its source file is left
+       in place, and the batch moves on to the next ISO. It's still logged
+       at ERROR level, counted in the summary's stalled tally, and makes
+       the run exit nonzero, so it can't pass unnoticed.
      - Ctrl+C during a run terminates the in-flight makemkvcon child
        process cleanly, then still prints the summary-so-far and closes
        the log, rather than leaving an orphaned process or a truncated
@@ -1055,13 +1064,29 @@ class DualLogger:
         "log an error -> stop the run" apply everywhere at once. Nothing
         after the logger.error(...) call that triggered this will run
         (SystemExit isn't caught by the `except Exception` blocks used
-        elsewhere in this script, so it propagates straight out). Only
-        logger.warning() still lets the batch continue.
+        elsewhere in this script, so it propagates straight out).
+
+        Use error_continue() for the deliberate exceptions - failures that
+        are known to be isolated to one ISO and shouldn't stop the batch.
+        logger.warning() also still lets the batch continue.
         """
         self._log("ERROR", message, iso_path)
         self._raw(f"==== Run aborted after error (fail-fast) {self._timestamp()} ====")
         self.close()
         sys.exit(1)
+
+    def error_continue(self, message: str, iso_path: Path | None = None) -> None:
+        """Log at ERROR level WITHOUT aborting the run - for a failure that's
+        confined to the current ISO and shouldn't stop the whole batch (the
+        stall timeout is the case this exists for: a single hung/unreadable
+        disc shouldn't cost the rest of a multi-TB run).
+
+        Identical output to error(); the only difference is that the run
+        continues. The caller is responsible for abandoning the current ISO
+        (leaving its source file in place) and for counting the error, so the
+        run still ends with a nonzero exit status.
+        """
+        self._log("ERROR", message, iso_path)
 
     def close(self) -> None:
         self._fh.close()
@@ -1626,6 +1651,7 @@ class Stats:
     isos_converted: int = 0
     bytes_converted: int = 0
     already_converted_skipped: int = 0
+    isos_stalled: int = 0  # abandoned mid-extraction by the stall timeout (non-fatal; batch continued)
 
 
 @dataclass
@@ -1640,11 +1666,14 @@ class ProcessResult:
     DualLogger.error() first, which already aborts the run before
     process_iso() gets a chance to return. They're kept on the dataclass
     (harmlessly unreachable) rather than ripped out, in case a future
-    change makes some category of failure non-fatal again."""
+    change makes some category of failure non-fatal again. stalled IS
+    reachable: a stall timeout is deliberately non-fatal, so process_iso
+    returns normally and main() counts the ISO as failed-but-skipped."""
     converted: bool = False           # fully converted this run (counts toward --limit, eligible for deletion)
     skipped_already_done: bool = False  # resume: output already existed, nothing was done
     info_scan_failed: bool = False    # couldn't even read title info
     unexpected_error: bool = False    # an unhandled exception was caught around this ISO
+    stalled: bool = False             # abandoned because a title extraction stalled (non-fatal; batch continues)
     # --- dry-run planning fields (populated on every path, consumed only by the dry-run report) ---
     titles_selected: int = 0          # how many titles would be / were extracted
     estimated_output_bytes: int = 0   # sum of selected titles' MakeMKV-reported sizes (output-size estimate)
@@ -2096,6 +2125,7 @@ def process_iso(
 
     all_ok = True
     stop_reason: str | None = None  # set when all_ok is False for a reason other than a title outright failing
+    stalled_out: bool = False  # a stall timeout abandoned this ISO - non-fatal, the batch continues
     output_filenames: list[str] = []  # populated on success, written into the manifest below
     # Tracks whether EVERY extracted title was affirmatively verified clean
     # by the track/duration cross-check. Starts True only if a probe tool is
@@ -2164,25 +2194,36 @@ def process_iso(
         rc, mkv_output, stalled = run_cmd_with_progress(cmd, stall_timeout_sec=stall_timeout_sec)
 
         if stalled:
-            # The output file stopped growing (and no progress advanced) for the
-            # stall-timeout window: makemkvcon is genuinely hung, so it was
-            # terminated. Fail-fast so the run stops and this title can be
-            # investigated (a hung makemkvcon, a bad-sector disc, etc.) rather
-            # than silently moving on or hanging indefinitely. The elapsed time
-            # and bytes-written figures make a genuine stall ("wrote 12 GB then
-            # stopped") easy to distinguish from a spurious one at a glance.
+            # makemkvcon moved no bytes (and its progress didn't advance) for the
+            # stall-timeout window, so it was terminated as hung. Unlike most
+            # errors here this does NOT abort the run: a single hung or
+            # unreadable disc shouldn't cost the rest of a multi-TB batch. We
+            # log it at ERROR level (so it stands out and the run still exits
+            # nonzero), abandon THIS ISO - stop extracting its remaining titles
+            # and leave its source file in place - and let the batch move on to
+            # the next ISO. The elapsed time and bytes-written figures make a
+            # genuine stall ("wrote 12 GB then stopped") easy to tell from a
+            # spurious one at a glance.
             elapsed = time.monotonic() - extract_start
             written = max(0, sum(snapshot_output_dir(out_dir).values()) - before_bytes)
             logger.append_raw_to_file(mkv_output)
-            logger.error(
-                f"Title {tid} extraction stalled - the output file stopped growing for "
+            logger.error_continue(
+                f"Title {tid} extraction stalled - makemkvcon moved no data for "
                 f"{args.stall_timeout_min:g} minute(s) (wrote {human_bytes(written)} in "
-                f"{format_duration(elapsed)} before stalling), so makemkvcon was terminated. The "
-                f"disc may have bad sectors or makemkvcon may be hung; investigate this title. "
-                f"Raise or disable the limit with --stall-timeout-min if it was just genuinely slow.",
+                f"{format_duration(elapsed)} before stalling), so it was terminated. The disc may "
+                f"have bad sectors or makemkvcon may be hung; investigate this title. Raise or "
+                f"disable the limit with --stall-timeout-min if it was just genuinely slow. "
+                f"Skipping the rest of this ISO and continuing with the next one.",
                 iso_path,
             )
-            # logger.error() is fail-fast: this exits the run.
+            stats.conversions_error += 1
+            stats.isos_stalled += 1
+            all_ok = False
+            stalled_out = True
+            stop_reason = (
+                f"title {tid} extraction stalled (no data for {args.stall_timeout_min:g} minute(s))"
+            )
+            break
 
         if rc != 0:
             logger.error(f"makemkvcon failed for title {tid} (exit code {rc})", iso_path)
@@ -2373,11 +2414,16 @@ def process_iso(
             break
 
     if not all_ok:
+        # A stall was already reported non-fatally above and deliberately does
+        # not abort the batch, so this summary line must not either - use the
+        # matching non-fatal logger. Every other failure keeps the fail-fast
+        # logger.error().
+        report = logger.error_continue if stalled_out else logger.error
         if stop_reason:
-            logger.error(f"Stopped converting this ISO: {stop_reason}; source file retained", iso_path)
+            report(f"Stopped converting this ISO: {stop_reason}; source file retained", iso_path)
         else:
-            logger.error("One or more titles failed to convert; source file retained", iso_path)
-        return ProcessResult()
+            report("One or more titles failed to convert; source file retained", iso_path)
+        return ProcessResult(stalled=stalled_out)
 
     logger.info("All selected titles converted successfully", iso_path)
     stats.isos_converted += 1
@@ -2928,6 +2974,7 @@ def main() -> int:
             f"Conversion warnings          : {stats.warnings}",
             f"ISO files converted          : {stats.isos_converted}",
             f"Already-converted skipped    : {stats.already_converted_skipped}",
+            f"Stalled (skipped, investigate): {stats.isos_stalled}",
             f"Total ISO bytes converted    : {human_bytes(stats.bytes_converted)}",
             "==================================================",
         ]
