@@ -1099,6 +1099,39 @@ class DualLogger:
 # makemkvcon interaction
 # --------------------------------------------------------------------------
 
+def format_cmd_for_log(cmd: list[str]) -> str:
+    """Render a command list as a line that can be pasted straight into a
+    Windows console and run as-is.
+
+    Every path-bearing argument is wrapped in double quotes, so paths
+    containing spaces (common here: "Halloween III Season of the Witch
+    (1982).iso", "The Shield (2002)") survive the copy/paste instead of being
+    split into several arguments by the shell. An argument is treated as
+    path-bearing when it contains a path separator, a drive-letter prefix, or
+    a space - which covers both the plain output folder and the "iso:<path>"
+    form. The WHOLE argument is quoted, including that iso: prefix
+    ("iso:C:\\...\\x.iso"), because cmd.exe strips the quotes and hands
+    makemkvcon the intact single argument it expects.
+
+    Switches and other non-path arguments (-r, --cache=1, mkv, the title
+    number) are left bare so the line still reads naturally. Windows paths
+    can't contain a double quote, so no escaping is needed inside them.
+
+    This is for logging only - the actual subprocess call passes the argument
+    list directly and never goes through a shell, so quoting here can't affect
+    how the command really runs."""
+    parts: list[str] = []
+    for arg in cmd:
+        looks_like_path = (
+            "\\" in arg
+            or "/" in arg
+            or " " in arg
+            or re.match(r"^(?:[a-zA-Z]+:)?[a-zA-Z]:", arg) is not None  # C:\... or iso:C:\...
+        )
+        parts.append(f'"{arg}"' if looks_like_path and not arg.startswith('"') else arg)
+    return " ".join(parts)
+
+
 def run_cmd(cmd: list[str]) -> tuple[int, str]:
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -1306,7 +1339,7 @@ def get_disc_titles(
     simply being False, which is also true for every disc that never
     needed Java at all."""
     cmd: list[str] = ["makemkvcon64.exe", "-r", "--cache=1", "info", f"iso:{iso_path}"]
-    logger.file_only("CMD", " ".join(cmd), iso_path)
+    logger.file_only("CMD", format_cmd_for_log(cmd), iso_path)
     rc, output = run_cmd(cmd)
     titles: dict[int, Title] = {}
     jre_engaged: bool = "Using Java runtime" in output
@@ -2176,7 +2209,7 @@ def process_iso(
         cmd = ["makemkvcon64.exe", "-r", "--cache=1", "mkv", f"iso:{iso_path}", str(tid), str(out_dir)]
 
         if args.dry_run:
-            logger.info(f"[DRY RUN] Would run: {' '.join(cmd)}", iso_path)
+            logger.info(f"[DRY RUN] Would run: {format_cmd_for_log(cmd)}", iso_path)
             desired_name = "main_title.mkv" if tid == fpl_identified_main_tid else f"title_{tid:02d}.mkv"
             logger.info(f"[DRY RUN] Would name output {desired_name}", iso_path)
             continue
@@ -2197,7 +2230,7 @@ def process_iso(
         before_snapshot = snapshot_output_dir(out_dir)
         before_bytes = sum(before_snapshot.values())
         extract_start = time.monotonic()
-        logger.file_only("CMD", " ".join(cmd), iso_path)
+        logger.file_only("CMD", format_cmd_for_log(cmd), iso_path)
         rc, mkv_output, stalled = run_cmd_with_progress(cmd, stall_timeout_sec=stall_timeout_sec)
 
         if stalled:
