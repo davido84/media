@@ -2145,8 +2145,12 @@ def process_iso(
         # A manifest existed but didn't clear the resume check. Log the
         # specific reason (not a vague list of possibilities), so an
         # unexpected re-conversion during a "--limit then re-run" workflow
-        # is diagnosable at a glance rather than a mystery.
-        logger.warning(
+        # is diagnosable at a glance rather than a mystery. file_only: that
+        # diagnosis is wanted in the log after the fact, but on-screen it's
+        # noise during a long batch. Still counted in the warning tally so
+        # the end-of-run summary doesn't under-report.
+        logger.file_only(
+            "WARNING",
             f"{natural_out_dir} has a previous-run manifest but it doesn't match, so this ISO "
             f"will be redone rather than skipped. Reason: {resume_mismatch}",
             iso_path,
