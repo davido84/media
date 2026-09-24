@@ -670,10 +670,13 @@ def clear_previous_outputs(out_dir: Path, logger: "DualLogger", stats: "Stats") 
     ]
     if not stale:
         return
-    logger.info(
+    # file_only: housekeeping detail worth keeping in the log for
+    # troubleshooting, but just noise on-screen during a long batch.
+    logger.file_only(
+        "INFO",
         f"Re-extracting into a folder with {len(stale)} file(s) from a previous run - "
         f"clearing them first for a clean, idempotent conversion: "
-        f"{', '.join(sorted(p.name for p in stale))}"
+        f"{', '.join(sorted(p.name for p in stale))}",
     )
     for p in stale:
         try:
@@ -1772,7 +1775,11 @@ def process_iso(
 
     disc_type_override = None if args.disc_type == "auto" else args.disc_type
     disc_type = classify_disc(iso_path, args.dvd_max_size_gb * 1_000_000_000, disc_type_override)
-    logger.info(f"Classified as {disc_type} ({human_bytes(iso_path.stat().st_size)})", iso_path)
+    # file_only: useful when diagnosing a disc-type misclassification after the
+    # fact, but not worth a console line for every ISO in a long batch.
+    logger.file_only(
+        "INFO", f"Classified as {disc_type} ({human_bytes(iso_path.stat().st_size)})", iso_path
+    )
 
     rc, output, titles, jre_engaged, jre_required_missing = get_disc_titles(iso_path, logger)
     if rc != 0 or not titles:
