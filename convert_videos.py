@@ -79,24 +79,71 @@ class ConversionError(Exception):
 
 
 class ConversionTimeoutError(ConversionError):
-    """Raised when an ffprobe subprocess exceeds its allotted timeout. Treated as fatal
-    for the whole run (unlike other ConversionErrors, which just skip the file and
-    continue): a metadata probe that stalls this long points at a genuinely stuck
-    process or unreadable file, so it's worth stopping to investigate rather than
-    silently skipping ahead. Note that ffmpeg encode/decode passes deliberately run
-    without a timeout — see measure_loudness and process_file."""
+    """Raised when an ffprobe subprocess exceeds its allotted timeout. Logged more
+    loudly than a plain ConversionError, but handled the same way: the file is skipped
+    and the batch continues. Aborting the whole run on a single stuck probe costs far
+    more than it saves on a job measured in days, and the systemic fault that would
+    justify stopping (the source drive dropping offline) is caught by the consecutive-
+    failure circuit breaker instead — see CONSECUTIVE_FAILURE_LIMIT. Note that ffmpeg
+    encode/decode passes are not bounded by a wall-clock timeout at all; they're
+    supervised by the liveness-based stall watchdog — see run_ffmpeg_with_watchdog."""
     pass
 
 
 # Minimum timeout for any single ffprobe call, regardless of file size, so very small
-# files still get a sane floor rather than a near-zero allowance.
-TIMEOUT_FLOOR_SECONDS: int = 30 * 60  # 30 minutes
+# files still get a sane floor rather than a near-zero allowance. A metadata probe of
+# a healthy file completes in tens of milliseconds, so a 60s floor is already ~1000x
+# normal — generous enough to absorb a cold cache and a spun-down disk, while still
+# firing inside a useful window rather than hours later.
+TIMEOUT_FLOOR_SECONDS: int = 60  # 1 minute
 
-# Additional timeout allowance per GB of source file size, covering slow reads on
-# large files over network mounts or spinning disks. Deliberately generous: ffprobe
-# only reads container metadata, so taking longer than this points at a stuck process
-# rather than merely slow work.
-TIMEOUT_SECONDS_PER_GB: int = 15 * 60  # 15 minutes per GB
+# Small additional allowance per GB of source file size. ffprobe reads bounded
+# container metadata (headers and index), NOT the file body, so its runtime is very
+# nearly independent of file size — measured, a ~200x size increase costs well under
+# 2x the probe time. This term therefore exists only to cover seek latency on large
+# files over network mounts or spinning disks, not to scale with the data volume.
+TIMEOUT_SECONDS_PER_GB: int = 5  # 5 seconds per GB
+
+# Hard ceiling on any single probe timeout. Without this, the per-GB term would hand a
+# large remux a multi-hour allowance, which in practice means the timeout never fires
+# within a useful window — the failure mode is a run that looks hung for most of a day
+# before reporting anything.
+TIMEOUT_CEILING_SECONDS: int = 10 * 60  # 10 minutes
+
+# --- Encode stall watchdog -------------------------------------------------------
+# ffmpeg encode/decode passes are guarded by liveness, not by elapsed time. A wall
+# clock cap can't work here: a legitimate veryslow encode of a large file can run for
+# many hours, and any cap generous enough to never false-positive is too generous to
+# catch a real hang. Instead the watchdog treats a process as alive if EITHER it is
+# still emitting -progress heartbeats OR its consumed CPU time is still climbing, and
+# kills it only when BOTH have been flat for this long. Elapsed time never enters into
+# it, so an arbitrarily slow-but-healthy encode is safe indefinitely.
+#
+# The CPU-time signal is what makes this safe. ffmpeg goes genuinely silent on the
+# -progress stream during the tail of an encode, while the encoder's lookahead buffer
+# drains and the container index is written — measured at ~35s of total silence even
+# on a small test file, and it scales with preset and file size. During that window
+# the process is pegged at ~100% CPU. A real hang (a wedged Quick Sync session, a
+# blocked read on a dropped mount) is blocked in a driver or I/O call and consumes no
+# CPU at all, which cleanly separates the two cases.
+ENCODE_STALL_SECONDS: int = 15 * 60  # 15 minutes of no progress AND no CPU movement
+
+# How often the watchdog samples CPU time while waiting for the next heartbeat.
+ENCODE_STALL_POLL_SECONDS: float = 5.0
+
+# CPU time must advance by at least this much between samples to count as movement,
+# so scheduler noise and accounting granularity don't read as liveness on a truly
+# wedged process.
+ENCODE_STALL_MIN_CPU_DELTA: float = 0.10  # seconds
+
+# --- Failure circuit breaker -----------------------------------------------------
+# A single bad file shouldn't end a multi-day batch, so per-file failures (including
+# probe timeouts) skip the file and carry on. But a systemic fault — the source drive
+# dropping offline, ffmpeg going missing — would otherwise churn through thousands of
+# files failing identically. Aborting after this many CONSECUTIVE failures catches the
+# systemic case while leaving isolated bad files as mere skips. The counter resets on
+# any successful file.
+CONSECUTIVE_FAILURE_LIMIT: int = 10
 
 # Hardware (Quick Sync) encodes launched back-to-back can occasionally hit a
 # transient session/driver hiccup that a bare re-run of the same command doesn't
@@ -144,10 +191,13 @@ type CrfRow = tuple[int, int | None, float, str | None, bool]
 def compute_timeout_seconds(src_size_bytes: int) -> float:
     """A generous timeout for a single ffprobe metadata read over a file this size, so
     a hung probe on a corrupt or unusual file doesn't stall the batch indefinitely.
-    Not applied to ffmpeg encode or decode passes, which are unbounded — capping those
-    by wall clock produced false positives on slow-but-healthy encodes."""
+    Capped at TIMEOUT_CEILING_SECONDS, since a probe that slow is stuck rather than
+    merely working on a big file. Not applied to ffmpeg encode or decode passes, which
+    are guarded by the liveness-based stall watchdog instead — see
+    run_ffmpeg_with_watchdog and ENCODE_STALL_SECONDS."""
     size_gb = src_size_bytes / (1024 ** 3)
-    return TIMEOUT_FLOOR_SECONDS + size_gb * TIMEOUT_SECONDS_PER_GB
+    return min(TIMEOUT_FLOOR_SECONDS + size_gb * TIMEOUT_SECONDS_PER_GB,
+               TIMEOUT_CEILING_SECONDS)
 
 
 def _is_within(path: Path, folder: Path) -> bool:
@@ -479,16 +529,179 @@ def probe_duration(path: Path, timeout_seconds: float) -> float | None:
         return None
 
 
+def _process_cpu_seconds(proc: "subprocess.Popen[str]") -> float | None:
+    """Total CPU time (user + kernel, in seconds) consumed so far by a running child
+    process, or None if it can't be determined on this platform/process. Used by
+    run_ffmpeg_with_watchdog as a liveness signal that stays valid during the silent
+    tail of an encode, when no -progress heartbeats are emitted but the encoder is
+    still working hard.
+
+    Windows reads it via GetProcessTimes on the handle subprocess already holds; Linux
+    reads utime+stime from /proc. Never raises: if sampling fails for any reason the
+    caller simply falls back to heartbeats alone (see run_ffmpeg_with_watchdog)."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            handle = getattr(proc, "_handle", None)
+            if handle is None:
+                return None
+            creation = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            ok = ctypes.windll.kernel32.GetProcessTimes(  # type: ignore[attr-defined]
+                wintypes.HANDLE(int(handle)),
+                ctypes.byref(creation), ctypes.byref(exit_time),
+                ctypes.byref(kernel), ctypes.byref(user))
+            if not ok:
+                return None
+            # FILETIME is a split 64-bit count of 100-nanosecond intervals.
+            def _ft(ft: "wintypes.FILETIME") -> int:
+                return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+            return (_ft(kernel) + _ft(user)) / 10_000_000.0
+        with open(f"/proc/{proc.pid}/stat", "rb") as fh:
+            # The comm field can contain spaces/parens, so split after the closing
+            # paren; utime/stime are then fields 14 and 15 (1-based) of the original.
+            fields = fh.read().rpartition(b")")[2].split()
+        utime, stime = int(fields[11]), int(fields[12])
+        return (utime + stime) / os.sysconf("SC_CLK_TCK")
+    except Exception:
+        return None
+
+
+def add_progress_flags(cmd: list[str]) -> list[str]:
+    """Return cmd with the global options the stall watchdog needs, inserted directly
+    after the ffmpeg executable so they're parsed as global (not per-input) options.
+    Call this before logging the command, so what gets logged is exactly what runs.
+
+    -progress pipe:1 emits a machine-readable heartbeat block to stdout roughly once a
+    second; -nostats drops the human progress line we'd otherwise have to filter out;
+    -nostdin stops ffmpeg consuming the console's stdin, which matters now that we run
+    it via Popen rather than a fully-captured subprocess.run. stdout is free for this
+    in every command the script builds: real output always goes to a file, and the
+    loudness pass writes to the null muxer."""
+    return [cmd[0], "-nostdin", "-progress", "pipe:1", "-nostats"] + list(cmd[1:])
+
+
+class FFmpegRunResult:
+    """Outcome of one watchdog-supervised ffmpeg run."""
+    def __init__(self, returncode: int, stderr: str, stalled: bool, elapsed: float,
+                 silent_for: float) -> None:
+        self.returncode = returncode
+        self.stderr = stderr
+        self.stalled = stalled          # True if the watchdog killed it as hung
+        self.elapsed = elapsed
+        self.silent_for = silent_for    # seconds of combined silence that triggered the kill
+
+
+def run_ffmpeg_with_watchdog(cmd: list[str],
+                              stall_seconds: float = ENCODE_STALL_SECONDS
+                              ) -> FFmpegRunResult:
+    """Run an ffmpeg command to completion, killing it only if it stops showing any
+    sign of life for stall_seconds. cmd must already carry the progress flags (see
+    add_progress_flags).
+
+    Liveness is the OR of two signals, and the process is killed only when both have
+    been flat for the whole window:
+      * a -progress heartbeat arriving on stdout, and
+      * consumed CPU time continuing to climb.
+    Elapsed wall time is deliberately NOT a factor, so a legitimately slow encode can
+    run as long as it needs. The CPU signal covers the silent tail where the encoder
+    drains its lookahead and the muxer writes its index; the heartbeat signal covers
+    any case where CPU sampling is unavailable. If CPU time can't be sampled at all on
+    this platform, the watchdog degrades to heartbeats alone, which is still correct
+    for a wedged process — just likelier to misjudge a very long flush, which is why
+    stall_seconds is set in minutes rather than seconds.
+
+    Both pipes are drained on background threads: stderr in particular must be read
+    continuously, or a chatty ffmpeg would fill the pipe buffer and deadlock waiting
+    for us while we wait for it. Returns a FFmpegRunResult; never raises on a failed
+    or killed encode (the caller decides what a non-zero return code means)."""
+    import queue
+    import threading
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, errors="replace")
+    heartbeats: queue.Queue[float | None] = queue.Queue()
+    stderr_chunks: list[str] = []
+
+    def pump_stdout() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            # Each progress block ends with a progress=continue/end line; counting only
+            # those keeps one heartbeat per block instead of one per key.
+            if line.startswith("progress="):
+                heartbeats.put(time.monotonic())
+        heartbeats.put(None)  # stdout closed: ffmpeg is on its way out
+
+    def pump_stderr() -> None:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            stderr_chunks.append(line)
+
+    t_out = threading.Thread(target=pump_stdout, daemon=True)
+    t_err = threading.Thread(target=pump_stderr, daemon=True)
+    t_out.start()
+    t_err.start()
+
+    start = time.monotonic()
+    last_life = start                       # last moment either signal moved
+    last_cpu = _process_cpu_seconds(proc)
+    stalled = False
+    stdout_closed = False
+
+    while True:
+        if stdout_closed:
+            # ffmpeg has closed stdout; it's finishing up. Wait for exit, still
+            # watching CPU so a wedge during final teardown is caught too.
+            if proc.poll() is not None:
+                break
+        now = time.monotonic()
+        if now - last_life >= stall_seconds:
+            stalled = True
+            proc.kill()
+            break
+
+        try:
+            beat = heartbeats.get(timeout=ENCODE_STALL_POLL_SECONDS)
+            if beat is None:
+                stdout_closed = True
+            else:
+                last_life = beat
+                last_cpu = _process_cpu_seconds(proc)
+                continue
+        except queue.Empty:
+            pass
+
+        # No heartbeat this interval — fall back to the CPU signal.
+        cpu_now = _process_cpu_seconds(proc)
+        if cpu_now is not None and last_cpu is not None and \
+                cpu_now - last_cpu >= ENCODE_STALL_MIN_CPU_DELTA:
+            last_life = time.monotonic()
+        if cpu_now is not None:
+            last_cpu = cpu_now
+
+    returncode = proc.wait()
+    t_out.join(timeout=5)
+    t_err.join(timeout=5)
+    elapsed = time.monotonic() - start
+    silent_for = time.monotonic() - last_life if stalled else 0.0
+    return FFmpegRunResult(returncode, "".join(stderr_chunks), stalled, elapsed,
+                            silent_for)
+
+
 def measure_loudness(src: Path, duration: float, loudnorm_target: float,
                       audio_stream_index: int) -> dict[str, Any]:
     """Runs loudnorm's analysis pass (decode + filter, no output file written) against
     the given audio stream to measure its actual loudness stats, for feeding into a
     second, exact pass of EBU R128 normalization. Returns the parsed stats dict
     (keys include input_i, input_tp, input_lra, input_thresh, target_offset).
-    Raises ConversionError if ffmpeg fails or the stats block can't be found/parsed,
-    so callers can fall back to one-pass normalization for this file. No timeout is
-    applied: a full decode pass on a large file can legitimately run a long time, and
-    a wall-clock cap produced false positives on slow-but-healthy work."""
+    Raises ConversionError if ffmpeg fails, stalls, or the stats block can't be
+    found/parsed, so callers can fall back to one-pass normalization for this file.
+    No wall-clock cap is applied — a full decode pass on a large file can legitimately
+    run a long time — but the pass is supervised by the liveness-based stall watchdog,
+    so a wedged decode is caught without false-positiving on slow-but-healthy work."""
     cmd: list[str] = ["ffmpeg", "-i", str(src)]
     if duration != -1:
         cmd += ["-t", str(duration)]
@@ -497,8 +710,15 @@ def measure_loudness(src: Path, duration: float, loudnorm_target: float,
         "-af", f"loudnorm=I={loudnorm_target}:TP=-1.5:LRA=11:print_format=json",
         "-f", "null", "-",
     ]
+    cmd = add_progress_flags(cmd)
     logging.info(f"Command: {format_cmd_for_log(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = run_ffmpeg_with_watchdog(cmd)
+    if result.stalled:
+        raise ConversionError(src, f"loudness measurement pass stalled: no progress and "
+                                    f"no CPU activity for "
+                                    f"{human_duration(result.silent_for, include_seconds=True)}; "
+                                    f"killed after "
+                                    f"{human_duration(result.elapsed, include_seconds=True)}")
     if result.returncode != 0:
         raise ConversionError(src, f"loudness measurement pass failed: {result.stderr[-1000:]}")
 
@@ -846,7 +1066,10 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         try:
             small_file_duration = probe_duration(src, timeout_seconds)
         except ConversionTimeoutError:
-            raise  # fatal: propagate up so the run stops and can be investigated
+            # Propagate rather than shrugging it off: a probe that hangs on a file this
+            # small is a stuck process, not a slow read, so the file is skipped and
+            # logged as a timeout rather than silently copied.
+            raise
         except ConversionError as e:
             logging.warning(f"Could not determine duration for below-threshold file "
                              f"(copying anyway): {e.reason}: {src}")
@@ -981,21 +1204,33 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                             normalize_audio, loudnorm_target, keep_audio_indices,
                             keep_subtitle_indices, video_info["stream_index"],
                             measured_loudness, preset=preset)
+    cmd = add_progress_flags(cmd)
     logging.info(f"Command: {format_cmd_for_log(cmd)}")
     max_attempts = HARDWARE_ENCODE_MAX_ATTEMPTS if encoding == "hardware" else 1
     for attempt in range(1, max_attempts + 1):
-        encode_start = time.monotonic()
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        encode_elapsed = time.monotonic() - encode_start
+        result = run_ffmpeg_with_watchdog(cmd)
+        encode_elapsed = result.elapsed
 
-        if result.returncode == 0:
+        if result.returncode == 0 and not result.stalled:
             break
 
         if dst.exists():
             dst.unlink(missing_ok=True)
 
+        # A watchdog kill is reported as its own failure kind rather than a bare exit
+        # code, since "no output and no CPU for N minutes" needs a different diagnosis
+        # from a normal ffmpeg error. It follows the same retry policy: a wedged Quick
+        # Sync session is exactly the transient fault retrying is meant to absorb.
+        if result.stalled:
+            failure_desc = (f"stalled (no progress and no CPU activity for "
+                            f"{human_duration(result.silent_for, include_seconds=True)}, "
+                            f"killed after "
+                            f"{human_duration(result.elapsed, include_seconds=True)})")
+        else:
+            failure_desc = f"exited with code {result.returncode}"
+
         if attempt < max_attempts:
-            logging.warning(f"ffmpeg exited with code {result.returncode} on attempt "
+            logging.warning(f"ffmpeg {failure_desc} on attempt "
                              f"{attempt}/{max_attempts} (often a transient hardware "
                              f"encoder hiccup from back-to-back Quick Sync sessions); "
                              f"retrying in {HARDWARE_ENCODE_RETRY_DELAY_SECONDS}s: "
@@ -1003,7 +1238,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
             time.sleep(HARDWARE_ENCODE_RETRY_DELAY_SECONDS)
         else:
             attempts_str = f"{max_attempts} attempt(s)" if max_attempts > 1 else "1 attempt"
-            raise ConversionError(src, f"ffmpeg exited with code {result.returncode} "
+            raise ConversionError(src, f"ffmpeg {failure_desc} "
                                         f"after {attempts_str}: {result.stderr[-2000:]}")
 
     # Post-encode validation: confirm the output's duration roughly matches the
@@ -1131,10 +1366,14 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list[int], du
             if duration == -1:
                 shutil.copy2(src, original_dst)
             else:
-                copy_cmd = ["ffmpeg", "-y", "-i", str(src), "-t", str(duration),
-                            "-c", "copy", str(original_dst)]
+                copy_cmd = add_progress_flags(
+                    ["ffmpeg", "-y", "-i", str(src), "-t", str(duration),
+                     "-c", "copy", str(original_dst)])
                 logging.info(f"Command: {format_cmd_for_log(copy_cmd)}")
-                copy_result = subprocess.run(copy_cmd, capture_output=True, text=True)
+                copy_result = run_ffmpeg_with_watchdog(copy_cmd)
+                if copy_result.stalled:
+                    raise RuntimeError(f"ffmpeg stalled (no progress and no CPU activity "
+                                        f"for {human_duration(copy_result.silent_for, include_seconds=True)})")
                 if copy_result.returncode != 0 or not original_dst.exists():
                     raise RuntimeError(f"ffmpeg exited with code {copy_result.returncode}: "
                                         f"{copy_result.stderr[-500:]}")
@@ -1163,11 +1402,21 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list[int], du
         cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
                                 False, -16, keep_audio_indices, keep_subtitle_indices,
                                 video_info["stream_index"], None, preset=preset)
+        cmd = add_progress_flags(cmd)
         logging.info(f"Command: {format_cmd_for_log(cmd)}")
 
-        start = time.monotonic()
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        elapsed = time.monotonic() - start
+        result = run_ffmpeg_with_watchdog(cmd)
+        elapsed = result.elapsed
+
+        if result.stalled:
+            logging.error(f"CRF {crf}: ffmpeg stalled (no progress and no CPU activity "
+                          f"for {human_duration(result.silent_for, include_seconds=True)}), "
+                          f"killed after {human_duration(elapsed, include_seconds=True)}: "
+                          f"{src}")
+            if dst.exists():
+                dst.unlink(missing_ok=True)
+            rows.append((crf, None, elapsed, "stalled", False))
+            continue
 
         if result.returncode != 0 or not dst.exists():
             logging.error(f"CRF {crf}: ffmpeg failed (exit {result.returncode}): "
@@ -1403,13 +1652,13 @@ def main() -> None:
                 src_size, rows = run_crf_comparison(src, args.output_folder, crf_values,
                                                      args.duration, args.encoding,
                                                      args.downscale, args.preset)
-            except ConversionTimeoutError as e:
-                logging.error(f"TIMEOUT: {e.file.resolve()}\n{e.reason}")
-                logging.error("Stopping the run so this timeout can be investigated. "
-                              "Remaining files were not processed.")
-                sys.exit(1)
             except ConversionError as e:
-                logging.error(f"CRF comparison skipped for {e.file.resolve()}: {e.reason}")
+                # As in the main batch loop, a timeout is logged distinctly but skips
+                # the file rather than ending the run.
+                if isinstance(e, ConversionTimeoutError):
+                    logging.error(f"TIMEOUT: {e.file.resolve()}\n{e.reason}")
+                else:
+                    logging.error(f"CRF comparison skipped for {e.file.resolve()}: {e.reason}")
                 continue
 
             files_compared += 1
@@ -1470,6 +1719,9 @@ def main() -> None:
     retried_count = 0
     deleted_source_count = 0
     deleted_source_bytes = 0
+    # Counts failures back-to-back, reset by any file that succeeds. Drives the
+    # circuit breaker that distinguishes a run of bad files from a systemic fault.
+    consecutive_failures = 0
     # Diagnostic accumulators (only populated when --diagnose is set).
     diag_read_seconds = 0.0
     diag_read_bytes = 0
@@ -1609,21 +1861,32 @@ def main() -> None:
                                    args.normalize_audio, args.loudnorm_target, args.downscale,
                                    args.strip_no_english_audio, args.preset,
                                    processed_bytes)
-        except ConversionTimeoutError as e:
-            failed_path = e.file.resolve()
-            logging.error(f"TIMEOUT: {failed_path}\n{e.reason}")
-            logging.error("Stopping the run so this timeout can be investigated. "
-                          "Remaining files were not processed.")
-            sys.exit(1)
         except ConversionError as e:
+            # Timeouts are called out separately in the log (they point at a stuck
+            # process rather than a bad encode) but are handled identically: skip the
+            # file and keep going. The circuit breaker below is what stops a run when
+            # the fault is systemic rather than per-file.
             failed_path = e.file.resolve()
-            logging.error(f"CONVERSION FAILED: {failed_path}\n{e.reason}")
+            if isinstance(e, ConversionTimeoutError):
+                logging.error(f"TIMEOUT: {failed_path}\n{e.reason}")
+            else:
+                logging.error(f"CONVERSION FAILED: {failed_path}\n{e.reason}")
             failed_files.append(failed_path)
             processed_bytes += src_size
+            consecutive_failures += 1
+            if consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
+                logging.error(f"Stopping: {consecutive_failures} file(s) in a row failed, "
+                              f"which points at a systemic problem (source drive offline, "
+                              f"ffmpeg missing) rather than individual bad files. "
+                              f"Remaining files were not processed.")
+                print(f"\n{COLOR_ERROR}Stopping after {consecutive_failures} consecutive "
+                      f"failures — see the log.{COLOR_RESET}")
+                break
             continue
         call_elapsed = time.monotonic() - call_start
 
         processed_bytes += src_size
+        consecutive_failures = 0  # this file got through; the run is healthy again
 
         if result is not None:
             orig_size, new_size, video_duration, action, downscaled, grew_larger, retried = result
