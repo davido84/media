@@ -221,6 +221,11 @@ DEINTERLACE_FILTER: str = "bwdif=mode=send_frame:parity=auto:deint=all"
 # any successful file.
 CONSECUTIVE_FAILURE_LIMIT: int = 10
 
+# Cap on each informational subtitle-size probe. This statistic is a nicety, so a
+# pathological file must not hold up the batch: on timeout the figure is simply
+# omitted for that file and the conversion is unaffected.
+SUBTITLE_MEASURE_TIMEOUT_SECONDS: float = 300.0
+
 # Hardware (Quick Sync) encodes launched back-to-back can occasionally hit a
 # transient session/driver hiccup that a bare re-run of the same command doesn't
 # reproduce (e.g. the GPU context from the previous file not being fully released
@@ -440,16 +445,6 @@ def build_parser() -> argparse.ArgumentParser:
                               "answer for. Detection adds a second or two per file and "
                               "only runs on files being re-encoded, never on copies. "
                               "Default: off (video passed through exactly as before)")
-    parser.add_argument("--strip-no-english-subs", action="store_true",
-                         help="Drop subtitle tracks that aren't English, mirroring -e for "
-                              "audio. Untagged tracks are KEPT (missing language tags are "
-                              "common on subtitles, and an untagged track is usually "
-                              "English or a forced/foreign-dialogue track the film needs), "
-                              "and if the main audio track isn't English every subtitle is "
-                              "kept, since on a foreign-language film the subtitles are the "
-                              "translation. If stripping would leave no subtitles at all, "
-                              "all tracks are kept instead. Default: off (every subtitle "
-                              "track is carried through)")
     parser.add_argument("--include", type=str, default=None, metavar="REGEX",
                          help="Only process files whose path, taken relative to the "
                               "input folder and written with forward slashes, matches "
@@ -1019,6 +1014,52 @@ def resolve_deinterlace_filter(src: Path, video_info: dict[str, Any], mode: str
     return (None, f"auto -> progressive, no filtering ({reason})")
 
 
+def measure_subtitle_bytes(path: Path) -> tuple[int, int] | None:
+    """Total size in bytes of all subtitle-stream packets in path, with the number of
+    subtitle tracks, or None if it couldn't be measured. Informational only — nothing
+    in the conversion depends on it.
+
+    ffprobe is asked for packet sizes on subtitle streams only. It still walks the
+    whole container to find them, so cost tracks file size rather than subtitle size;
+    measured here at roughly 1.4 GB/s against warm cache, meaning it's CPU-trivial and
+    in practice bounded by how fast the output file can be re-read. That's acceptable
+    because it runs on the freshly written output, much of which the OS still has
+    cached, and because it's a small fraction of the encode that just produced it.
+
+    Never raises: a probe failure returns None and the caller simply reports nothing,
+    since a missing statistic must not disturb a successful conversion."""
+    cmd: list[str] = ["ffprobe", "-v", "error", "-select_streams", "s",
+                      "-show_entries", "packet=size", "-of", "compact=p=0:nk=1",
+                      str(path)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                 timeout=SUBTITLE_MEASURE_TIMEOUT_SECONDS)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+
+    total = 0
+    for line in result.stdout.split():
+        try:
+            total += int(line)
+        except ValueError:
+            continue  # ffprobe emits "N/A" for packets with no known size
+
+    count_cmd: list[str] = ["ffprobe", "-v", "error", "-select_streams", "s",
+                            "-show_entries", "stream=index", "-of", "csv=p=0",
+                            str(path)]
+    tracks = 0
+    try:
+        count_result = subprocess.run(count_cmd, capture_output=True, text=True,
+                                       timeout=SUBTITLE_MEASURE_TIMEOUT_SECONDS)
+        if count_result.returncode == 0:
+            tracks = len([ln for ln in count_result.stdout.splitlines() if ln.strip()])
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return (total, tracks)
+
+
 def measure_loudness(src: Path, duration: float, loudnorm_target: float,
                       audio_stream_index: int) -> dict[str, Any]:
     """Runs loudnorm's analysis pass (decode + filter, no output file written) against
@@ -1186,8 +1227,7 @@ def diagnose_encode_one(src: Path, dst: Path, preset: str | None, read_seconds: 
             args.dry_run, args.encoding,
             args.normalize_audio, args.loudnorm_target, args.downscale,
             args.strip_no_english_audio, preset,
-            deinterlace=args.deinterlace,
-            strip_non_english_subs=args.strip_no_english_subs)
+            deinterlace=args.deinterlace)
     except ConversionError as e:
         logging.error(f"CONVERSION FAILED (preset {preset}): {e.file.resolve()}\n{e.reason}")
         return None
@@ -1255,7 +1295,6 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
                       encoding: str = "software", normalize_audio: bool = True,
                       loudnorm_target: float = -16,
                       audio_stream_indices: list[int] | None = None,
-                      subtitle_stream_indices: list[int] | None = None,
                       video_stream_index: int = 0,
                       measured_loudness: dict[str, Any] | None = None,
                       preset: str | None = None,
@@ -1266,7 +1305,6 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
         cmd += ["-t", str(duration)]
 
     audio_stream_indices = audio_stream_indices or []
-    subtitle_stream_indices = subtitle_stream_indices or []
 
     # Explicit stream mapping disables ffmpeg's automatic "best stream" selection,
     # so the video stream must always be mapped too. video_stream_index picks out
@@ -1276,8 +1314,11 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
     cmd += ["-map", f"0:v:{video_stream_index}"]
     for idx in audio_stream_indices:
         cmd += ["-map", f"0:a:{idx}"]
-    for idx in subtitle_stream_indices:
-        cmd += ["-map", f"0:s:{idx}"]
+    # Every subtitle track is carried through, unconditionally. Subtitles are a
+    # rounding error against the video bitrate, and dropping one is irreversible, so
+    # there's nothing to gain from choosing between them. The trailing '?' makes the
+    # mapping optional, so a file with no subtitle streams at all isn't an error.
+    cmd += ["-map", "0:s?"]
 
     # Video filters are one -vf chain, applied in order. Deinterlacing/inverse
     # telecine must come FIRST: both work on field structure, which only survives at
@@ -1348,11 +1389,11 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
             # real encodes where the measurement pass itself failed.
             cmd += ["-filter:a:0", f"loudnorm=I={loudnorm_target}:TP=-1.5:LRA=11"]
 
-    if subtitle_stream_indices:
-        # Passthrough: subtitle tracks are copied as-is, not re-encoded. Since the
-        # output container always matches the input's (same file extension), the
-        # original subtitle codec (subrip, ass, PGS, etc.) remains valid.
-        cmd += ["-c:s", "copy"]
+    # Passthrough: subtitle tracks are copied as-is, not re-encoded. Since the output
+    # container always matches the input's (same file extension), the original subtitle
+    # codec (subrip, ass, PGS, etc.) remains valid. Harmless on a file with no
+    # subtitles, so it's set unconditionally alongside the blanket -map above.
+    cmd += ["-c:s", "copy"]
 
     cmd += [str(dst)]
     return cmd
@@ -1364,8 +1405,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                   downscale: bool = False, strip_non_english_audio: bool = False,
                   preset: str | None = None,
                   processed_bytes_so_far: int = 0,
-                  deinterlace: str = "off",
-                  strip_non_english_subs: bool = False) -> ProcessResult | None:
+                  deinterlace: str = "off") -> ProcessResult | None:
     """Returns (original_size, new_size, video_duration_seconds, action, downscaled,
     grew_larger, retried) on success or dry-run preview, or None only when the caller
     already decided to skip the file entirely before calling this (not used internally
@@ -1402,8 +1442,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     'detelecine'); see resolve_deinterlace_filter. Files that are copied rather than
     encoded never run detection, since their video isn't touched.
 
-    strip_non_english_subs mirrors strip_non_english_audio for subtitle tracks; when
-    False (the default) every subtitle track is carried through."""
+    Every subtitle track in the source is carried through; there is no selection or
+    language filtering."""
     min_size_bytes = min_size_mb * 1024 * 1024
     src_stat = src.stat()
     src_size = src_stat.st_size
@@ -1493,48 +1533,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     else:
         keep_audio_indices = []
 
-    # Subtitle/CC tracks, mirroring the audio policy above. Off by default: every
-    # track is carried through, because a subtitle stream costs almost nothing next to
-    # the video and dropping one is irreversible.
-    #
-    # When stripping IS enabled, two deliberate differences from a naive
-    # English-only filter, both chosen to fail toward keeping a track:
-    #   * Untagged tracks are KEPT. Language tags are missing far more often on
-    #     subtitles than on audio, and an untagged track on an English disc is usually
-    #     either English or a forced/foreign-dialogue track that the film needs.
-    #   * If the primary audio track isn't English, every subtitle is kept — the same
-    #     safety net the audio path uses. On a foreign-language film the subtitles are
-    #     the translation, so stripping by language is exactly backwards there.
-    primary_audio_lang = audio_languages[0] if audio_languages else None
-    primary_audio_is_english = primary_audio_lang in ("eng", "en")
-    if not strip_non_english_subs:
-        keep_subtitle_indices = list(range(len(subtitle_tracks)))
-        sub_reason = "strip-no-english-subs is off; keeping all track(s)"
-    elif not primary_audio_is_english:
-        keep_subtitle_indices = list(range(len(subtitle_tracks)))
-        sub_reason = (f"main audio track is not English "
-                      f"(tagged '{primary_audio_lang}')" if primary_audio_lang
-                      else "main audio track is untagged/unknown language")
-        sub_reason += "; keeping all subtitle track(s) as likely translations"
-    else:
-        keep_subtitle_indices = [i for i, (lang, codec) in enumerate(subtitle_tracks)
-                                  if lang in ("eng", "en") or lang is None]
-        sub_reason = "main audio track is English; keeping English and untagged track(s)"
-        if subtitle_tracks and not keep_subtitle_indices:
-            # Stripping would leave the file with no subtitles at all. Prefer keeping
-            # everything over silently shipping a subtitle-less archive copy.
-            keep_subtitle_indices = list(range(len(subtitle_tracks)))
-            sub_reason = ("no English or untagged subtitle track found; keeping all "
-                          "rather than dropping every track")
-
-    if subtitle_tracks:
-        kept_str = (", ".join(f"{i}:{subtitle_tracks[i][0] or 'und'}" for i in keep_subtitle_indices)
-                    if keep_subtitle_indices else "none")
-        dropped = [i for i in range(len(subtitle_tracks)) if i not in keep_subtitle_indices]
-        dropped_str = (", ".join(f"{i}:{subtitle_tracks[i][0] or 'und'}" for i in dropped)
-                       if dropped else "none")
-        logging.info(f"SUBTITLE: {sub_reason}; keeping [{kept_str}]; "
-                     f"discarding [{dropped_str}]: {src}")
+    # Subtitle/CC tracks are all carried through unconditionally; there is no
+    # selection logic. See build_ffmpeg_cmd, which maps them with "0:s?".
 
     # Scan-type handling. Detection decodes a sample, so it only runs for files that
     # are actually being re-encoded — by this point the copy-through cases (already
@@ -1576,7 +1576,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         # encode (below) runs an actual two-pass measurement when normalize_audio is on.
         cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
                                 normalize_audio, loudnorm_target, keep_audio_indices,
-                                keep_subtitle_indices, video_info["stream_index"],
+                                video_info["stream_index"],
                                 preset=preset, deinterlace_filter=deinterlace_filter)
         logging.info(f"[DRY RUN] Command: {format_cmd_for_log(cmd)}")
         if normalize_audio and keep_audio_indices:
@@ -1610,7 +1610,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
 
     cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
                             normalize_audio, loudnorm_target, keep_audio_indices,
-                            keep_subtitle_indices, video_info["stream_index"],
+                            video_info["stream_index"],
                             measured_loudness, preset=preset,
                             deinterlace_filter=deinterlace_filter)
     cmd = add_progress_flags(cmd)
@@ -1798,7 +1798,6 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list[int], du
     width, height = video_info.get("width", 0), video_info.get("height", 0)
     needs_downscale = downscale and (width > 1920 or height > 1080)
     keep_audio_indices = list(range(len(media["audio_languages"])))
-    keep_subtitle_indices = list(range(len(media["subtitle_tracks"])))
 
     # Detection runs once, not once per CRF: the scan type is a property of the source,
     # and every variant in the table must share it or the sizes aren't comparable.
@@ -1819,7 +1818,7 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list[int], du
             continue
 
         cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
-                                False, -16, keep_audio_indices, keep_subtitle_indices,
+                                False, -16, keep_audio_indices,
                                 video_info["stream_index"], None, preset=preset,
                                 deinterlace_filter=deinterlace_filter)
         cmd = add_progress_flags(cmd)
@@ -2119,7 +2118,6 @@ def main() -> None:
                  f"Data limit: {'none' if args.limit == -1 else f'{args.limit}GB'} "
                  f"Downscale to 1080p: {'yes' if args.downscale else 'no'} "
                  f"Strip non-English audio: {'yes' if args.strip_no_english_audio else 'no'} "
-                 f"Strip non-English subtitles: {'yes' if args.strip_no_english_subs else 'no'} "
                  f"Deinterlace: {args.deinterlace}")
 
     if args.include is not None or args.exclude is not None:
@@ -2143,6 +2141,9 @@ def main() -> None:
     # Files encoded with --deinterlace off whose container metadata claimed interlaced
     # video. Advisory only — see container_interlace_hint.
     interlace_hinted_count = 0
+    # Informational subtitle accounting, reported to the log file only.
+    subtitle_bytes_total = 0
+    subtitle_tracks_total = 0
     deleted_source_count = 0
     deleted_source_bytes = 0
     # Counts failures back-to-back, reset by any file that succeeds. Drives the
@@ -2286,8 +2287,7 @@ def main() -> None:
                                    args.dry_run, args.encoding,
                                    args.normalize_audio, args.loudnorm_target, args.downscale,
                                    args.strip_no_english_audio, args.preset,
-                                   processed_bytes, args.deinterlace,
-                                   args.strip_no_english_subs)
+                                   processed_bytes, args.deinterlace)
         except ConversionError as e:
             # Timeouts are called out separately in the log (they point at a stuck
             # process rather than a bad encode) but are handled identically: skip the
@@ -2334,6 +2334,19 @@ def main() -> None:
                 retried_count += 1
             if interlace_hinted:
                 interlace_hinted_count += 1
+
+            # Informational only, and log-file only (logging.info isn't echoed to the
+            # console). Skipped on dry runs, where no output file exists to measure.
+            if not args.dry_run:
+                subtitle_measurement = measure_subtitle_bytes(dst)
+                if subtitle_measurement is not None:
+                    sub_bytes, sub_tracks = subtitle_measurement
+                    subtitle_bytes_total += sub_bytes
+                    subtitle_tracks_total += sub_tracks
+                    pct = f"{sub_bytes / new_size * 100:.2f}%" if new_size else "--"
+                    logging.info(f"SUBTITLE SIZE: {human_size(sub_bytes)} across "
+                                 f"{sub_tracks} track(s), {pct} of the "
+                                 f"{human_size(new_size)} output: {dst}")
 
             if args.delete_source:
                 if args.dry_run:
@@ -2550,6 +2563,15 @@ def main() -> None:
                         f"({human_size(total_orig)} -> {human_size(total_new)})")
         logging.info(summary)
         print(f"\n{summary}")
+
+        # Log file only, deliberately not printed: this is reference data rather than
+        # something to watch a long run by.
+        sub_pct = (f"{subtitle_bytes_total / total_new * 100:.2f}% of output"
+                   if total_new else "--")
+        logging.info(f"Total subtitle data: {human_size(subtitle_bytes_total)} across "
+                     f"{subtitle_tracks_total} track(s) in {encoded_count + copied_count} "
+                     f"file(s), {sub_pct}")
+
         runtime_summary = f"Total video running time: {human_duration(total_duration_seconds)}"
         logging.info(runtime_summary)
         print(runtime_summary)
