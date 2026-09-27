@@ -198,10 +198,12 @@ loose, and consider trying it on a copy of a known ScreenPass disc (e.g.
 John Wick) to confirm the obfuscation heuristic behaves the way you want.
 
 7. Safety/workflow additions on top of the above:
-     - Before deleting a source ISO, the script verifies a real (non-tiny)
-       .mkv file actually appeared/changed in the output directory for
-       each extracted title - a 0-exit-code from makemkvcon is treated as
-       necessary but not sufficient. See MIN_OUTPUT_FILE_BYTES.
+     - Source ISOs are NEVER deleted or modified: the input tree is only
+       ever read. Everything this script writes goes under --output.
+     - After each title, the script verifies a real (non-tiny) .mkv file
+       actually appeared/changed in the output directory - a 0-exit-code
+       from makemkvcon is treated as necessary but not sufficient. See
+       MIN_OUTPUT_FILE_BYTES.
      - A pre-flight check confirms makemkvcon64.exe (the 64-bit MakeMKV
        CLI, required deliberately over the memory-limited 32-bit build)
        can be found on PATH before any files are touched.
@@ -215,7 +217,7 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        The ONE deliberate exception is the stall timeout (below), which
        uses DualLogger.error_continue(): a hung disc is known to be
        isolated to that ISO, so it's logged as an error, that ISO is
-       abandoned with its source retained, and the batch continues. The
+       abandoned and the batch continues. The
        run still exits nonzero.
      - Free space on the output volume is checked before each title
        extraction (using MakeMKV's own reported title size plus
@@ -300,8 +302,8 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        grossly exceeds the expected size - the larger of the summed
        per-title MakeMKV estimates and the ISO's own size, plus a margin
        (--runaway-output-margin-pct, default 20%) - extraction of that ISO
-       stops immediately, a warning is logged, and the source ISO is left
-       in place (not deleted). The margin matters: honest MKV output runs a
+       stops immediately and a warning is logged. The margin matters:
+       honest MKV output runs a
        little larger than the raw stream bytes (container overhead plus
        estimate slack), so on a disc whose selected titles nearly fill it
        the total can legitimately tip just over the ISO's own size - the
@@ -499,8 +501,8 @@ STALL_TIMEOUT_MIN_DEFAULT: float = 15.0
 STALL_CHECK_INTERVAL_SEC: float = 15.0
 
 # Sanity floor for "does this look like a real output file", used both to
-# verify a title actually got extracted before deleting the source (safety
-# enhancement 1) and to decide whether an existing output directory counts
+# verify a title actually got extracted (safety enhancement 1) and to
+# decide whether an existing output directory counts
 # as "already converted" for resume support (enhancement 4). This is a
 # floor, not a quality check - any real title clearing --min-length will
 # produce something far larger than this.
@@ -921,8 +923,7 @@ def probe_output_tracks_and_duration(mkv_path: Path, tool: str) -> tuple[int, in
     failure (tool not found, bad/unparseable output, timeout) - the
     cross-check is then simply skipped for that title rather than
     treated as a failure in its own right, since this is a best-effort
-    extra check layered on top of the file-existence/size check that
-    already gates source deletion."""
+    extra check layered on top of the file-existence/size check."""
     try:
         if tool == "mkvmerge":
             proc = subprocess.run(
@@ -1705,7 +1706,7 @@ class ProcessResult:
     change makes some category of failure non-fatal again. stalled IS
     reachable: a stall timeout is deliberately non-fatal, so process_iso
     returns normally and main() counts the ISO as failed-but-skipped."""
-    converted: bool = False           # fully converted this run (counts toward --limit, eligible for deletion)
+    converted: bool = False           # fully converted this run (counts toward --limit)
     skipped_already_done: bool = False  # resume: output already existed, nothing was done
     info_scan_failed: bool = False    # couldn't even read title info
     unexpected_error: bool = False    # an unhandled exception was caught around this ISO
@@ -1713,7 +1714,6 @@ class ProcessResult:
     # --- dry-run planning fields (populated on every path, consumed only by the dry-run report) ---
     titles_selected: int = 0          # how many titles would be / were extracted
     estimated_output_bytes: int = 0   # sum of selected titles' MakeMKV-reported sizes (output-size estimate)
-    would_delete_source: bool = False  # dry-run: source would be deleted (if --delete-source and output verifies)
     needs_attention: bool = False     # a skip the user should resolve before a real run (vs a benign resume skip)
     attention_reason: str | None = None  # short label for the needs-attention report
     jre_missing: bool = False         # this disc needed a JRE that MakeMKV couldn't find (a fixable root cause)
@@ -1769,7 +1769,7 @@ def process_iso(
     bytes_converted_so_far: int = 0,
 ) -> ProcessResult:
     """Returns a ProcessResult describing what happened, so main() can
-    drive --limit accounting, source deletion, and the info-scan
+    drive --limit accounting and the info-scan
     circuit breaker.
 
     bytes_converted_so_far is the run-wide total of source ISO bytes
@@ -2171,12 +2171,6 @@ def process_iso(
     stop_reason: str | None = None  # set when all_ok is False for a reason other than a title outright failing
     stalled_out: bool = False  # a stall timeout abandoned this ISO - non-fatal, the batch continues
     output_filenames: list[str] = []  # populated on success, written into the manifest below
-    # Tracks whether EVERY extracted title was affirmatively verified clean
-    # by the track/duration cross-check. Starts True only if a probe tool is
-    # available at all; any title that can't be probed, or that shows a
-    # mismatch, flips it False. --delete-source consults this so a source is
-    # only ever removed when its output was positively confirmed good.
-    output_verified = probe_tool is not None
     iso_size_bytes = iso_path.stat().st_size
     total_extracted_bytes = 0  # running total across titles - see size failsafe below
     # Expected output size for the runaway-output failsafe below: the sum of
@@ -2415,11 +2409,6 @@ def process_iso(
                         iso_path,
                     )
                     stats.warnings += 1
-                    output_verified = False  # a flagged title means the disc isn't cleanly verified
-            else:
-                # Probe tool present but couldn't read this file - can't
-                # affirmatively verify it, so the disc isn't clean-verified.
-                output_verified = False
 
         # --- Runaway-output failsafe ---
         # The combined size of everything extracted from this ISO shouldn't
@@ -2435,9 +2424,8 @@ def process_iso(
         # remains for this backstop is a GROSS overrun - a genuinely
         # looping/duplicate extraction, or overlapping playlists that slipped
         # past dedup - which lands well past the margin. On a trip, stop
-        # pulling more titles from this ISO and leave the source alone rather
-        # than risk deleting it (if --delete-source is set) after a broken
-        # extraction.
+        # pulling more titles from this ISO rather than grinding out more
+        # broken output.
         total_extracted_bytes += after_snapshot[qualifying_new_mkvs[0]]
         if total_extracted_bytes > runaway_output_limit:
             expected_base = max(iso_size_bytes, estimated_total_bytes)
@@ -2449,8 +2437,7 @@ def process_iso(
             )
             logger.warning(
                 f"{stop_reason} - this points to something wrong with the extraction rather "
-                f"than genuinely larger output. Stopping further titles for this ISO; source "
-                f"file will be retained.",
+                f"than genuinely larger output. Stopping further titles for this ISO.",
                 iso_path,
             )
             stats.warnings += 1
@@ -2464,9 +2451,9 @@ def process_iso(
         # logger.error().
         report = logger.error_continue if stalled_out else logger.error
         if stop_reason:
-            report(f"Stopped converting this ISO: {stop_reason}; source file retained", iso_path)
+            report(f"Stopped converting this ISO: {stop_reason}", iso_path)
         else:
-            report("One or more titles failed to convert; source file retained", iso_path)
+            report("One or more titles failed to convert", iso_path)
         return ProcessResult(stalled=stalled_out)
 
     logger.info("All selected titles converted successfully", iso_path)
@@ -2478,43 +2465,14 @@ def process_iso(
         # manifest_mismatch_reason().
         write_manifest(out_dir, iso_path, candidates, output_filenames, args, logger, stats)
 
-        # Stamp each output .mkv with the source ISO's file date. Done
-        # before any source deletion (the source still exists here) and
-        # only over the final, named output files - not the manifest.
+        # Stamp each output .mkv with the source ISO's file date, over the
+        # final, named output files - not the manifest.
         stamp_outputs_with_source_date(iso_path, out_dir, output_filenames, logger, stats)
-
-    if not args.delete_source:
-        logger.info("Keeping source file (deletion is off by default; enable with --delete-source)", iso_path)
-    elif args.dry_run:
-        logger.info(
-            "[DRY RUN] Would delete source ISO file if its output verified clean (--delete-source)",
-            iso_path,
-        )
-    elif not output_verified:
-        # --delete-source only removes a source whose output was positively
-        # confirmed good by the track/duration cross-check. Here it wasn't
-        # (a mismatch, a probe that couldn't read a file, or no probe tool
-        # available), so the source is kept regardless of --delete-source.
-        # This is the safety gate working as intended, so it's INFO, not an
-        # error; any actual mismatch already logged its own warning above.
-        logger.info(
-            "Not deleting source ISO: its output was not verified clean by the track/duration "
-            "cross-check, so it's kept for safety despite --delete-source. Resolve the issue and "
-            "re-run, or delete manually once satisfied.",
-            iso_path,
-        )
-    else:
-        try:
-            iso_path.unlink()
-            logger.info("Deleted source ISO file (--delete-source, output verified clean)", iso_path)
-        except OSError as e:
-            logger.error(f"Failed to delete source file: {e}", iso_path)
 
     return ProcessResult(
         converted=True,
         titles_selected=len(candidates),
         estimated_output_bytes=sum(titles[t].size_bytes for t in candidates),
-        would_delete_source=args.delete_source,
     )
 
 
@@ -2568,14 +2526,6 @@ def parse_args() -> argparse.Namespace:
         "-l", "--log", nargs="?", const=None, default=None, metavar="LOGFILE",
         help="Log file path. Defaults to 'convert.log' inside the output folder (-o). Pass an "
              "explicit path to place it elsewhere",
-    )
-    p.add_argument(
-        "--delete-source", action="store_true",
-        help="Delete each source ISO after it converts AND its output passes the track/duration "
-             "cross-check clean. Off by default - sources are kept unless this is given. A source "
-             "whose output can't be positively verified (a cross-check mismatch, an unreadable "
-             "output, or no mkvmerge/ffprobe available) is always kept, so this has no effect "
-             "without a probe tool installed",
     )
     p.add_argument("-n", "--dry-run", action="store_true", help="Show what would happen without changing anything")
     p.add_argument(
@@ -2781,19 +2731,6 @@ def main() -> int:
             "enable it, or pass --no-verify-tracks to silence this message."
         )
 
-    # --delete-source now removes a source only after its output passes the
-    # cross-check clean. If that check can't run this session, deletion can
-    # never be authorized, so warn up front rather than silently keeping
-    # every source.
-    if args.delete_source and probe_tool is None:
-        reason = "--no-verify-tracks is set" if not args.verify_tracks else "no mkvmerge/ffprobe found"
-        logger.warning(
-            f"--delete-source only deletes a source after its output is verified clean by the "
-            f"track/duration cross-check, but that check is unavailable this run ({reason}). "
-            f"No sources will be deleted. Install mkvmerge or ffprobe (and don't pass "
-            f"--no-verify-tracks) to enable verified deletion."
-        )
-
     if not input_root.is_dir():
         logger.error(f"Input folder does not exist: {input_root}")
         logger.close()
@@ -2874,8 +2811,6 @@ def main() -> int:
     dry_convert_input_bytes: int = 0
     dry_resume_skips: int = 0
     dry_attention: list[tuple[Path, str, bool]] = []  # (iso_path, reason, jre_missing)
-    dry_delete_count: int = 0
-    dry_delete_bytes: int = 0
 
     try:
         for idx, iso_path in enumerate(iso_files, start=1):
@@ -2941,9 +2876,6 @@ def main() -> int:
                     dry_titles_total += result.titles_selected
                     dry_output_bytes += result.estimated_output_bytes
                     dry_convert_input_bytes += iso_size
-                    if result.would_delete_source:
-                        dry_delete_count += 1
-                        dry_delete_bytes += iso_size
                 elif result.skipped_already_done:
                     dry_resume_skips += 1
                 elif result.needs_attention:
@@ -2999,13 +2931,6 @@ def main() -> int:
                     f"  ({jre_n} of these needed a JRE MakeMKV couldn't find - install a JRE or "
                     f"set app_Java in MakeMKV's settings.conf)"
                 )
-        if args.delete_source:
-            summary_lines.append("")
-            summary_lines.append("-- Deletion footprint --")
-            summary_lines.append(
-                f"  Would delete {dry_delete_count} source ISO(s) "
-                f"(~{human_bytes(dry_delete_bytes)}) once each output verifies clean"
-            )
         summary_lines.append("")
         summary_lines.append("Nothing was changed (dry run).")
         summary_lines.append("======================================================")
