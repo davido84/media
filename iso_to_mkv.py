@@ -368,22 +368,6 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        process cleanly, then still prints the summary-so-far and closes
        the log, rather than leaving an orphaned process or a truncated
        log file.
-     - Pass-through copies of already-ripped files: a library folder often
-       holds a mix of ISOs still to be ripped and video files ripped on
-       some earlier occasion. Those files (.mkv and .mp4 - see
-       PASSTHROUGH_SUFFIXES) have nothing to extract, but leaving them
-       behind would make the output an incomplete copy of the library, so
-       each one is copied across byte-for-byte - no remux, no re-encode -
-       to the same path relative to the output root
-       (<input>/Show/1-1.mp4 -> <output>/Show/1-1.mp4, keeping its name
-       and extension, with no per-title subfolder). The copy goes to a
-       .partial temp name and is renamed into place only once complete and
-       size-verified, so an interrupted run can't leave a half file that
-       later looks done; timestamps are preserved; free space is checked
-       first; a copy whose destination already exists at the same size is
-       skipped, so re-runs are cheap. Copied bytes draw on the --limit
-       budget like converted ones. The source file is never deleted, even
-       under --delete-source.
      - Source file date preservation: each output .mkv is stamped with
        the source ISO's access/modification times, so the converted file
        carries the same file date as the disc image it came from (handy
@@ -528,12 +512,6 @@ MIN_OUTPUT_FILE_BYTES: int = 1_000_000  # 1 MB
 # for why a count alone can't tell "same titles, already done" apart from "a
 # different run left a coincidentally-equal number of files here".
 MANIFEST_FILENAME: str = ".iso_to_mkv_manifest.json"
-
-# Already-ripped video files that may be sitting in the input tree alongside
-# the ISOs. There's nothing to extract from these, so they're copied through
-# to the output unchanged (see copy_passthrough_file). Extensions are matched
-# case-insensitively; add to this set to carry more formats across.
-PASSTHROUGH_SUFFIXES: frozenset[str] = frozenset({".mkv", ".mp4"})
 
 # Tolerance (seconds) for comparing a stored source-ISO mtime against a
 # freshly stat'd one during the resume check. Exact float equality is too
@@ -1710,9 +1688,6 @@ class Stats:
     bytes_converted: int = 0
     already_converted_skipped: int = 0
     isos_stalled: int = 0  # abandoned mid-extraction by the stall timeout (non-fatal; batch continued)
-    files_copied: int = 0      # already-ripped files in the input tree copied through to the output unchanged
-    copies_skipped: int = 0    # ...and ones already present in the output, so nothing was copied
-    bytes_copied: int = 0      # total bytes of those pass-through copies
 
 
 @dataclass
@@ -1735,7 +1710,6 @@ class ProcessResult:
     info_scan_failed: bool = False    # couldn't even read title info
     unexpected_error: bool = False    # an unhandled exception was caught around this ISO
     stalled: bool = False             # abandoned because a title extraction stalled (non-fatal; batch continues)
-    copied: bool = False              # a loose input .mkv was copied through to the output unchanged
     # --- dry-run planning fields (populated on every path, consumed only by the dry-run report) ---
     titles_selected: int = 0          # how many titles would be / were extracted
     estimated_output_bytes: int = 0   # sum of selected titles' MakeMKV-reported sizes (output-size estimate)
@@ -1743,96 +1717,6 @@ class ProcessResult:
     needs_attention: bool = False     # a skip the user should resolve before a real run (vs a benign resume skip)
     attention_reason: str | None = None  # short label for the needs-attention report
     jre_missing: bool = False         # this disc needed a JRE that MakeMKV couldn't find (a fixable root cause)
-
-
-def copy_passthrough_file(
-    src_path: Path,
-    input_root: Path,
-    output_root: Path,
-    args: argparse.Namespace,
-    logger: "DualLogger",
-    stats: "Stats",
-) -> "ProcessResult":
-    """Copy an already-ripped video file found in the input tree straight
-    through to the output tree, byte-for-byte, with no remux or re-encode.
-
-    Applies to every extension in PASSTHROUGH_SUFFIXES (.mkv, .mp4). Some
-    folders hold a mix of ISOs still to be ripped and files that were already
-    ripped on an earlier occasion. Those have nothing to extract, but leaving
-    them behind would make the output tree an incomplete copy of the library,
-    so they're carried across unchanged.
-
-    The destination mirrors the source's path relative to the input root, so
-    <input>/Breaking Bad/1-1.mp4 lands at <output>/Breaking Bad/1-1.mp4 -
-    same filename, same extension, same folder layout, no per-title subfolder
-    (that structure exists to hold the several titles an ISO yields; a
-    standalone file is already one finished video).
-
-    Care taken, matching how ISO conversion behaves:
-      - Resume: if the destination already exists with the same size, nothing
-        is copied and it's counted as skipped, so re-runs are cheap.
-      - Never truncated: the copy is written to a .partial temp name and only
-        renamed into place once it's complete and its size matches the source,
-        so an interrupted run can't leave a half file that later looks done.
-      - The source file's timestamps are preserved (shutil.copy2).
-      - Free space is checked first, with the same --free-space-margin-pct.
-      - The source file is NEVER deleted, even under --delete-source: that
-        flag is about reclaiming space from an ISO whose titles were verified
-        out of it, which has no equivalent here.
-    """
-    rel = src_path.relative_to(input_root)
-    dest = output_root / rel
-    src_size = src_path.stat().st_size
-
-    if dest.exists():
-        try:
-            dest_size = dest.stat().st_size
-        except OSError:
-            dest_size = -1
-        if dest_size == src_size:
-            # file_only: routine on every re-run of an already-copied library.
-            logger.file_only("INFO", f"Already present at {dest} - skipping copy", src_path)
-            stats.copies_skipped += 1
-            return ProcessResult(skipped_already_done=True)
-        logger.warning(
-            f"{dest} already exists but is a different size ({human_bytes(dest_size)} vs "
-            f"{human_bytes(src_size)} at the source) - recopying",
-            src_path,
-        )
-        stats.warnings += 1
-
-    if args.dry_run:
-        logger.info(f"[DRY RUN] Would copy as-is -> {dest} ({human_bytes(src_size)})", src_path)
-        return ProcessResult(copied=True, estimated_output_bytes=src_size)
-
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    space_error = check_free_space(dest.parent, output_root, src_size, args.free_space_margin_pct)
-    if space_error:
-        logger.error(f"Cannot copy this {src_path.suffix} file: {space_error}", src_path)  # fail-fast
-
-    logger.info(f"Copying as-is ({human_bytes(src_size)}) -> {dest}", src_path)
-    tmp = dest.with_name(dest.name + ".partial")
-    try:
-        shutil.copy2(src_path, tmp)
-        copied_size = tmp.stat().st_size
-        if copied_size != src_size:
-            tmp.unlink(missing_ok=True)
-            logger.error(
-                f"Copy came out the wrong size ({human_bytes(copied_size)} vs "
-                f"{human_bytes(src_size)} at the source) - discarded the partial file",
-                src_path,
-            )  # fail-fast
-        tmp.replace(dest)
-    except OSError as e:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        logger.error(f"Failed to copy this file to {dest}: {e}", src_path)  # fail-fast
-
-    stats.files_copied += 1
-    stats.bytes_copied += src_size
-    return ProcessResult(copied=True, estimated_output_bytes=src_size)
 
 
 # --------------------------------------------------------------------------
@@ -2921,15 +2805,6 @@ def main() -> int:
     iso_files = sorted(
         {p for p in input_root.rglob("*") if p.is_file() and p.suffix.lower() == ".iso"}
     )
-    # Already-ripped video files sitting in the input tree have nothing to
-    # extract, but they're part of the library, so they're carried across to
-    # the output unchanged (see copy_passthrough_file).
-    passthrough_files = sorted(
-        {
-            p for p in input_root.rglob("*")
-            if p.is_file() and p.suffix.lower() in PASSTHROUGH_SUFFIXES
-        }
-    )
 
     # --include/--exclude match against each ISO's path RELATIVE to the
     # input folder, as a forward-slash string (so patterns are the same on
@@ -2942,10 +2817,6 @@ def main() -> int:
     if args.include:
         before = len(iso_files)
         iso_files = [p for p in iso_files if args.include.match(p.relative_to(input_root).as_posix())]
-        passthrough_files = [
-            p for p in passthrough_files
-            if args.include.match(p.relative_to(input_root).as_posix())
-        ]
         logger.info(
             f"--include={args.include.pattern!r} applied: {len(iso_files)} of {before} "
             f"ISO(s) matched and will be processed"
@@ -2953,17 +2824,13 @@ def main() -> int:
     elif args.exclude:
         before = len(iso_files)
         iso_files = [p for p in iso_files if not args.exclude.match(p.relative_to(input_root).as_posix())]
-        passthrough_files = [
-            p for p in passthrough_files
-            if not args.exclude.match(p.relative_to(input_root).as_posix())
-        ]
         logger.info(
             f"--exclude={args.exclude.pattern!r} applied: {before - len(iso_files)} of {before} "
             f"ISO(s) matched and will be skipped"
         )
 
-    if not iso_files and not passthrough_files:
-        logger.info(f"No .iso files or copyable video files found under {input_root}")
+    if not iso_files:
+        logger.info(f"No .iso files found under {input_root}")
         logger.close()
         return 0
 
@@ -2983,17 +2850,14 @@ def main() -> int:
         logger.close()
         return 1
 
-    # One ordered work list so progress numbering, the ETA and the --limit
-    # budget all account for the pass-through copies as well as the ISOs.
-    work_files = sorted(iso_files + passthrough_files)
-    total_bytes_all = sum(p.stat().st_size for p in work_files)
-    total_count = len(work_files)
+    total_bytes_all = sum(p.stat().st_size for p in iso_files)
+    total_count = len(iso_files)
     limit_bytes = args.limit * (1024 ** 3) if args.limit and args.limit > 0 else None
 
-    found_msg = f"Found {len(iso_files)} ISO file(s)"
-    if passthrough_files:
-        found_msg += f" and {len(passthrough_files)} already-ripped file(s) to copy through as-is"
-    logger.info(f"{found_msg}, {human_bytes(total_bytes_all)} total, under {input_root}")
+    logger.info(
+        f"Found {total_count} ISO file(s), {human_bytes(total_bytes_all)} total, "
+        f"under {input_root}"
+    )
 
     stats: Stats = Stats()
     used_output_names: set[str] = set()
@@ -3014,7 +2878,7 @@ def main() -> int:
     dry_delete_bytes: int = 0
 
     try:
-        for idx, iso_path in enumerate(work_files, start=1):
+        for idx, iso_path in enumerate(iso_files, start=1):
             if limit_bytes is not None and bytes_converted_running >= limit_bytes:
                 logger.info(
                     f"Byte limit reached ({human_bytes(bytes_converted_running)} >= "
@@ -3044,22 +2908,15 @@ def main() -> int:
             # is allowed to propagate past this without going through the
             # logger first.
             try:
-                if iso_path.suffix.lower() in PASSTHROUGH_SUFFIXES:
-                    # Already-ripped file: copied through unchanged, no
-                    # extraction (see copy_passthrough_file).
-                    result = copy_passthrough_file(
-                        iso_path, input_root, output_root, args, logger, stats
-                    )
-                else:
-                    result = process_iso(
-                        iso_path, input_root, output_root, args, logger, stats, used_output_names, probe_tool,
-                        bytes_converted_so_far=bytes_converted_running,
-                    )
+                result = process_iso(
+                    iso_path, input_root, output_root, args, logger, stats, used_output_names, probe_tool,
+                    bytes_converted_so_far=bytes_converted_running,
+                )
             except KeyboardInterrupt:
                 raise
             except Exception as e:
                 logger.error(
-                    f"Unexpected error while processing this file: {e!r}",
+                    f"Unexpected error while processing this ISO: {e!r}",
                     iso_path,
                 )
                 stats.conversions_error += 1
@@ -3075,11 +2932,6 @@ def main() -> int:
             if result.converted:
                 bytes_converted_running += iso_size
                 stats.bytes_converted += iso_size
-            elif result.copied:
-                # A pass-through copy is real byte-moving work, so it draws on
-                # the same --limit budget; without that, a library of loose
-                # .mkv files could copy for hours past the requested cap.
-                bytes_converted_running += iso_size
 
             # Gather the dry-run pre-flight plan as we go (see the plan
             # printed after the loop). Cheap, and only reported in dry-run.
@@ -3167,8 +3019,6 @@ def main() -> int:
             f"ISO files converted          : {stats.isos_converted}",
             f"Already-converted skipped    : {stats.already_converted_skipped}",
             f"Stalled (skipped, investigate): {stats.isos_stalled}",
-            f"Files copied as-is           : {stats.files_copied} "
-            f"({human_bytes(stats.bytes_copied)}), {stats.copies_skipped} already present",
             f"Total ISO bytes converted    : {human_bytes(stats.bytes_converted)}",
             "==================================================",
         ]
