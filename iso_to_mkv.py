@@ -2126,11 +2126,11 @@ def process_iso(
         previous_manifest, iso_path, candidates, natural_out_dir, args
     )
     if resume_mismatch is None:
-        logger.info(
-            f"{natural_out_dir} already has a matching completed conversion for this exact "
-            f"title selection and these settings - skipping. Use --force to redo.",
-            iso_path,
-        )
+        # The logger already prefixes every line with the source file, so the
+        # message itself just states the outcome. The matching output folder,
+        # the exact match criteria and the --force hint are all recoverable
+        # from the run's settings, so they're not worth the console width.
+        logger.info("already has a matching completed conversion.", iso_path)
         # Even when skipping, make sure the existing outputs carry the
         # source file date - this repairs folders converted before file-
         # date preservation existed, without needing --force. No-op when
