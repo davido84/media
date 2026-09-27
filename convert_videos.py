@@ -136,7 +136,83 @@ ENCODE_STALL_POLL_SECONDS: float = 5.0
 # wedged process.
 ENCODE_STALL_MIN_CPU_DELTA: float = 0.10  # seconds
 
-# --- Failure circuit breaker -----------------------------------------------------
+# --- Interlacing detection -------------------------------------------------------
+# Deinterlacing is decided per file from the picture content, not from the container's
+# field_order tag, which is frequently absent, wrong, or stale on DVD rips. Detection
+# decodes a short sample through ffmpeg's idet filter and reads its frame counts.
+#
+# The distinction that matters is telecine vs true interlace, because the correct fix
+# differs and guessing wrong damages the picture:
+#   * Film-sourced NTSC DVDs are 23.976p carried as 29.97i via 3:2 pulldown. The fix
+#     is inverse telecine (fieldmatch + decimate), which reconstructs the original
+#     progressive frames exactly and drops the frame count by 20% — better quality AND
+#     a smaller file.
+#   * Video-sourced content (TV, concerts, extras) is genuinely 29.97i with unique
+#     motion in every field. Nothing can reconstruct whole frames, so it must be
+#     interpolated with a real deinterlacer (bwdif).
+#   * Much PAL and soft-telecined NTSC content is already progressive despite an
+#     interlaced flag, and must be left completely alone.
+# Applying a deinterlacer to progressive content softens it permanently; applying
+# decimate to true video content throws away every fifth frame of real motion.
+
+# How many frames of the sample to run through idet. A few hundred is enough for a
+# stable ratio while keeping detection to a second or two even on 1080p.
+IDET_SAMPLE_FRAMES: int = 400
+
+# How far into the file to start the sample, as a fraction of its duration. Opening
+# credits, studio logos and fades are often progressive (or black) even in interlaced
+# content, so sampling from the very start misclassifies a lot of discs.
+IDET_SAMPLE_POSITION: float = 0.35
+
+# Fraction of ALL sampled frames (undetermined included) that must show comb before a
+# file is treated as needing any filtering. Compression noise makes idet flag the
+# occasional frame in genuinely progressive content, so this sits well above zero.
+IDET_INTERLACED_THRESHOLD: float = 0.20
+
+# Minimum frames that must come back from a sample for its ratios to mean anything.
+# A truncated or unseekable sample yielding a handful of frames is reported as
+# 'unknown' (leave the file alone) rather than classified from near-zero evidence.
+IDET_MIN_SAMPLE_FRAMES: int = 50
+
+# Fraction of sampled frames carrying a repeated field above which the source is taken
+# to be 3:2 pulldown. Telecine duplicates one field every five frames, so a clean
+# cadence lands around 20-40%; genuine interlace and progressive content sit at ~0%.
+IDET_REPEAT_FIELD_THRESHOLD: float = 0.12
+
+# Alternative telecine signal: the fraction by which a fieldmatch pass must cut the
+# combed-frame ratio. Field matching re-pairs fields into whole frames, which only
+# works on a pulldown cadence — measured on clean telecine it takes a ~100% combed
+# sample to 0%, while true interlace barely moves.
+IDET_FIELDMATCH_RECOVERY: float = 0.70
+
+# Frame rates (fps) at which 3:2 pulldown is possible at all — NTSC 29.97 and its
+# 30.0 variant. A 25fps PAL source flagged interlaced is never telecined in this
+# sense, so it goes down the deinterlace path without the fieldmatch test.
+NTSC_FRAME_RATES: tuple[float, ...] = (29.97, 30.0)
+NTSC_FRAME_RATE_TOLERANCE: float = 0.5
+
+# Frame rates that are inherently progressive. Interlaced video only exists in the
+# broadcast formats built around it (25i/50i for PAL, 29.97i/59.94i for NTSC); no
+# interlaced format runs at film rate. So a file already at 23.976/24fps cannot be
+# interlaced video, whatever comb idet thinks it sees — and idet DOES produce false
+# positives here, because very sharp horizontal detail looks like comb to it (measured:
+# a genuinely progressive 24p test pattern reported 63% of frames combed). Trusting
+# that would apply a deinterlacer to clean progressive video and soften it permanently,
+# so film-rate sources short-circuit to 'progressive'.
+PROGRESSIVE_FRAME_RATES: tuple[float, ...] = (23.976, 24.0)
+PROGRESSIVE_FRAME_RATE_TOLERANCE: float = 0.1
+
+# Filter chains for each outcome.
+# fieldmatch reconstructs progressive frames from the 3:2 cadence; the yadif between
+# handles the occasional orphaned combed frame fieldmatch can't pair up (a bad edit or
+# a cadence break); decimate then drops the duplicated fifth frame, taking 29.97 back
+# to 23.976. bwdif is used for true interlace in send_frame mode, which outputs one
+# frame per input frame rather than doubling the rate — doubling would undo much of
+# the size reduction this script exists to achieve.
+DETELECINE_FILTER: str = "fieldmatch=order=auto:combmatch=full,yadif=deint=interlaced,decimate"
+DEINTERLACE_FILTER: str = "bwdif=mode=send_frame:parity=auto:deint=all"
+
+
 # A single bad file shouldn't end a multi-day batch, so per-file failures (including
 # probe timeouts) skip the file and carry on. But a systemic fault — the source drive
 # dropping offline, ffmpeg going missing — would otherwise churn through thousands of
@@ -180,8 +256,11 @@ type PresetStats = dict[str | None, dict[str, float]]
 
 # process_file's success/preview result:
 # (original_size, new_size, video_duration_seconds_or_None, action, downscaled,
-#  grew_larger, retried). action is "encoded" or "copied".
-type ProcessResult = tuple[int, int, float | None, str, bool, bool, bool]
+#  grew_larger, retried, interlace_hinted). action is "encoded" or "copied".
+# interlace_hinted is True only when the file was encoded with --deinterlace off AND
+# its container metadata claimed interlaced video — an advisory flag the run summary
+# counts, never a statement that the picture really is interlaced.
+type ProcessResult = tuple[int, int, float | None, str, bool, bool, bool, bool]
 
 # One row of the --compare-crf table:
 # (crf, output_size_bytes_or_None, elapsed_seconds, error_or_None, skipped).
@@ -344,6 +423,33 @@ def build_parser() -> argparse.ArgumentParser:
                               "alone, as is anything that fails). Has no effect combined "
                               "with --dry-run or --compare-crf. Always prompts for "
                               "confirmation before the run starts. Default: off")
+    parser.add_argument("--deinterlace", choices=["off", "auto", "deinterlace", "detelecine"],
+                         default="off",
+                         help="How to handle interlaced sources (mainly DVD rips; Blu-ray "
+                              "is almost always progressive). HEVC has no interlaced "
+                              "coding mode, so interlaced video encoded as-is gets its "
+                              "comb artifacts baked in permanently and costs extra "
+                              "bitrate to store them. 'auto' decodes a short sample of "
+                              "each file and picks per file: film-sourced NTSC content "
+                              "carried as 3:2 pulldown is inverse-telecined back to true "
+                              "23.976p (better quality AND ~20%% fewer frames), genuinely "
+                              "interlaced video is deinterlaced with bwdif, and "
+                              "progressive content is left untouched. 'deinterlace' and "
+                              "'detelecine' force one filter on every file without "
+                              "detecting anything, for sources you already know the "
+                              "answer for. Detection adds a second or two per file and "
+                              "only runs on files being re-encoded, never on copies. "
+                              "Default: off (video passed through exactly as before)")
+    parser.add_argument("--strip-no-english-subs", action="store_true",
+                         help="Drop subtitle tracks that aren't English, mirroring -e for "
+                              "audio. Untagged tracks are KEPT (missing language tags are "
+                              "common on subtitles, and an untagged track is usually "
+                              "English or a forced/foreign-dialogue track the film needs), "
+                              "and if the main audio track isn't English every subtitle is "
+                              "kept, since on a foreign-language film the subtitles are the "
+                              "translation. If stripping would leave no subtitles at all, "
+                              "all tracks are kept instead. Default: off (every subtitle "
+                              "track is carried through)")
     parser.add_argument("--include", type=str, default=None, metavar="REGEX",
                          help="Only process files whose path, taken relative to the "
                               "input folder and written with forward slashes, matches "
@@ -422,11 +528,28 @@ def setup_logging(output_folder: Path, name_suffix: str = "") -> Path:
 COVER_ART_CODECS = {"mjpeg", "png", "bmp", "gif"}
 
 
+def _parse_frame_rate(rate_str: str | None) -> float | None:
+    """Parse ffprobe's r_frame_rate, which is a rational string like '30000/1001',
+    into a float. Returns None for a missing, malformed or zero-denominator value
+    (ffprobe reports '0/0' for streams where it can't determine a rate)."""
+    if not rate_str:
+        return None
+    try:
+        if "/" in rate_str:
+            num_str, _, den_str = rate_str.partition("/")
+            num, den = float(num_str), float(den_str)
+            return num / den if den else None
+        return float(rate_str)
+    except ValueError:
+        return None
+
+
 def probe_media(path: Path, timeout_seconds: float) -> dict[str, Any]:
     """Probe a media file with a single ffprobe call, returning:
       {
         "video": {"codec_name": str, "width": int, "height": int, "duration": float|None,
-                   "stream_index": int},  # index i in ffmpeg's 0:v:i, for explicit mapping
+                   "stream_index": int,   # index i in ffmpeg's 0:v:i, for explicit mapping
+                   "frame_rate": float|None, "field_order": str|None},
         "audio_languages": [lang_or_None, ...],   # index i == ffmpeg's 0:a:i
         "subtitle_tracks": [(lang_or_None, codec_name), ...],  # index i == 0:s:i
       }
@@ -438,7 +561,8 @@ def probe_media(path: Path, timeout_seconds: float) -> dict[str, Any]:
     cmd: list[str] = [
         "ffprobe", "-v", "error",
         "-show_entries",
-        "stream=codec_name,codec_type,width,height,disposition:stream_tags=language:format=duration",
+        "stream=codec_name,codec_type,width,height,disposition,r_frame_rate,field_order:"
+        "stream_tags=language:format=duration",
         "-of", "json",
         str(path),
     ]
@@ -474,6 +598,14 @@ def probe_media(path: Path, timeout_seconds: float) -> dict[str, Any]:
                 "width": s.get("width", 0),
                 "height": s.get("height", 0),
                 "stream_index": stream_index,
+                # Container-declared frame rate and field order. Both are hints only:
+                # field_order is frequently wrong or absent on DVD rips (and stays
+                # stale on a re-muxed file), so detect_field_mode() decides from the
+                # actual picture content instead. frame_rate matters because it's what
+                # separates an NTSC 29.97 source (where 3:2 telecine is possible) from
+                # a PAL 25 source (where it isn't).
+                "frame_rate": _parse_frame_rate(s.get("r_frame_rate")),
+                "field_order": s.get("field_order"),
             }
             if fallback_video_info is None:
                 fallback_video_info = info
@@ -691,6 +823,202 @@ def run_ffmpeg_with_watchdog(cmd: list[str],
                             silent_for)
 
 
+def _run_idet(src: Path, start_seconds: float, extra_filters: str | None
+               ) -> dict[str, int] | None:
+    """Decode a sample of src through ffmpeg's idet filter and return its frame counts
+    as {'interlaced', 'progressive', 'undetermined', 'repeated', 'total'}, or None if
+    the sample couldn't be analyzed. extra_filters, when given, is applied BEFORE idet,
+    which is how the telecine test re-measures a field-matched version of the sample.
+
+    'repeated' counts frames carrying a repeated field, which is the fingerprint of 3:2
+    pulldown: telecine duplicates one field every five frames, and nothing else does.
+
+    Reads idet's "Multi frame detection" line rather than "Single frame detection":
+    the multi-frame figure considers neighbouring frames and is markedly more reliable
+    on compressed sources, where a single frame's comb can be ambiguous."""
+    filters = f"{extra_filters},idet" if extra_filters else "idet"
+    cmd: list[str] = ["ffmpeg", "-hide_banner", "-nostdin"]
+    if start_seconds > 0:
+        # Before -i, so this is a fast keyframe seek rather than a decode-and-discard.
+        cmd += ["-ss", f"{start_seconds:.3f}"]
+    cmd += ["-i", str(src), "-map", "0:v:0", "-vf", filters,
+            "-frames:v", str(IDET_SAMPLE_FRAMES), "-an", "-sn", "-f", "null", "-"]
+
+    result = run_ffmpeg_with_watchdog(add_progress_flags(cmd))
+    if result.stalled or result.returncode != 0:
+        return None
+
+    # idet prints its totals at end of stream, e.g.
+    #   [Parsed_idet_0 @ ...] Multi frame detection: TFF: 202 BFF: 0 Progressive: 0 Undetermined: 0
+    # ffmpeg emits MORE THAN ONE of these blocks: an all-zero one from a filter-graph
+    # instance that processed no frames, then the real totals from the instance that
+    # did the work. Take the last block, never the first — reading the first is a
+    # silent failure that makes every file look unclassifiable.
+    matches = re.findall(
+        r"Multi frame detection:\s*TFF:\s*(\d+)\s*BFF:\s*(\d+)\s*"
+        r"Progressive:\s*(\d+)\s*Undetermined:\s*(\d+)", result.stderr)
+    if not matches:
+        return None
+    tff, bff, progressive, undetermined = (int(g) for g in matches[-1])
+
+    repeated = 0
+    rep_matches = re.findall(
+        r"Repeated Fields:\s*Neither:\s*(\d+)\s*Top:\s*(\d+)\s*Bottom:\s*(\d+)",
+        result.stderr)
+    if rep_matches:
+        _, top, bottom = (int(g) for g in rep_matches[-1])
+        repeated = top + bottom
+
+    total = tff + bff + progressive + undetermined
+    return {"interlaced": tff + bff, "progressive": progressive,
+            "undetermined": undetermined, "repeated": repeated, "total": total}
+
+
+def detect_field_mode(src: Path, video_info: dict[str, Any]) -> tuple[str, str]:
+    """Classify src's scan type by inspecting the picture itself, returning
+    (mode, reason) where mode is one of:
+      'progressive' - leave the video alone
+      'telecine'    - 3:2 pulldown; inverse-telecine it (DETELECINE_FILTER)
+      'interlaced'  - genuine interlace; deinterlace it (DEINTERLACE_FILTER)
+      'unknown'     - detection failed; caller should leave the video alone
+    reason is a short human-readable explanation for the log, so a questionable call
+    can be audited after the fact rather than silently trusted.
+
+    Stage 1 asks whether there is comb at all. Note that ratios are taken over EVERY
+    sampled frame, undetermined ones included: clean progressive footage very often
+    comes back entirely 'undetermined' rather than 'progressive' (idet only reports
+    'progressive' when it is positively confident), so dividing by the classified
+    frames alone turns a handful of stray detections in a pristine file into a 100%
+    interlaced verdict.
+
+    Stage 2 separates telecine from true interlace, for NTSC-rate sources only, using
+    two independent signals and accepting either:
+      * repeated fields - 3:2 pulldown duplicates a field every five frames, giving a
+        repeat rate near 20%+; genuine interlace repeats none. This is the strongest
+        signal and survives compression well.
+      * fieldmatch recovery - re-measuring the sample through fieldmatch. If the comb
+        largely disappears, the fields could be re-paired into whole frames, which is
+        only true of a pulldown cadence. Verified on clean telecine, where fieldmatch
+        takes the sample from ~100% combed to 0%; it degrades on very high-entropy
+        compressed sources where lossy coding has broken field correspondence, which
+        is why the repeated-field signal stands alongside it rather than behind it.
+
+    Detection never raises: any failure returns 'unknown', because a file whose scan
+    type can't be determined should pass through untouched rather than be guessed at."""
+    duration = video_info.get("duration")
+    start = 0.0
+    if isinstance(duration, (int, float)) and duration and duration > 0:
+        start = max(0.0, float(duration) * IDET_SAMPLE_POSITION)
+
+    counts = _run_idet(src, start, None)
+    if counts is None and start > 0:
+        # The seek may have landed past the last keyframe on a short or oddly indexed
+        # file; retry from the beginning before giving up.
+        counts = _run_idet(src, 0.0, None)
+    if counts is None:
+        return ("unknown", "idet analysis failed")
+
+    total = counts["total"]
+    if total < IDET_MIN_SAMPLE_FRAMES:
+        return ("unknown", f"only {total} frame(s) sampled, too few to classify")
+
+    interlaced_ratio = counts["interlaced"] / total
+    if interlaced_ratio < IDET_INTERLACED_THRESHOLD:
+        return ("progressive",
+                f"{interlaced_ratio:.0%} of {total} sampled frames show comb, below the "
+                f"{IDET_INTERLACED_THRESHOLD:.0%} threshold")
+
+    frame_rate = video_info.get("frame_rate")
+    if isinstance(frame_rate, (int, float)) and any(
+            abs(frame_rate - rate) <= PROGRESSIVE_FRAME_RATE_TOLERANCE
+            for rate in PROGRESSIVE_FRAME_RATES):
+        # See PROGRESSIVE_FRAME_RATES: film rate rules out interlaced video, so this
+        # is idet reacting to sharp detail rather than real comb.
+        return ("progressive",
+                f"{interlaced_ratio:.0%} of {total} sampled frames show comb, but the "
+                f"source is {frame_rate:.3f}fps film rate, which no interlaced format "
+                f"uses - treating as progressive")
+
+    is_ntsc_rate = isinstance(frame_rate, (int, float)) and any(
+        abs(frame_rate - rate) <= NTSC_FRAME_RATE_TOLERANCE for rate in NTSC_FRAME_RATES)
+    if not is_ntsc_rate:
+        rate_str = f"{frame_rate:.3f}fps" if isinstance(frame_rate, (int, float)) else "unknown rate"
+        return ("interlaced",
+                f"{interlaced_ratio:.0%} of {total} sampled frames show comb at "
+                f"{rate_str}; 3:2 pulldown only occurs at NTSC rates, so treating as "
+                f"true interlace")
+
+    repeat_ratio = counts["repeated"] / total
+    if repeat_ratio >= IDET_REPEAT_FIELD_THRESHOLD:
+        return ("telecine",
+                f"{interlaced_ratio:.0%} of {total} sampled frames show comb and "
+                f"{repeat_ratio:.0%} carry a repeated field - 3:2 pulldown")
+
+    matched = _run_idet(src, start, "fieldmatch=order=auto:combmatch=full")
+    if matched is None or matched["total"] < IDET_MIN_SAMPLE_FRAMES:
+        return ("interlaced",
+                f"{interlaced_ratio:.0%} of {total} sampled frames show comb, only "
+                f"{repeat_ratio:.0%} repeated fields, and the fieldmatch test was "
+                f"inconclusive - treating as true interlace")
+
+    matched_ratio = matched["interlaced"] / matched["total"]
+    if matched_ratio <= interlaced_ratio * (1 - IDET_FIELDMATCH_RECOVERY):
+        return ("telecine",
+                f"{interlaced_ratio:.0%} of {total} sampled frames show comb, but field "
+                f"matching brings that down to {matched_ratio:.0%} - 3:2 pulldown")
+    return ("interlaced",
+            f"{interlaced_ratio:.0%} of {total} sampled frames show comb, only "
+            f"{repeat_ratio:.0%} repeated fields, and field matching only reaches "
+            f"{matched_ratio:.0%} - genuine interlace")
+
+
+def container_interlace_hint(video_info: dict[str, Any]) -> str | None:
+    """A zero-cost advisory check for interlacing, returning a short reason string when
+    the container's own metadata says the video is interlaced, or None otherwise.
+
+    Unlike detect_field_mode this decodes NOTHING — it only reads the field_order and
+    frame rate that probe_media already collected, so it's free to run on every file.
+    That also makes it far weaker evidence: field_order is frequently absent, and on a
+    re-muxed file it can be stale (a previous conversion may have left an interlaced
+    tag on video that is now progressive, or vice versa). So this is only ever used to
+    print a 'worth checking' hint when --deinterlace is off; it never selects a filter
+    or changes the encode. A missing tag produces no hint rather than a guess, to keep
+    the signal-to-noise ratio worth reading in a long batch log."""
+    field_order = video_info.get("field_order")
+    if not isinstance(field_order, str):
+        return None
+    if field_order.lower() in ("progressive", "unknown"):
+        return None
+
+    frame_rate = video_info.get("frame_rate")
+    rate_part = (f" at {frame_rate:.3f}fps" if isinstance(frame_rate, (int, float))
+                 else "")
+    return f"container reports field order '{field_order}'{rate_part}"
+
+
+def resolve_deinterlace_filter(src: Path, video_info: dict[str, Any], mode: str
+                                ) -> tuple[str | None, str]:
+    """Map the --deinterlace setting to an actual filter string for this file,
+    returning (filter_or_None, log_note). 'auto' runs detection; 'deinterlace' and
+    'detelecine' force the corresponding filter without detection (an escape hatch for
+    files the detector calls wrong); 'off' disables the feature entirely."""
+    if mode == "off":
+        return (None, "off")
+    if mode == "deinterlace":
+        return (DEINTERLACE_FILTER, "forced deinterlace (detection skipped)")
+    if mode == "detelecine":
+        return (DETELECINE_FILTER, "forced inverse telecine (detection skipped)")
+
+    detected, reason = detect_field_mode(src, video_info)
+    if detected == "telecine":
+        return (DETELECINE_FILTER, f"auto -> inverse telecine ({reason})")
+    if detected == "interlaced":
+        return (DEINTERLACE_FILTER, f"auto -> deinterlace ({reason})")
+    if detected == "unknown":
+        return (None, f"auto -> leaving video untouched ({reason})")
+    return (None, f"auto -> progressive, no filtering ({reason})")
+
+
 def measure_loudness(src: Path, duration: float, loudnorm_target: float,
                       audio_stream_index: int) -> dict[str, Any]:
     """Runs loudnorm's analysis pass (decode + filter, no output file written) against
@@ -857,7 +1185,9 @@ def diagnose_encode_one(src: Path, dst: Path, preset: str | None, read_seconds: 
             src, dst, args.crf, args.duration, args.min_size_mb,
             args.dry_run, args.encoding,
             args.normalize_audio, args.loudnorm_target, args.downscale,
-            args.strip_no_english_audio, preset)
+            args.strip_no_english_audio, preset,
+            deinterlace=args.deinterlace,
+            strip_non_english_subs=args.strip_no_english_subs)
     except ConversionError as e:
         logging.error(f"CONVERSION FAILED (preset {preset}): {e.file.resolve()}\n{e.reason}")
         return None
@@ -865,7 +1195,8 @@ def diagnose_encode_one(src: Path, dst: Path, preset: str | None, read_seconds: 
 
     if result is None:
         return None
-    orig_size, new_size, video_duration, action, downscaled, grew_larger, retried = result
+    (orig_size, new_size, video_duration, action, downscaled, grew_larger,
+     retried, interlace_hinted) = result
     if action != "encoded" or retried:
         # Copied (already HEVC / below min size) or retried (timing polluted by the
         # failed attempt) — not a clean encode-speed sample.
@@ -927,7 +1258,8 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
                       subtitle_stream_indices: list[int] | None = None,
                       video_stream_index: int = 0,
                       measured_loudness: dict[str, Any] | None = None,
-                      preset: str | None = None) -> list[str]:
+                      preset: str | None = None,
+                      deinterlace_filter: str | None = None) -> list[str]:
     cmd: list[str] = ["ffmpeg", "-y", "-i", str(src)]
 
     if duration != -1:
@@ -947,12 +1279,22 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
     for idx in subtitle_stream_indices:
         cmd += ["-map", f"0:s:{idx}"]
 
+    # Video filters are one -vf chain, applied in order. Deinterlacing/inverse
+    # telecine must come FIRST: both work on field structure, which only survives at
+    # the source resolution — scaling first blends the two fields' scanlines together
+    # and destroys the very comb pattern the filters need to see.
+    video_filters: list[str] = []
+    if deinterlace_filter:
+        video_filters.append(deinterlace_filter)
     if needs_downscale:
         # Scale down so neither dimension exceeds 1080p, preserving aspect ratio.
         # force_original_aspect_ratio=decrease only shrinks, never upscales.
         # force_divisible_by=2 rounds the calculated dimension to an even number,
         # since x265/x264 require even width & height for 4:2:0 chroma subsampling.
-        cmd += ["-vf", "scale=1920:1080:force_original_aspect_ratio=decrease:force_divisible_by=2"]
+        video_filters.append(
+            "scale=1920:1080:force_original_aspect_ratio=decrease:force_divisible_by=2")
+    if video_filters:
+        cmd += ["-vf", ",".join(video_filters)]
 
     if encoding == "hardware":
         # Intel Quick Sync HEVC encoder. QSV uses -global_quality as its CRF-equivalent
@@ -1021,7 +1363,9 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                   normalize_audio: bool = True, loudnorm_target: float = -16,
                   downscale: bool = False, strip_non_english_audio: bool = False,
                   preset: str | None = None,
-                  processed_bytes_so_far: int = 0) -> ProcessResult | None:
+                  processed_bytes_so_far: int = 0,
+                  deinterlace: str = "off",
+                  strip_non_english_subs: bool = False) -> ProcessResult | None:
     """Returns (original_size, new_size, video_duration_seconds, action, downscaled,
     grew_larger, retried) on success or dry-run preview, or None only when the caller
     already decided to skip the file entirely before calling this (not used internally
@@ -1052,7 +1396,14 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     prior files in this batch) the caller reports alongside the pre-encode ENCODING/
     WOULD ENCODE log line, so someone tailing the log file can see cumulative progress
     without cross-referencing the console output. It defaults to 0 for callers (e.g.
-    diagnose_encode_one's preset sweep) that don't track a meaningful running total."""
+    diagnose_encode_one's preset sweep) that don't track a meaningful running total.
+
+    deinterlace selects the scan-type handling ('off', 'auto', 'deinterlace',
+    'detelecine'); see resolve_deinterlace_filter. Files that are copied rather than
+    encoded never run detection, since their video isn't touched.
+
+    strip_non_english_subs mirrors strip_non_english_audio for subtitle tracks; when
+    False (the default) every subtitle track is carried through."""
     min_size_bytes = min_size_mb * 1024 * 1024
     src_stat = src.stat()
     src_size = src_stat.st_size
@@ -1078,12 +1429,12 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         if dry_run:
             logging.info(f"[DRY RUN] WOULD COPY (below {min_size_mb}MB minimum, "
                          f"{human_size(src_size)}): {src} -> {dst}")
-            return (src_size, src_size, small_file_duration, "copied", False, False, False)
+            return (src_size, src_size, small_file_duration, "copied", False, False, False, False)
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
         logging.info(f"COPIED (below {min_size_mb}MB minimum, "
                      f"{human_size(src_size)}): {src} -> {dst}")
-        return (src_size, src_size, small_file_duration, "copied", False, False, False)
+        return (src_size, src_size, small_file_duration, "copied", False, False, False, False)
 
     media = probe_media(src, timeout_seconds)
     video_info = media["video"]
@@ -1095,11 +1446,11 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     if codec == "hevc":
         if dry_run:
             logging.info(f"[DRY RUN] WOULD COPY (already H.265): {src} -> {dst}")
-            return (src_size, src_size, video_duration, "copied", False, False, False)
+            return (src_size, src_size, video_duration, "copied", False, False, False, False)
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
         logging.info(f"COPIED (already H.265): {src} -> {dst}")
-        return (src_size, src_size, video_duration, "copied", False, False, False)
+        return (src_size, src_size, video_duration, "copied", False, False, False, False)
 
     needs_downscale = downscale and (width > 1920 or height > 1080)
 
@@ -1142,22 +1493,78 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     else:
         keep_audio_indices = []
 
-    # Subtitle/CC tracks: always carry through every English-tagged track; drop the
-    # rest (including untagged, since it can't be confirmed English).
-    keep_subtitle_indices = [i for i, (lang, codec) in enumerate(subtitle_tracks)
-                              if lang in ("eng", "en")]
+    # Subtitle/CC tracks, mirroring the audio policy above. Off by default: every
+    # track is carried through, because a subtitle stream costs almost nothing next to
+    # the video and dropping one is irreversible.
+    #
+    # When stripping IS enabled, two deliberate differences from a naive
+    # English-only filter, both chosen to fail toward keeping a track:
+    #   * Untagged tracks are KEPT. Language tags are missing far more often on
+    #     subtitles than on audio, and an untagged track on an English disc is usually
+    #     either English or a forced/foreign-dialogue track that the film needs.
+    #   * If the primary audio track isn't English, every subtitle is kept — the same
+    #     safety net the audio path uses. On a foreign-language film the subtitles are
+    #     the translation, so stripping by language is exactly backwards there.
+    primary_audio_lang = audio_languages[0] if audio_languages else None
+    primary_audio_is_english = primary_audio_lang in ("eng", "en")
+    if not strip_non_english_subs:
+        keep_subtitle_indices = list(range(len(subtitle_tracks)))
+        sub_reason = "strip-no-english-subs is off; keeping all track(s)"
+    elif not primary_audio_is_english:
+        keep_subtitle_indices = list(range(len(subtitle_tracks)))
+        sub_reason = (f"main audio track is not English "
+                      f"(tagged '{primary_audio_lang}')" if primary_audio_lang
+                      else "main audio track is untagged/unknown language")
+        sub_reason += "; keeping all subtitle track(s) as likely translations"
+    else:
+        keep_subtitle_indices = [i for i, (lang, codec) in enumerate(subtitle_tracks)
+                                  if lang in ("eng", "en") or lang is None]
+        sub_reason = "main audio track is English; keeping English and untagged track(s)"
+        if subtitle_tracks and not keep_subtitle_indices:
+            # Stripping would leave the file with no subtitles at all. Prefer keeping
+            # everything over silently shipping a subtitle-less archive copy.
+            keep_subtitle_indices = list(range(len(subtitle_tracks)))
+            sub_reason = ("no English or untagged subtitle track found; keeping all "
+                          "rather than dropping every track")
+
     if subtitle_tracks:
         kept_str = (", ".join(f"{i}:{subtitle_tracks[i][0] or 'und'}" for i in keep_subtitle_indices)
                     if keep_subtitle_indices else "none")
         dropped = [i for i in range(len(subtitle_tracks)) if i not in keep_subtitle_indices]
         dropped_str = (", ".join(f"{i}:{subtitle_tracks[i][0] or 'und'}" for i in dropped)
                        if dropped else "none")
-        logging.info(f"SUBTITLE: keeping English track(s) [{kept_str}]; "
+        logging.info(f"SUBTITLE: {sub_reason}; keeping [{kept_str}]; "
                      f"discarding [{dropped_str}]: {src}")
 
+    # Scan-type handling. Detection decodes a sample, so it only runs for files that
+    # are actually being re-encoded — by this point the copy-through cases (already
+    # HEVC, below the size threshold) have already returned.
+    deinterlace_filter, deinterlace_note = resolve_deinterlace_filter(
+        src, video_info, deinterlace)
+    if deinterlace != "off":
+        logging.info(f"SCAN TYPE: {deinterlace_note}: {src}")
+
+    # With filtering off nothing has decoded a sample, so fall back to saying something
+    # on the cheap evidence rather than staying silent — encoding interlaced video to
+    # HEVC bakes the comb in permanently. The run summary counts these so a
+    # library-wide pattern is visible without grepping the log.
+    interlace_hint: str | None = None
+    if deinterlace == "off":
+        interlace_hint = container_interlace_hint(video_info)
+        if interlace_hint:
+            logging.warning(
+                f"POSSIBLE INTERLACING ({interlace_hint}) but --deinterlace is off, so "
+                f"the video is being encoded as-is. Metadata alone is weak evidence; "
+                f"re-run this file with --deinterlace auto to check the picture "
+                f"itself: {src}")
+
     log_action = "[DRY RUN] WOULD ENCODE" if dry_run else "ENCODING"
+    scan_part = ""
+    if deinterlace_filter:
+        scan_part = (", scan=inverse-telecine" if deinterlace_filter == DETELECINE_FILTER
+                     else ", scan=deinterlace")
     logging.info(f"{log_action}: {src} -> {dst} (codec={codec}, {width}x{height}, "
-                 f"downscale={'yes' if needs_downscale else 'no'}, crf={crf}, "
+                 f"downscale={'yes' if needs_downscale else 'no'}{scan_part}, crf={crf}, "
                  f"encoding={encoding}, "
                  f"normalize_audio={'yes (' + str(loudnorm_target) + ' LUFS)' if normalize_audio else 'no'}, "
                  f"duration={'full' if duration == -1 else f'{duration}s'}, "
@@ -1170,7 +1577,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
                                 normalize_audio, loudnorm_target, keep_audio_indices,
                                 keep_subtitle_indices, video_info["stream_index"],
-                                preset=preset)
+                                preset=preset, deinterlace_filter=deinterlace_filter)
         logging.info(f"[DRY RUN] Command: {format_cmd_for_log(cmd)}")
         if normalize_audio and keep_audio_indices:
             logging.info(f"[DRY RUN] Note: audio will be normalized in two passes "
@@ -1181,7 +1588,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         # reduction" summary is never printed in dry-run mode, only the
         # Encoded/Copied/Failed breakdown and --limit accounting, which need orig_size
         # and action/downscaled, not a real new_size.
-        return (src_size, src_size, video_duration, "encoded", needs_downscale, False, False)
+        return (src_size, src_size, video_duration, "encoded", needs_downscale, False, False,
+                bool(interlace_hint))
 
     # Output is always a separate path from the source, so ffmpeg can write straight to
     # dst — no temp-file-and-swap dance (which only existed to avoid reading and writing
@@ -1203,7 +1611,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
                             normalize_audio, loudnorm_target, keep_audio_indices,
                             keep_subtitle_indices, video_info["stream_index"],
-                            measured_loudness, preset=preset)
+                            measured_loudness, preset=preset,
+                            deinterlace_filter=deinterlace_filter)
     cmd = add_progress_flags(cmd)
     logging.info(f"Command: {format_cmd_for_log(cmd)}")
     max_attempts = HARDWARE_ENCODE_MAX_ATTEMPTS if encoding == "hardware" else 1
@@ -1280,7 +1689,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         logging.warning(f"DISCARDED (encode grew {human_size(src_size)} -> "
                         f"{human_size(candidate_size)}, +{growth_pct:.1f}%); "
                         f"copied original instead: {src} -> {dst}")
-        return (src_size, src_size, video_duration, "copied", False, True, False)
+        return (src_size, src_size, video_duration, "copied", False, True, False,
+                bool(interlace_hint))
 
     # Preserve the source file's modification/access time on the newly encoded output.
     os.utime(dst, (src_stat.st_atime, src_stat.st_mtime))
@@ -1311,12 +1721,13 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                  f"({human_size(orig_size)} -> {human_size(new_size)}, {saved_pct:.1f}% smaller"
                  f"{speed_str})")
     return (orig_size, new_size, video_duration, "encoded", needs_downscale, grew_larger,
-             attempt > 1)
+             attempt > 1, bool(interlace_hint))
 
 
 def run_crf_comparison(src: Path, output_folder: Path, crf_values: list[int], duration: float,
                         encoding: str, downscale: bool,
-                        preset: str | None = None) -> tuple[int, list[CrfRow]]:
+                        preset: str | None = None,
+                        deinterlace: str = "off") -> tuple[int, list[CrfRow]]:
     """Comparison mode for a single source file: test-encodes src once per CRF value in
     crf_values, all other settings held fixed (audio normalization off, all audio/
     subtitle tracks kept), and prints/logs a size + encode-time table so the effect
@@ -1389,6 +1800,14 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list[int], du
     keep_audio_indices = list(range(len(media["audio_languages"])))
     keep_subtitle_indices = list(range(len(media["subtitle_tracks"])))
 
+    # Detection runs once, not once per CRF: the scan type is a property of the source,
+    # and every variant in the table must share it or the sizes aren't comparable.
+    deinterlace_filter, deinterlace_note = resolve_deinterlace_filter(
+        src, video_info, deinterlace)
+    if deinterlace != "off":
+        logging.info(f"SCAN TYPE: {deinterlace_note}: {src}")
+        print(f"  Scan type: {deinterlace_note}")
+
     rows: list[CrfRow] = []  # (crf, size_bytes_or_None, elapsed_seconds, error_or_None, skipped)
     for crf in crf_values:
         dst = output_folder / f"{src.stem}_crf{crf}_{encoding}{src.suffix}"
@@ -1401,7 +1820,8 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list[int], du
 
         cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
                                 False, -16, keep_audio_indices, keep_subtitle_indices,
-                                video_info["stream_index"], None, preset=preset)
+                                video_info["stream_index"], None, preset=preset,
+                                deinterlace_filter=deinterlace_filter)
         cmd = add_progress_flags(cmd)
         logging.info(f"Command: {format_cmd_for_log(cmd)}")
 
@@ -1651,7 +2071,8 @@ def main() -> None:
             try:
                 src_size, rows = run_crf_comparison(src, args.output_folder, crf_values,
                                                      args.duration, args.encoding,
-                                                     args.downscale, args.preset)
+                                                     args.downscale, args.preset,
+                                                     args.deinterlace)
             except ConversionError as e:
                 # As in the main batch loop, a timeout is logged distinctly but skips
                 # the file rather than ending the run.
@@ -1697,7 +2118,9 @@ def main() -> None:
                  f"Min size: {args.min_size_mb}MB "
                  f"Data limit: {'none' if args.limit == -1 else f'{args.limit}GB'} "
                  f"Downscale to 1080p: {'yes' if args.downscale else 'no'} "
-                 f"Strip non-English audio: {'yes' if args.strip_no_english_audio else 'no'}")
+                 f"Strip non-English audio: {'yes' if args.strip_no_english_audio else 'no'} "
+                 f"Strip non-English subtitles: {'yes' if args.strip_no_english_subs else 'no'} "
+                 f"Deinterlace: {args.deinterlace}")
 
     if args.include is not None or args.exclude is not None:
         logging.info(f"Filters active — include: {args.include!r}, "
@@ -1717,6 +2140,9 @@ def main() -> None:
     downscaled_count = 0
     grew_larger_count = 0
     retried_count = 0
+    # Files encoded with --deinterlace off whose container metadata claimed interlaced
+    # video. Advisory only — see container_interlace_hint.
+    interlace_hinted_count = 0
     deleted_source_count = 0
     deleted_source_bytes = 0
     # Counts failures back-to-back, reset by any file that succeeds. Drives the
@@ -1860,7 +2286,8 @@ def main() -> None:
                                    args.dry_run, args.encoding,
                                    args.normalize_audio, args.loudnorm_target, args.downscale,
                                    args.strip_no_english_audio, args.preset,
-                                   processed_bytes)
+                                   processed_bytes, args.deinterlace,
+                                   args.strip_no_english_subs)
         except ConversionError as e:
             # Timeouts are called out separately in the log (they point at a stuck
             # process rather than a bad encode) but are handled identically: skip the
@@ -1889,7 +2316,8 @@ def main() -> None:
         consecutive_failures = 0  # this file got through; the run is healthy again
 
         if result is not None:
-            orig_size, new_size, video_duration, action, downscaled, grew_larger, retried = result
+            (orig_size, new_size, video_duration, action, downscaled, grew_larger,
+     retried, interlace_hinted) = result
             total_orig += orig_size
             total_new += new_size
             if video_duration is not None:
@@ -1904,6 +2332,8 @@ def main() -> None:
                 grew_larger_count += 1
             if retried:
                 retried_count += 1
+            if interlace_hinted:
+                interlace_hinted_count += 1
 
             if args.delete_source:
                 if args.dry_run:
@@ -1978,6 +2408,15 @@ def main() -> None:
     retried_line = f"Needed a retry after a transient encode failure: {retried_count} file(s)"
     logging.info(retried_line)
     print(retried_line)
+
+    # Only printed when there's something to report: on a progressive library this
+    # would otherwise be a permanent "0 file(s)" line that trains the eye to skip it.
+    if interlace_hinted_count:
+        interlace_line = (f"Possibly interlaced (encoded as-is, --deinterlace was off): "
+                          f"{interlace_hinted_count} file(s) — see POSSIBLE INTERLACING "
+                          f"in the log, and re-check them with --deinterlace auto")
+        logging.info(interlace_line)
+        print(f"{COLOR_WARNING}{interlace_line}{COLOR_RESET}")
 
     if args.delete_source:
         if args.dry_run:
