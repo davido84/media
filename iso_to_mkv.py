@@ -200,6 +200,21 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
 7. Safety/workflow additions on top of the above:
      - Source ISOs are NEVER deleted or modified: the input tree is only
        ever read. Everything this script writes goes under --output.
+     - makemkvcon read cache: --cache-mb (default 1024, matching MakeMKV's
+       own Blu-ray recommendation) sets the --cache size handed to
+       makemkvcon. This script used to hardcode --cache=1 - a ONE megabyte
+       cache, three orders of magnitude under the recommended value and
+       almost certainly a misreading of the option as a boolean. That
+       survived on makemkvcon 1.18.4 but crashes 2.0.0 outright with an
+       access violation on some discs, and it also forced needless seeking
+       when reading ISOs from spinning disks. Pass --cache-mb 0 to omit
+       the option entirely.
+     - A makemkvcon crash is reported as such: Windows signals a crashed
+       process through an unhandled-exception exit code (e.g. 3221225477 =
+       0xC0000005, an access violation) rather than a small error code, so
+       those are decoded by name in the log instead of appearing as an
+       opaque number, with a hint to check the MakeMKV version and cache
+       size.
      - After each title, the script verifies a real (non-tiny) .mkv file
        actually appeared/changed in the output directory - a 0-exit-code
        from makemkvcon is treated as necessary but not sufficient. See
@@ -514,6 +529,18 @@ MIN_OUTPUT_FILE_BYTES: int = 1_000_000  # 1 MB
 # for why a count alone can't tell "same titles, already done" apart from "a
 # different run left a coincidentally-equal number of files here".
 MANIFEST_FILENAME: str = ".iso_to_mkv_manifest.json"
+
+# Read-cache size (MB) handed to makemkvcon via --cache. MakeMKV's own usage
+# notes recommend ~128 MB for streaming/backup, 512 MB for DVD and 1024 MB for
+# Blu-ray conversion, so this matches its Blu-ray recommendation. This script
+# previously hardcoded --cache=1, i.e. a ONE megabyte cache - three orders of
+# magnitude below the recommendation, and almost certainly a misreading of the
+# option as a boolean "caching on" flag rather than a size in megabytes. That
+# worked by luck on makemkvcon 1.18.4 but crashes 2.0.0 with an access
+# violation (exit code 0xC0000005) on some discs, and a 1 MB read cache also
+# forces far more seeking than necessary when reading ISOs off spinning disks.
+# Override with --cache-mb; 0 omits the option and uses makemkvcon's default.
+MAKEMKV_CACHE_MB_DEFAULT: int = 1024
 
 # Tolerance (seconds) for comparing a stored source-ISO mtime against a
 # freshly stat'd one during the resume check. Exact float equality is too
@@ -1114,7 +1141,7 @@ def format_cmd_for_log(cmd: list[str]) -> str:
     ("iso:C:\\...\\x.iso"), because cmd.exe strips the quotes and hands
     makemkvcon the intact single argument it expects.
 
-    Switches and other non-path arguments (-r, --cache=1, mkv, the title
+    Switches and other non-path arguments (-r, --cache=N, mkv, the title
     number) are left bare so the line still reads naturally. Windows paths
     can't contain a double quote, so no escaping is needed inside them.
 
@@ -1131,6 +1158,118 @@ def format_cmd_for_log(cmd: list[str]) -> str:
         )
         parts.append(f'"{arg}"' if looks_like_path and not arg.startswith('"') else arg)
     return " ".join(parts)
+
+
+# Windows reports a crashed process via an unhandled-exception status as the
+# exit code. These are the ones worth naming when makemkvcon dies, so a crash
+# is never reported as just an opaque number (see describe_exit_code).
+_WINDOWS_CRASH_CODES: dict[int, str] = {
+    0xC0000005: "access violation",
+    0xC0000374: "heap corruption",
+    0xC000001D: "illegal instruction",
+    0xC00000FD: "stack overflow",
+    0xC0000409: "stack buffer overrun",
+    0xC000041D: "unhandled exception in a callback",
+    0xC0000017: "out of memory",
+}
+
+
+def describe_exit_code(rc: int) -> str:
+    """Render a process exit code, naming it when it's a Windows crash status.
+
+    Windows reports a crashed process through its exit code: an unhandled
+    exception status like 0xC0000005 rather than a small integer the program
+    chose to return. Those arrive here as large positive numbers (e.g.
+    3221225477) or, via Python's signed handling, as large negatives, and are
+    meaningless at a glance. Naming them distinguishes "makemkvcon hit a bug
+    and died" from "makemkvcon ran and reported a failure", which point at
+    very different fixes."""
+    status = rc & 0xFFFFFFFF
+    name = _WINDOWS_CRASH_CODES.get(status)
+    if name is None:
+        return f"exit code {rc}"
+    return (
+        f"exit code {rc} = 0x{status:08X}, a Windows {name} crash - makemkvcon "
+        f"itself crashed rather than reporting an error"
+    )
+
+
+# makemkvcon prints a version banner as its first robot-mode message, e.g.
+#   MSG:1005,0,1,"MakeMKV v2.0.0 win(x64-release) started",...
+# Because it comes first, it survives in the captured output even when
+# makemkvcon later crashes - which is exactly when knowing the version matters.
+MAKEMKV_VERSION_RE: re.Pattern[str] = re.compile(r"MakeMKV\s+v([0-9][0-9.]*)")
+
+# Versions observed to crash rather than run. 2.0.0 crashes with an access
+# violation on Blu-ray ISOs (DVD ISOs appear unaffected); 1.18.4 handles the
+# same discs fine. Keyed by version string prefix.
+KNOWN_BAD_VERSIONS: dict[str, str] = {
+    "2.0.0": (
+        "MakeMKV 2.0.0 crashes on Blu-ray ISOs (DVD ISOs appear unaffected). "
+        "Version 1.18.4 handles the same discs correctly - downgrading is the known workaround."
+    ),
+}
+
+CRASH_HINT: str = "That points at a makemkvcon bug rather than a bad disc."
+
+
+def parse_makemkv_version(output: str) -> str | None:
+    """Extract the MakeMKV version from makemkvcon's startup banner, or None.
+
+    The banner is the first thing makemkvcon emits, so this still works on
+    output from a run that crashed moments later."""
+    match = MAKEMKV_VERSION_RE.search(output or "")
+    return match.group(1) if match else None
+
+
+def known_bad_version_note(version: str | None) -> str | None:
+    """Return the advisory for a MakeMKV version known to crash, else None."""
+    if not version:
+        return None
+    for bad, note in KNOWN_BAD_VERSIONS.items():
+        if version == bad or version.startswith(bad + "."):
+            return note
+    return None
+
+
+def crash_advice(rc: int, output: str) -> str:
+    """The extra explanation to append when makemkvcon died on us: name the
+    crash, and - when the captured output identifies a version known to be
+    broken - say so outright instead of leaving it to be rediscovered."""
+    if not is_crash_exit_code(rc):
+        return ""
+    version = parse_makemkv_version(output)
+    parts = [CRASH_HINT]
+    if version:
+        parts.append(f"Detected MakeMKV version: {version}.")
+    note = known_bad_version_note(version)
+    if note:
+        parts.append(note)
+    else:
+        parts.append(
+            "Check which MakeMKV version is installed - a working version is the usual fix."
+        )
+    return " " + " ".join(parts)
+
+
+def is_crash_exit_code(rc: int) -> bool:
+    """True when an exit code is a Windows unhandled-exception status, i.e. the
+    process crashed rather than choosing to exit with an error."""
+    return (rc & 0xFFFFFFFF) in _WINDOWS_CRASH_CODES
+
+
+def makemkvcon_cmd(args: argparse.Namespace, *tail: str) -> list[str]:
+    """Build a makemkvcon64.exe command line with the run's shared options.
+
+    Centralizes the executable, robot mode (-r) and the read-cache size so the
+    info scan and the per-title extraction can't drift apart. --cache is
+    omitted entirely when --cache-mb is 0, letting makemkvcon pick its own
+    default (see MAKEMKV_CACHE_MB_DEFAULT for why the size matters)."""
+    cmd = ["makemkvcon64.exe", "-r"]
+    if args.cache_mb and args.cache_mb > 0:
+        cmd.append(f"--cache={args.cache_mb}")
+    cmd.extend(tail)
+    return cmd
 
 
 def run_cmd(cmd: list[str]) -> tuple[int, str]:
@@ -1327,7 +1466,7 @@ class Title:
 
 
 def get_disc_titles(
-    iso_path: Path, logger: "DualLogger"
+    iso_path: Path, logger: "DualLogger", args: argparse.Namespace
 ) -> tuple[int, str, dict[int, Title], bool, bool]:
     """Run `makemkvcon info` on the ISO and parse the title table.
 
@@ -1339,7 +1478,7 @@ def get_disc_titles(
     could not find a JRE to use - a much stronger signal than jre_engaged
     simply being False, which is also true for every disc that never
     needed Java at all."""
-    cmd: list[str] = ["makemkvcon64.exe", "-r", "--cache=1", "info", f"iso:{iso_path}"]
+    cmd: list[str] = makemkvcon_cmd(args, "info", f"iso:{iso_path}")
     logger.file_only("CMD", format_cmd_for_log(cmd), iso_path)
     rc, output = run_cmd(cmd)
     titles: dict[int, Title] = {}
@@ -1814,9 +1953,13 @@ def process_iso(
         "INFO", f"Classified as {disc_type} ({human_bytes(iso_path.stat().st_size)})", iso_path
     )
 
-    rc, output, titles, jre_engaged, jre_required_missing = get_disc_titles(iso_path, logger)
+    rc, output, titles, jre_engaged, jre_required_missing = get_disc_titles(iso_path, logger, args)
     if rc != 0 or not titles:
-        logger.error(f"Failed to read title information (exit code {rc})", iso_path)
+        logger.error(
+            f"Failed to read title information ({describe_exit_code(rc)})"
+            f"{crash_advice(rc, output)}",
+            iso_path,
+        )
         logger.append_raw_to_file(output)
         stats.conversions_error += 1
         return ProcessResult(
@@ -2204,7 +2347,7 @@ def process_iso(
         # filtering (makemkvcon has no CLI mechanism for it at all, and a
         # prior mkvmerge-based workaround was deliberately removed in
         # favor of leaving track curation to a later encoding pass).
-        cmd = ["makemkvcon64.exe", "-r", "--cache=1", "mkv", f"iso:{iso_path}", str(tid), str(out_dir)]
+        cmd = makemkvcon_cmd(args, "mkv", f"iso:{iso_path}", str(tid), str(out_dir))
 
         if args.dry_run:
             logger.info(f"[DRY RUN] Would run: {format_cmd_for_log(cmd)}", iso_path)
@@ -2264,7 +2407,11 @@ def process_iso(
             break
 
         if rc != 0:
-            logger.error(f"makemkvcon failed for title {tid} (exit code {rc})", iso_path)
+            logger.error(
+                f"makemkvcon failed for title {tid} ({describe_exit_code(rc)})"
+                f"{crash_advice(rc, mkv_output)}",
+                iso_path,
+            )
             logger.append_raw_to_file(mkv_output)
             stats.conversions_error += 1
             all_ok = False
@@ -2621,6 +2768,16 @@ def parse_args() -> argparse.Namespace:
         "-f", "--force", action="store_true",
         help="Redo an ISO even if its output folder already looks fully converted "
              "(default: skip it)",
+    )
+    p.add_argument(
+        "--cache-mb", type=int, default=MAKEMKV_CACHE_MB_DEFAULT, metavar="MB",
+        help="Read-cache size (megabytes) passed to makemkvcon as --cache. MakeMKV's own "
+             "documentation recommends ~128 for streaming/backup, 512 for DVD and 1024 for "
+             f"Blu-ray, so the default is {MAKEMKV_CACHE_MB_DEFAULT}. This script previously "
+             "hardcoded --cache=1 (a 1 MB cache), which is far below every recommended value; "
+             "makemkvcon 2.0.0 crashes outright (access violation) on some discs with a cache "
+             "that small, and a tiny cache also forces far more seeking on spinning disks. "
+             "Set 0 to omit --cache entirely and let makemkvcon use its own default",
     )
     p.add_argument(
         "--free-space-margin-pct", type=float, default=10.0, metavar="PCT",
