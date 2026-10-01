@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -770,36 +771,48 @@ def run_ffmpeg_with_watchdog(cmd: list[str],
     stalled = False
     stdout_closed = False
 
-    while True:
-        if stdout_closed:
-            # ffmpeg has closed stdout; it's finishing up. Wait for exit, still
-            # watching CPU so a wedge during final teardown is caught too.
-            if proc.poll() is not None:
+    # If anything interrupts the wait — Ctrl-C above all — the ffmpeg child must die
+    # with us. subprocess.run does this automatically, but a raw Popen doesn't, and an
+    # orphaned ffmpeg would keep running after the script exits, still writing (and
+    # holding open) a partial output file.
+    try:
+        while True:
+            if stdout_closed:
+                # ffmpeg has closed stdout; it's finishing up. Wait for exit, still
+                # watching CPU so a wedge during final teardown is caught too.
+                if proc.poll() is not None:
+                    break
+            now = time.monotonic()
+            if now - last_life >= stall_seconds:
+                stalled = True
+                proc.kill()
                 break
-        now = time.monotonic()
-        if now - last_life >= stall_seconds:
-            stalled = True
-            proc.kill()
-            break
 
+            try:
+                beat = heartbeats.get(timeout=ENCODE_STALL_POLL_SECONDS)
+                if beat is None:
+                    stdout_closed = True
+                else:
+                    last_life = beat
+                    last_cpu = _process_cpu_seconds(proc)
+                    continue
+            except queue.Empty:
+                pass
+
+            # No heartbeat this interval — fall back to the CPU signal.
+            cpu_now = _process_cpu_seconds(proc)
+            if cpu_now is not None and last_cpu is not None and \
+                    cpu_now - last_cpu >= ENCODE_STALL_MIN_CPU_DELTA:
+                last_life = time.monotonic()
+            if cpu_now is not None:
+                last_cpu = cpu_now
+    except BaseException:
         try:
-            beat = heartbeats.get(timeout=ENCODE_STALL_POLL_SECONDS)
-            if beat is None:
-                stdout_closed = True
-            else:
-                last_life = beat
-                last_cpu = _process_cpu_seconds(proc)
-                continue
-        except queue.Empty:
+            proc.kill()
+            proc.wait(timeout=10)
+        except Exception:
             pass
-
-        # No heartbeat this interval — fall back to the CPU signal.
-        cpu_now = _process_cpu_seconds(proc)
-        if cpu_now is not None and last_cpu is not None and \
-                cpu_now - last_cpu >= ENCODE_STALL_MIN_CPU_DELTA:
-            last_life = time.monotonic()
-        if cpu_now is not None:
-            last_cpu = cpu_now
+        raise
 
     returncode = proc.wait()
     t_out.join(timeout=5)
@@ -1072,7 +1085,7 @@ def measure_loudness(src: Path, duration: float, loudnorm_target: float,
         "-f", "null", "-",
     ]
     cmd = add_progress_flags(cmd)
-    logging.info(f"Command: {format_cmd_for_log(cmd)}")
+    log_ffmpeg_command(cmd)
     result = run_ffmpeg_with_watchdog(cmd)
     if result.stalled:
         raise ConversionError(src, f"loudness measurement pass stalled: no progress and "
@@ -1262,6 +1275,20 @@ def diagnose_tagged_dst(src: Path, input_base: Path, output_folder: Path,
     effective_preset = preset or (DEFAULT_QSV_PRESET if encoding == "hardware"
                                   else DEFAULT_X265_PRESET)
     return dst.with_name(f"{dst.stem}_{effective_preset}_crf{crf}{dst.suffix}")
+
+
+# Whether to write each ffmpeg command line to the log. On for normal batch runs, where
+# the exact command is the record of how each archived file was produced; switched off
+# by main() for --compare-crf and --diagnose, which are throwaway test runs where the
+# commands are just noise around the comparison tables.
+_LOG_FFMPEG_COMMANDS: bool = True
+
+
+def log_ffmpeg_command(cmd: list[str], prefix: str = "") -> None:
+    """Log an ffmpeg command line, unless command logging is switched off for this run
+    (see _LOG_FFMPEG_COMMANDS)."""
+    if _LOG_FFMPEG_COMMANDS:
+        logging.info(f"{prefix}Command: {format_cmd_for_log(cmd)}")
 
 
 def format_cmd_for_log(cmd: list[str]) -> str:
@@ -1570,7 +1597,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                                 normalize_audio, loudnorm_target, keep_audio_indices,
                                 video_info["stream_index"],
                                 preset=preset, deinterlace_filter=deinterlace_filter)
-        logging.info(f"[DRY RUN] Command: {format_cmd_for_log(cmd)}")
+        log_ffmpeg_command(cmd, "[DRY RUN] ")
         if normalize_audio and keep_audio_indices:
             logging.info(f"[DRY RUN] Note: audio will be normalized in two passes "
                          f"(a measurement pass, then the exact-gain encode shown above "
@@ -1606,7 +1633,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                             measured_loudness, preset=preset,
                             deinterlace_filter=deinterlace_filter)
     cmd = add_progress_flags(cmd)
-    logging.info(f"Command: {format_cmd_for_log(cmd)}")
+    log_ffmpeg_command(cmd)
     max_attempts = HARDWARE_ENCODE_MAX_ATTEMPTS if encoding == "hardware" else 1
     for attempt in range(1, max_attempts + 1):
         result = run_ffmpeg_with_watchdog(cmd)
@@ -1772,7 +1799,7 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list[int], du
                 copy_cmd = add_progress_flags(
                     ["ffmpeg", "-y", "-i", str(src), "-t", str(duration),
                      "-c", "copy", str(original_dst)])
-                logging.info(f"Command: {format_cmd_for_log(copy_cmd)}")
+                log_ffmpeg_command(copy_cmd)
                 copy_result = run_ffmpeg_with_watchdog(copy_cmd)
                 if copy_result.stalled:
                     raise RuntimeError(f"ffmpeg stalled (no progress and no CPU activity "
@@ -1814,7 +1841,7 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list[int], du
                                 video_info["stream_index"], None, preset=preset,
                                 deinterlace_filter=deinterlace_filter)
         cmd = add_progress_flags(cmd)
-        logging.info(f"Command: {format_cmd_for_log(cmd)}")
+        log_ffmpeg_command(cmd)
 
         result = run_ffmpeg_with_watchdog(cmd)
         elapsed = result.elapsed
@@ -1902,7 +1929,71 @@ def print_crf_aggregate_summary(aggregate: dict[int, dict[str, float]],
         logging.info(note)
 
 
+# Set once logging is configured, so the end-of-script banner knows whether there's a
+# log file to write to and how long the run took. Argument errors exit before logging
+# is set up (the output folder may not even be valid yet), so those runs log nothing.
+_SCRIPT_START_MONOTONIC: float | None = None
+
+# Set by main() when a run ends early but still returns normally (--limit reached,
+# or the consecutive-failure circuit breaker), so the end banner doesn't report a
+# cut-short run as a plain 'completed'.
+_SCRIPT_STOP_NOTE: str | None = None
+
+LOG_BANNER_RULE: str = "=" * 78
+
+
+def _ffmpeg_version_line() -> str:
+    """First line of `ffmpeg -version`, for the start banner, or a placeholder if it
+    can't be read. Recording it makes a months-long archive log self-describing: if
+    output quality or behaviour ever shifts, the log shows which build produced it."""
+    try:
+        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True,
+                                timeout=30)
+        first = result.stdout.splitlines()[0] if result.stdout else ""
+        return first.strip() or "unknown"
+    except (OSError, subprocess.TimeoutExpired, IndexError):
+        return "unavailable"
+
+
+def log_script_start() -> None:
+    """Write the start-of-run banner to the log file. The log is opened in append mode,
+    so successive runs accumulate in one file; the ruled banner makes each run's
+    boundary easy to find when scrolling or searching. INFO level, so it goes to the
+    log file only, never the console."""
+    global _SCRIPT_START_MONOTONIC
+    _SCRIPT_START_MONOTONIC = time.monotonic()
+    logging.info(LOG_BANNER_RULE)
+    logging.info(f"SCRIPT STARTED at {time.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+                 f"(pid {os.getpid()})")
+    logging.info(f"Command line: {subprocess.list2cmdline(sys.argv)}")
+    logging.info(f"Python {sys.version.split()[0]}; {_ffmpeg_version_line()}")
+    logging.info(LOG_BANNER_RULE)
+
+
+def log_script_end(status: str, crash_details: str | None = None) -> None:
+    """Write the end-of-run banner to the log file, whatever way the script ended:
+    normal completion, an explicit exit, Ctrl-C, or an unhandled crash (in which case
+    the traceback is written too, so the log alone is enough to diagnose it). A no-op
+    when logging was never set up. Never raises — it runs on the way out of an
+    exception, and must not replace the original error with a new one."""
+    if _SCRIPT_START_MONOTONIC is None:
+        return
+    try:
+        runtime = time.monotonic() - _SCRIPT_START_MONOTONIC
+        if crash_details:
+            logging.info(f"Unhandled exception:\n{crash_details.rstrip()}")
+        logging.info(LOG_BANNER_RULE)
+        logging.info(f"SCRIPT FINISHED at {time.strftime('%Y-%m-%d %H:%M:%S %Z')}: "
+                     f"{status}; ran for "
+                     f"{human_duration(runtime, include_seconds=True)}")
+        logging.info(LOG_BANNER_RULE)
+        logging.shutdown()  # flush the file handler before the process exits
+    except Exception:
+        pass
+
+
 def main() -> None:
+    global _SCRIPT_STOP_NOTE, _LOG_FFMPEG_COMMANDS
     args = parse_args()
 
     video_extensions: tuple[str, ...] = ("*.mp4", "*.MP4", "*.mkv", "*.MKV")
@@ -2025,6 +2116,14 @@ def main() -> None:
     # the same output folder produce separate logs rather than interleaving in one.
     log_suffix = f"_{args.encoding}" if crf_values is not None else ""
     log_path = setup_logging(args.output_folder, log_suffix)
+    log_script_start()
+
+    # Test modes don't need a per-file command trail; the comparison tables are the
+    # output that matters there.
+    if crf_values is not None or args.diagnose:
+        _LOG_FFMPEG_COMMANDS = False
+        logging.info("ffmpeg command logging is off for this run "
+                     f"({'--compare-crf' if crf_values is not None else '--diagnose'}).")
 
     if crf_values is not None:
         compare_start = time.monotonic()
@@ -2164,6 +2263,7 @@ def main() -> None:
         # what --limit is meant to cap.
         if total_orig + src_size > limit_bytes:
             limit_reached = True
+            _SCRIPT_STOP_NOTE = f"stopped early at the --limit of {args.limit}GB"
             verb = "would be processed" if args.dry_run else "processed"
             logging.info(f"Data limit of {args.limit}GB reached: next file "
                          f"({human_size(src_size)}) would exceed it "
@@ -2276,6 +2376,8 @@ def main() -> None:
             processed_bytes += src_size
             consecutive_failures += 1
             if consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
+                _SCRIPT_STOP_NOTE = (f"ABORTED after {consecutive_failures} consecutive "
+                                     f"failures")
                 logging.error(f"Stopping: {consecutive_failures} file(s) in a row failed, "
                               f"which points at a systemic problem (source drive offline, "
                               f"ffmpeg missing) rather than individual bad files. "
@@ -2317,10 +2419,17 @@ def main() -> None:
                     sub_bytes, sub_tracks = subtitle_measurement
                     subtitle_bytes_total += sub_bytes
                     subtitle_tracks_total += sub_tracks
-                    pct = f"{sub_bytes / new_size * 100:.2f}%" if new_size else "--"
-                    logging.info(f"SUBTITLE SIZE: {human_size(sub_bytes)} across "
-                                 f"{sub_tracks} track(s), {pct} of the "
-                                 f"{human_size(new_size)} output: {dst}")
+                    if sub_tracks == 0:
+                        # Stated plainly rather than as "0.0B across 0 track(s)". This
+                        # line also covers copied files (already HEVC / below the size
+                        # threshold), which never reach process_file's
+                        # "SUBTITLE TRACKS FOUND" check.
+                        logging.info(f"SUBTITLE SIZE: no subtitle tracks in output: {dst}")
+                    else:
+                        pct = f"{sub_bytes / new_size * 100:.2f}%" if new_size else "--"
+                        logging.info(f"SUBTITLE SIZE: {human_size(sub_bytes)} across "
+                                     f"{sub_tracks} track(s), {pct} of the "
+                                     f"{human_size(new_size)} output: {dst}")
 
     if skipped_existing:
         logging.info(f"{skipped_existing} file(s) skipped because the output file already existed.")
@@ -2510,4 +2619,26 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # The end banner is written from here rather than from main() so it covers every
+    # way out: normal return, sys.exit (the CRF-comparison path exits explicitly),
+    # Ctrl-C, and crashes. Each exception is re-raised unchanged afterwards, so exit
+    # codes and console behaviour are exactly what they would be without this wrapper.
+    try:
+        main()
+    except SystemExit as exc:
+        code = exc.code
+        if code is None or code == 0:
+            log_script_end(_SCRIPT_STOP_NOTE or "completed")
+        else:
+            log_script_end(f"exited with code {code}")
+        raise
+    except KeyboardInterrupt:
+        log_script_end("INTERRUPTED by user (Ctrl-C) - the file in progress was not "
+                       "finished")
+        raise
+    except BaseException as exc:
+        log_script_end(f"CRASHED ({type(exc).__name__}: {exc})",
+                       traceback.format_exc())
+        raise
+    else:
+        log_script_end(_SCRIPT_STOP_NOTE or "completed")
