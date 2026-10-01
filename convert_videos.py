@@ -10,10 +10,9 @@ If -i/-o are omitted they default to the current folder, but the input and outpu
 folders must be different and neither may be nested inside the other, so at least one
 of -i/-o must be given explicitly.
 
-Unless --delete-source is given, the script never modifies anything in the input path:
-it only reads source files and writes to the output folder (including its log). This
-means it runs fine on a read-only input path. --delete-source is the sole exception —
-it removes each source file after that file has been successfully written to output.
+The script never modifies anything in the input path: it only reads source files
+and writes to the output folder (including its log). Source files are always
+preserved, so it runs fine on a read-only input path.
 
 Requires: ffmpeg and ffprobe available on PATH.
 """
@@ -421,13 +420,6 @@ def build_parser() -> argparse.ArgumentParser:
                               "track is tagged as a different language, or has no "
                               "language tag at all, all audio tracks are kept regardless. "
                               "Default: off (all audio tracks are kept)")
-    parser.add_argument("--delete-source", action="store_true",
-                         help="Delete the source file once it has been successfully "
-                              "copied or encoded to the output folder (files skipped "
-                              "due to --limit or an existing output file are left "
-                              "alone, as is anything that fails). Has no effect combined "
-                              "with --dry-run or --compare-crf. Always prompts for "
-                              "confirmation before the run starts. Default: off")
     parser.add_argument("--deinterlace", choices=["off", "auto", "deinterlace", "detelecine"],
                          default="off",
                          help="How to handle interlaced sources (mainly DVD rips; Blu-ray "
@@ -452,7 +444,7 @@ def build_parser() -> argparse.ArgumentParser:
                               "match). E.g. with -i d:/media, --include=ABC processes "
                               "d:/media/ABCdef/title.mkv but not d:/media/zABC/title.mkv. "
                               "Case-insensitive. Files that don't match are skipped "
-                              "entirely (never copied, encoded, or deleted). Default: "
+                              "entirely (never copied or encoded). Default: "
                               "process everything")
     parser.add_argument("--exclude", type=str, default=None, metavar="REGEX",
                          help="Skip files whose path, taken relative to the input "
@@ -2029,22 +2021,6 @@ def main() -> None:
               f"outside the input tree.", file=sys.stderr)
         sys.exit(1)
 
-    # Dry runs never actually delete anything (they only log a preview), so the
-    # confirmation prompt would just be noise there.
-    if args.delete_source and not args.dry_run:
-        if not sys.stdin.isatty():
-            print("Error: --delete-source needs confirmation, but stdin isn't a "
-                  "terminal (e.g. running under cron), so the prompt can't be "
-                  "answered. Run interactively instead.", file=sys.stderr)
-            sys.exit(1)
-        print(f"--delete-source is set: source files under {input_resolved} will be "
-              f"permanently deleted, one at a time, right after each is successfully "
-              f"copied or encoded to {output_resolved}.")
-        reply = input("Type 'yes' to continue: ").strip().lower()
-        if reply != "yes":
-            print("Aborted: confirmation not given.", file=sys.stderr)
-            sys.exit(1)
-
     # Comparison runs get an encoder-tagged log, so a hardware and a software run over
     # the same output folder produce separate logs rather than interleaving in one.
     log_suffix = f"_{args.encoding}" if crf_values is not None else ""
@@ -2144,8 +2120,6 @@ def main() -> None:
     # Informational subtitle accounting, reported to the log file only.
     subtitle_bytes_total = 0
     subtitle_tracks_total = 0
-    deleted_source_count = 0
-    deleted_source_bytes = 0
     # Counts failures back-to-back, reset by any file that succeeds. Drives the
     # circuit breaker that distinguishes a run of bad files from a systemic fault.
     consecutive_failures = 0
@@ -2348,45 +2322,6 @@ def main() -> None:
                                  f"{sub_tracks} track(s), {pct} of the "
                                  f"{human_size(new_size)} output: {dst}")
 
-            if args.delete_source:
-                if args.dry_run:
-                    deleted_source_count += 1
-                    deleted_source_bytes += orig_size
-                    logging.info(f"[DRY RUN] WOULD DELETE SOURCE (after successful "
-                                 f"{action}): {src}")
-                else:
-                    # One more direct check right here, independent of process_file's
-                    # own validation, immediately before the irreversible step: confirm
-                    # the output this deletion is predicated on is actually sitting on
-                    # disk with real content. Catches a race (something removing/
-                    # truncating dst between process_file returning and here) or a
-                    # future bug upstream that returns success without a good file.
-                    try:
-                        dst_size = dst.stat().st_size
-                    except OSError:
-                        dst_size = 0
-                    if dst_size == 0:
-                        logging.warning(f"Refusing to delete source: output at {dst} "
-                                         f"is missing or empty, despite a reported "
-                                         f"successful {action}: {src}")
-                        continue
-                    try:
-                        # Guarantee: this is the ONLY operation in the script that
-                        # modifies anything in the input path, and it must never run
-                        # without --delete-source. Asserting it here keeps that promise
-                        # self-enforcing against future edits — without --delete-source
-                        # the input tree is untouched and the script runs fine on a
-                        # read-only input.
-                        assert args.delete_source, "source deletion requires --delete-source"
-                        src.unlink()
-                        deleted_source_count += 1
-                        deleted_source_bytes += orig_size
-                        logging.info(f"DELETED SOURCE (after successful {action}): {src}")
-                    except OSError as e:
-                        logging.warning(f"Could not delete source file after successful "
-                                         f"{action} (output at {dst} is unaffected): "
-                                         f"{src}: {e}")
-
     if skipped_existing:
         logging.info(f"{skipped_existing} file(s) skipped because the output file already existed.")
 
@@ -2430,16 +2365,6 @@ def main() -> None:
                           f"in the log, and re-check them with --deinterlace auto")
         logging.info(interlace_line)
         print(f"{COLOR_WARNING}{interlace_line}{COLOR_RESET}")
-
-    if args.delete_source:
-        if args.dry_run:
-            deleted_line = (f"Source files that would be deleted: {deleted_source_count} "
-                            f"file(s), {human_size(deleted_source_bytes)} would be freed")
-        else:
-            deleted_line = (f"Source files deleted: {deleted_source_count} file(s), "
-                            f"{human_size(deleted_source_bytes)} freed")
-        logging.info(deleted_line)
-        print(deleted_line)
 
     if args.diagnose and diag_sweep and diag_read_seconds > 0:
         any_encoded = any(s["files"] > 0 for s in preset_stats.values())
