@@ -221,6 +221,21 @@ DEINTERLACE_FILTER: str = "bwdif=mode=send_frame:parity=auto:deint=all"
 # any successful file.
 CONSECUTIVE_FAILURE_LIMIT: int = 10
 
+# --- Audio ----------------------------------------------------------------------
+# Every kept audio track is re-encoded to stereo in one of these codecs. AAC is the
+# default for compatibility: it plays essentially everywhere (smart-TV built-in
+# players, streaming boxes, phones, browsers) and in both MKV and MP4, whereas Opus is
+# missing from many TV players and from Roku's MP4 support entirely. Opus is the more
+# efficient codec, so AAC gets a higher bitrate to land at roughly comparable quality;
+# the extra 32 kbps costs ~29 MB over a two-hour film. Note that standard ffmpeg builds
+# use ffmpeg's own 'aac' encoder (the better libfdk_aac is excluded for licensing
+# reasons), which is solid at 160 kbps but weaker at low bitrates — so don't lower it.
+AUDIO_CODEC_SETTINGS: dict[str, tuple[str, str]] = {
+    "aac": ("aac", "160k"),       # (ffmpeg encoder, bitrate)
+    "opus": ("libopus", "128k"),
+}
+DEFAULT_AUDIO_CODEC: str = "aac"
+
 # Cap on each informational subtitle-size probe. This statistic is a nicety, so a
 # pathological file must not hold up the batch: on timeout the figure is simply
 # omitted for that file and the conversion is unaffected.
@@ -421,6 +436,16 @@ def build_parser() -> argparse.ArgumentParser:
                               "track is tagged as a different language, or has no "
                               "language tag at all, all audio tracks are kept regardless. "
                               "Default: off (all audio tracks are kept)")
+    parser.add_argument("--audio-codec", choices=sorted(AUDIO_CODEC_SETTINGS),
+                         default=DEFAULT_AUDIO_CODEC,
+                         help="Codec for re-encoded audio (always stereo). 'aac' (160 "
+                              "kbps) plays on essentially every TV, streaming box and "
+                              "phone, in both MKV and MP4. 'opus' (128 kbps) is more "
+                              "efficient but unsupported by many TV players, and Roku "
+                              "can't play it in MP4 files. The size difference is ~29 MB "
+                              "per two hours of video. Files copied through unchanged "
+                              "(already HEVC, or below --min-size-mb) keep their original "
+                              f"audio. Default: {DEFAULT_AUDIO_CODEC}")
     parser.add_argument("--deinterlace", choices=["off", "auto", "deinterlace", "detelecine"],
                          default="off",
                          help="How to handle interlaced sources (mainly DVD rips; Blu-ray "
@@ -1232,7 +1257,7 @@ def diagnose_encode_one(src: Path, dst: Path, preset: str | None, read_seconds: 
             args.dry_run, args.encoding,
             args.normalize_audio, args.loudnorm_target, args.downscale,
             args.strip_no_english_audio, preset,
-            deinterlace=args.deinterlace)
+            deinterlace=args.deinterlace, audio_codec=args.audio_codec)
     except ConversionError as e:
         logging.error(f"CONVERSION FAILED (preset {preset}): {e.file.resolve()}\n{e.reason}")
         return None
@@ -1317,7 +1342,8 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
                       video_stream_index: int = 0,
                       measured_loudness: dict[str, Any] | None = None,
                       preset: str | None = None,
-                      deinterlace_filter: str | None = None) -> list[str]:
+                      deinterlace_filter: str | None = None,
+                      audio_codec: str = DEFAULT_AUDIO_CODEC) -> list[str]:
     cmd: list[str] = ["ffmpeg", "-y", "-i", str(src)]
 
     if duration != -1:
@@ -1366,8 +1392,9 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
         # global_quality:v (not the unscoped -global_quality) matters here: without a
         # stream specifier, ffmpeg's per-file option resolution applies the implied
         # "quality/CRF mode" flag to every output stream, not just the video one. QSV
-        # handles that fine, but libopus doesn't support quality-scale mode at all and
-        # refuses to open, aborting the whole encode with no output written.
+        # handles that fine, but audio encoders don't: libopus refuses quality-scale
+        # mode outright (aborting the whole encode with no output written), and the
+        # aac encoder would silently switch from the fixed bitrate below to VBR.
         cmd += ["-pix_fmt", "p010le", "-c:v", "hevc_qsv", "-global_quality:v", str(crf),
                 "-preset", preset or DEFAULT_QSV_PRESET, "-low_power", "0",
                 "-look_ahead", "1", "-look_ahead_depth", "40"]
@@ -1379,15 +1406,23 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
         cmd += ["-pix_fmt", "yuv420p10le", "-c:v", "libx265", "-preset", preset or DEFAULT_X265_PRESET,
                 "-crf", str(crf)]
 
-    cmd += ["-c:a", "libopus", "-ac", "2", "-b:a", "128k"]
+    audio_encoder, audio_bitrate = AUDIO_CODEC_SETTINGS[audio_codec]
+    cmd += ["-c:a", audio_encoder, "-ac", "2", "-b:a", audio_bitrate]
 
     if normalize_audio:
         # Scoped to output audio stream 0 (-filter:a:0) rather than the unscoped -af,
         # which would apply this exact filter description — including the fixed
         # measured_* gain values below, which are only valid for the primary track —
         # identically to every kept audio stream. Only the primary/first mapped
-        # audio track is normalized; any other kept tracks are still re-encoded to
-        # Opus above, just without a loudness filter applied.
+        # audio track is normalized; any other kept tracks are still re-encoded with
+        # the codec above, just without a loudness filter applied.
+        #
+        # loudnorm works internally at 192 kHz and outputs at that rate. libopus only
+        # encodes at 48 kHz so it resamples back down by itself, but the aac encoder
+        # accepts high rates and lands on 96 kHz (verified), wasting bitrate on
+        # inaudible frequencies and risking playback trouble on some devices. Pinning
+        # the normalized track to 48 kHz fixes that for both codecs.
+        cmd += ["-ar:a:0", "48000"]
         if measured_loudness:
             # Two-pass EBU R128: feed the analysis pass's exact measured stats back
             # in with linear=true, which applies a single fixed gain rather than
@@ -1424,7 +1459,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                   downscale: bool = False, strip_non_english_audio: bool = False,
                   preset: str | None = None,
                   processed_bytes_so_far: int = 0,
-                  deinterlace: str = "off") -> ProcessResult | None:
+                  deinterlace: str = "off",
+                  audio_codec: str = DEFAULT_AUDIO_CODEC) -> ProcessResult | None:
     """Returns (original_size, new_size, video_duration_seconds, action, downscaled,
     grew_larger, retried) on success or dry-run preview, or None only when the caller
     already decided to skip the file entirely before calling this (not used internally
@@ -1585,6 +1621,7 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     logging.info(f"{log_action}: {src} -> {dst} (codec={codec}, {width}x{height}, "
                  f"downscale={'yes' if needs_downscale else 'no'}{scan_part}, crf={crf}, "
                  f"encoding={encoding}, "
+                 f"audio={audio_codec} {AUDIO_CODEC_SETTINGS[audio_codec][1]}, "
                  f"normalize_audio={'yes (' + str(loudnorm_target) + ' LUFS)' if normalize_audio else 'no'}, "
                  f"duration={'full' if duration == -1 else f'{duration}s'}, "
                  f"converted so far: {human_size(processed_bytes_so_far)})")
@@ -1596,7 +1633,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
         cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
                                 normalize_audio, loudnorm_target, keep_audio_indices,
                                 video_info["stream_index"],
-                                preset=preset, deinterlace_filter=deinterlace_filter)
+                                preset=preset, deinterlace_filter=deinterlace_filter,
+                                audio_codec=audio_codec)
         log_ffmpeg_command(cmd, "[DRY RUN] ")
         if normalize_audio and keep_audio_indices:
             logging.info(f"[DRY RUN] Note: audio will be normalized in two passes "
@@ -1631,7 +1669,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                             normalize_audio, loudnorm_target, keep_audio_indices,
                             video_info["stream_index"],
                             measured_loudness, preset=preset,
-                            deinterlace_filter=deinterlace_filter)
+                            deinterlace_filter=deinterlace_filter,
+                            audio_codec=audio_codec)
     cmd = add_progress_flags(cmd)
     log_ffmpeg_command(cmd)
     max_attempts = HARDWARE_ENCODE_MAX_ATTEMPTS if encoding == "hardware" else 1
@@ -1746,7 +1785,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
 def run_crf_comparison(src: Path, output_folder: Path, crf_values: list[int], duration: float,
                         encoding: str, downscale: bool,
                         preset: str | None = None,
-                        deinterlace: str = "off") -> tuple[int, list[CrfRow]]:
+                        deinterlace: str = "off",
+                        audio_codec: str = DEFAULT_AUDIO_CODEC) -> tuple[int, list[CrfRow]]:
     """Comparison mode for a single source file: test-encodes src once per CRF value in
     crf_values, all other settings held fixed (audio normalization off, all audio/
     subtitle tracks kept), and prints/logs a size + encode-time table so the effect
@@ -1839,7 +1879,8 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list[int], du
         cmd = build_ffmpeg_cmd(src, dst, crf, duration, needs_downscale, encoding,
                                 False, -16, keep_audio_indices,
                                 video_info["stream_index"], None, preset=preset,
-                                deinterlace_filter=deinterlace_filter)
+                                deinterlace_filter=deinterlace_filter,
+                                audio_codec=audio_codec)
         cmd = add_progress_flags(cmd)
         log_ffmpeg_command(cmd)
 
@@ -2146,7 +2187,7 @@ def main() -> None:
                 src_size, rows = run_crf_comparison(src, args.output_folder, crf_values,
                                                      args.duration, args.encoding,
                                                      args.downscale, args.preset,
-                                                     args.deinterlace)
+                                                     args.deinterlace, args.audio_codec)
             except ConversionError as e:
                 # As in the main batch loop, a timeout is logged distinctly but skips
                 # the file rather than ending the run.
@@ -2193,7 +2234,8 @@ def main() -> None:
                  f"Data limit: {'none' if args.limit == -1 else f'{args.limit}GB'} "
                  f"Downscale to 1080p: {'yes' if args.downscale else 'no'} "
                  f"Strip non-English audio: {'yes' if args.strip_no_english_audio else 'no'} "
-                 f"Deinterlace: {args.deinterlace}")
+                 f"Deinterlace: {args.deinterlace} "
+                 f"Audio: {args.audio_codec} {AUDIO_CODEC_SETTINGS[args.audio_codec][1]} stereo")
 
     if args.include is not None or args.exclude is not None:
         logging.info(f"Filters active — include: {args.include!r}, "
@@ -2361,7 +2403,7 @@ def main() -> None:
                                    args.dry_run, args.encoding,
                                    args.normalize_audio, args.loudnorm_target, args.downscale,
                                    args.strip_no_english_audio, args.preset,
-                                   processed_bytes, args.deinterlace)
+                                   processed_bytes, args.deinterlace, args.audio_codec)
         except ConversionError as e:
             # Timeouts are called out separately in the log (they point at a stuck
             # process rather than a bad encode) but are handled identically: skip the
