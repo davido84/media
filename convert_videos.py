@@ -364,6 +364,17 @@ def build_parser() -> argparse.ArgumentParser:
                               "both fall back to the current folder.")
     parser.add_argument("-q", "--crf", type=int, default=22,
                          help="x265 CRF value (lower = higher quality/larger file). Default: 22")
+    parser.add_argument("--source", choices=["all", "dvd", "bd"], default="all",
+                         help="Which sources to process: 'dvd' only DVD rips, 'bd' only "
+                              "Blu-ray rips, 'all' everything. Judged from each file's "
+                              f"frame size: at most {DVD_MAX_WIDTH}x{DVD_MAX_HEIGHT} counts "
+                              "as DVD, anything larger as Blu-ray. Lets you run each group "
+                              "with its own settings over one mixed folder, e.g. "
+                              "'--source dvd --deinterlace auto --encoding software' and "
+                              "then '--source bd'. Files outside the chosen group are "
+                              "skipped entirely and left out of the totals, ETA and "
+                              "--limit. 'dvd' and 'bd' read each file's metadata once at "
+                              "startup to sort them. Default: all (nothing is read)")
     parser.add_argument("-t", "--duration", type=float, default=-1,
                          help="Encode only the first N seconds of each file. "
                               "Default: -1 (encode the full file)")
@@ -1239,6 +1250,46 @@ def build_preset_comparison_table(preset_stats: PresetStats,
         lines.append(f"{preset:<10} {enc_mbps:>9.1f} {gb_day:>8.0f} {rt_str:>9} "
                      f"{pct_smaller:>7.0f}% {ratio:>5.2f}x {proj:>16}")
     return lines
+
+
+# A source counts as DVD-sourced if its frame fits within standard-definition limits:
+# 720x480 (NTSC) and 720x576 (PAL), with headroom for rips stored at square-pixel sizes
+# such as 854x480 or 1024x576. Anything larger is treated as Blu-ray. Both limits must
+# hold: a scope film cropped to 1280x536 is under 576 lines tall but is unmistakably HD.
+DVD_MAX_WIDTH: int = 1024
+DVD_MAX_HEIGHT: int = 576
+
+
+# Per-run cache of classify_source results, so no file is probed twice for the same
+# answer.
+_SOURCE_CACHE: dict[Path, tuple[str, int, int] | None] = {}
+
+
+def classify_source(src: Path) -> tuple[str, int, int] | None:
+    """Classify src as 'dvd' or 'bd' from its frame size, returning (type, width,
+    height), or None if the file can't be probed. A file counts as DVD when its frame
+    fits within DVD_MAX_WIDTH x DVD_MAX_HEIGHT; anything larger is Blu-ray. Resolution
+    is the only reliable signal here: a ripped file carries no marker of the disc it
+    came from, and codec doesn't settle it (MPEG-2 appears on both). Cached per file."""
+    if src in _SOURCE_CACHE:
+        return _SOURCE_CACHE[src]
+    result: tuple[str, int, int] | None
+    try:
+        video = probe_media(src, compute_timeout_seconds(src.stat().st_size))["video"]
+        width, height = video.get("width") or 0, video.get("height") or 0
+        if not (width and height):
+            result = None
+        elif width <= DVD_MAX_WIDTH and height <= DVD_MAX_HEIGHT:
+            result = ("dvd", width, height)
+        else:
+            result = ("bd", width, height)
+    except (ConversionError, OSError):
+        result = None
+    _SOURCE_CACHE[src] = result
+    return result
+
+
+SOURCE_LABELS: dict[str, str] = {"dvd": "DVD", "bd": "Blu-ray"}
 
 
 def diagnose_encode_one(src: Path, dst: Path, preset: str | None, read_seconds: float,
@@ -2166,6 +2217,43 @@ def main() -> None:
         logging.info("ffmpeg command logging is off for this run "
                      f"({'--compare-crf' if crf_values is not None else '--diagnose'}).")
 
+    # --source filtering. Runs at startup rather than per file so the file count, total
+    # size, ETA and --limit all describe only the chosen group. Done after logging is
+    # set up so unreadable files are recorded in the log.
+    if args.source != "all":
+        wanted = SOURCE_LABELS[args.source]
+        print(f"Sorting {len(mp4_files)} file(s) by resolution to select {wanted} "
+              f"sources...")
+        kept: list[Path] = []
+        other_count = 0
+        unreadable: list[Path] = []
+        for src in mp4_files:
+            classified = classify_source(src)
+            if classified is None:
+                unreadable.append(src)
+            elif classified[0] == args.source:
+                kept.append(src)
+            else:
+                other_count += 1
+        other_label = SOURCE_LABELS["bd" if args.source == "dvd" else "dvd"]
+        summary = (f"Source filter --source {args.source}: {len(kept)} {wanted} file(s) "
+                   f"selected; {other_count} {other_label} file(s) skipped")
+        if unreadable:
+            summary += f"; {len(unreadable)} file(s) skipped as unreadable"
+        logging.info(summary)
+        print(summary)
+        for src in unreadable:
+            # Unreadable files fit neither group, so a dvd run and a bd run would both
+            # pass over them silently. Warn (log + console) so they don't go unnoticed.
+            logging.warning(f"Skipped by --source: could not read resolution, so this "
+                            f"file is neither DVD nor Blu-ray here. Run with --source all "
+                            f"to process it (and see the error): {src}")
+        if not kept:
+            logging.info(f"No {wanted} files to process; nothing to do.")
+            print(f"No {wanted} files found; nothing to do.", file=sys.stderr)
+            sys.exit(1)
+        mp4_files = kept
+
     if crf_values is not None:
         compare_start = time.monotonic()
         logging.info(f"CRF comparison mode: {len(mp4_files)} file(s) found in "
@@ -2234,6 +2322,7 @@ def main() -> None:
                  f"Data limit: {'none' if args.limit == -1 else f'{args.limit}GB'} "
                  f"Downscale to 1080p: {'yes' if args.downscale else 'no'} "
                  f"Strip non-English audio: {'yes' if args.strip_no_english_audio else 'no'} "
+                 f"Source: {args.source} "
                  f"Deinterlace: {args.deinterlace} "
                  f"Audio: {args.audio_codec} {AUDIO_CODEC_SETTINGS[args.audio_codec][1]} stereo")
 
