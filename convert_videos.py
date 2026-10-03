@@ -496,7 +496,7 @@ def build_parser() -> argparse.ArgumentParser:
                               "an aggregate table across files. Uses --duration for a quick "
                               "clip test if set, otherwise encodes full files. Requires "
                               "-o/--output different from -i/--input. Writes "
-                              "<name>_crf<value>_<hardware|software><ext> plus an unmodified "
+                              "<name>_crf<value>_<hardware|software>_<preset><ext> plus an unmodified "
                               "<name>_original<ext> for side-by-side comparison.")
     return parser
 
@@ -1865,7 +1865,13 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list[int], du
 
     clip_label = "full file" if duration == -1 else \
         f"{human_duration(duration, include_seconds=True)} test clip"
-    header = f"CRF comparison for: {src.name}  ({clip_label}, {encoding} encoding)"
+    # The effective preset (resolving "not given" to the encoder's default) goes into
+    # every output name, so comparisons run under different presets land side by side
+    # instead of colliding, or being skipped as "already exists".
+    effective_preset = preset or (DEFAULT_QSV_PRESET if encoding == "hardware"
+                                  else DEFAULT_X265_PRESET)
+    header = (f"CRF comparison for: {src.name}  ({clip_label}, {encoding} encoding, "
+              f"preset {effective_preset})")
     print(f"\n{header}")
     logging.info(header)
 
@@ -1919,7 +1925,7 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list[int], du
 
     rows: list[CrfRow] = []  # (crf, size_bytes_or_None, elapsed_seconds, error_or_None, skipped)
     for crf in crf_values:
-        dst = output_folder / f"{src.stem}_crf{crf}_{encoding}{src.suffix}"
+        dst = output_folder / f"{src.stem}_crf{crf}_{encoding}_{effective_preset}{src.suffix}"
 
         if dst.exists():
             print(f"  Skipping CRF {crf}: output already exists ({dst.name})")
