@@ -1458,7 +1458,17 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
                 "-crf", str(crf)]
 
     audio_encoder, audio_bitrate = AUDIO_CODEC_SETTINGS[audio_codec]
+    # -ac 2 downmixes every track to stereo, folding the center (dialogue) and surround
+    # channels into left/right.
     cmd += ["-c:a", audio_encoder, "-ac", "2", "-b:a", audio_bitrate]
+    if audio_codec == "opus":
+        # Make the downmix run in floating point. libopus also accepts 16-bit integer
+        # audio, and with a 16-bit surround source (e.g. Blu-ray LPCM) ffmpeg picks
+        # that, which scales the downmix down to avoid integer clipping: measured, a
+        # 7.1 source's center channel came out 10 dB quieter than with AAC (-34.0 vs
+        # -24.1 dB). Float has no clipping limit, so no scaling. Not needed for AAC,
+        # whose encoder only accepts float anyway (and would reject this flag).
+        cmd += ["-sample_fmt:a", "flt"]
 
     if normalize_audio:
         # Scoped to output audio stream 0 (-filter:a:0) rather than the unscoped -af,
