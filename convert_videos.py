@@ -384,10 +384,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-size-mb", type=float, default=50,
                          help="Files smaller than this size (in MB) are skipped and just "
                               "copied to the output folder as-is. Default: 50")
-    parser.add_argument("--encoding", choices=["hardware", "software"], default="hardware",
+    parser.add_argument("-E", "--encoding", choices=["hardware", "software"], default="hardware",
                          help="Encoding mode. 'software' uses libx265 (CPU). 'hardware' uses "
                               "Intel Quick Sync (hevc_qsv). Default: hardware")
-    parser.add_argument("--preset", type=str, default=None,
+    parser.add_argument("-p", "--preset", type=str, default=None,
                          help=f"Override the encoder's speed/quality preset. Valid values "
                               f"depend on --encoding: hardware (hevc_qsv) accepts "
                               f"{', '.join(QSV_PRESETS)}; software (libx265) accepts "
@@ -447,7 +447,7 @@ def build_parser() -> argparse.ArgumentParser:
                               "track is tagged as a different language, or has no "
                               "language tag at all, all audio tracks are kept regardless. "
                               "Default: off (all audio tracks are kept)")
-    parser.add_argument("--audio-codec", choices=sorted(AUDIO_CODEC_SETTINGS),
+    parser.add_argument("-a", "--audio-codec", choices=sorted(AUDIO_CODEC_SETTINGS),
                          default=DEFAULT_AUDIO_CODEC,
                          help="Codec for re-encoded audio (always stereo). 'aac' (160 "
                               "kbps) plays on essentially every TV, streaming box and "
@@ -457,7 +457,7 @@ def build_parser() -> argparse.ArgumentParser:
                               "per two hours of video. Files copied through unchanged "
                               "(already HEVC, or below --min-size-mb) keep their original "
                               f"audio. Default: {DEFAULT_AUDIO_CODEC}")
-    parser.add_argument("--deinterlace", choices=["off", "auto", "deinterlace", "detelecine"],
+    parser.add_argument("-D", "--deinterlace", choices=["off", "auto", "deinterlace", "detelecine"],
                          default="off",
                          help="How to handle interlaced sources (mainly DVD rips; Blu-ray "
                               "is almost always progressive). HEVC has no interlaced "
@@ -474,7 +474,7 @@ def build_parser() -> argparse.ArgumentParser:
                               "answer for. Detection adds a second or two per file and "
                               "only runs on files being re-encoded, never on copies. "
                               "Default: off (video passed through exactly as before)")
-    parser.add_argument("--include", type=str, default=None, metavar="REGEX",
+    parser.add_argument("-I", "--include", type=str, default=None, metavar="REGEX",
                          help="Only process files whose path, taken relative to the "
                               "input folder and written with forward slashes, matches "
                               "this regex at its start (like re.match, not a full "
@@ -483,7 +483,7 @@ def build_parser() -> argparse.ArgumentParser:
                               "Case-insensitive. Files that don't match are skipped "
                               "entirely (never copied or encoded). Default: "
                               "process everything")
-    parser.add_argument("--exclude", type=str, default=None, metavar="REGEX",
+    parser.add_argument("-X", "--exclude", type=str, default=None, metavar="REGEX",
                          help="Skip files whose path, taken relative to the input "
                               "folder and written with forward slashes, matches this "
                               "regex at its start (like re.match). Same anchoring and "
