@@ -568,6 +568,25 @@ def _parse_frame_rate(rate_str: str | None) -> float | None:
         return None
 
 
+def _audio_label(index: int, languages: list[str | None], media: dict[str, Any]) -> str:
+    """Log label for an audio track, e.g. '1:eng' or '2:und (commentary)'."""
+    label = f"{index}:{languages[index] or 'und'}"
+    if media.get("audio_commentary", [])[index:index + 1] == [True]:
+        label += " (commentary)"
+    return label
+
+
+def _is_commentary_track(stream: dict[str, Any]) -> bool:
+    """True if an ffprobe audio stream looks like a commentary track: either it carries
+    the container's commentary flag, or its title mentions commentary. Both are
+    checked because not every rip sets the flag, while a descriptive title such as
+    "Director's Commentary" is common."""
+    if stream.get("disposition", {}).get("comment"):
+        return True
+    title = stream.get("tags", {}).get("title") or ""
+    return "commentary" in title.lower()
+
+
 def probe_media(path: Path, timeout_seconds: float) -> dict[str, Any]:
     """Probe a media file with a single ffprobe call, returning:
       {
@@ -575,6 +594,7 @@ def probe_media(path: Path, timeout_seconds: float) -> dict[str, Any]:
                    "stream_index": int,   # index i in ffmpeg's 0:v:i, for explicit mapping
                    "frame_rate": float|None, "field_order": str|None},
         "audio_languages": [lang_or_None, ...],   # index i == ffmpeg's 0:a:i
+        "audio_commentary": [bool, ...],          # parallel to audio_languages
         "subtitle_tracks": [(lang_or_None, codec_name), ...],  # index i == 0:s:i
       }
     The video stream chosen is the first one that isn't embedded cover art (an
@@ -585,8 +605,13 @@ def probe_media(path: Path, timeout_seconds: float) -> dict[str, Any]:
     cmd: list[str] = [
         "ffprobe", "-v", "error",
         "-show_entries",
-        "stream=codec_name,codec_type,width,height,disposition,r_frame_rate,field_order:"
-        "stream_tags=language:format=duration",
+        # Disposition flags must be requested as their own stream_disposition section:
+        # listing "disposition" inside stream= is silently ignored by ffprobe, which
+        # previously left both the cover-art (attached_pic) and commentary checks
+        # without any flags to read.
+        "stream=codec_name,codec_type,width,height,r_frame_rate,field_order:"
+        "stream_disposition=attached_pic,comment:"
+        "stream_tags=language,title:format=duration",
         "-of", "json",
         str(path),
     ]
@@ -602,6 +627,7 @@ def probe_media(path: Path, timeout_seconds: float) -> dict[str, Any]:
     video_candidates: list[dict[str, Any]] = []  # every non-cover-art video stream seen, in order, with its 0:v:i index
     fallback_video_info: dict[str, Any] | None = None  # first video stream at all, in case every one looks like cover art
     audio_languages: list[str | None] = []
+    audio_commentary: list[bool] = []
     subtitle_tracks: list[tuple[str | None, str]] = []
     video_stream_count = 0
 
@@ -637,6 +663,7 @@ def probe_media(path: Path, timeout_seconds: float) -> dict[str, Any]:
                 video_candidates.append(info)
         elif codec_type == "audio":
             audio_languages.append(lang)
+            audio_commentary.append(_is_commentary_track(s))
         elif codec_type == "subtitle":
             subtitle_tracks.append((lang, s.get("codec_name", "unknown")))
 
@@ -659,6 +686,7 @@ def probe_media(path: Path, timeout_seconds: float) -> dict[str, Any]:
     return {
         "video": video_info,
         "audio_languages": audio_languages,
+        "audio_commentary": audio_commentary,
         "subtitle_tracks": subtitle_tracks,
     }
 
@@ -1612,7 +1640,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
 
     audio_languages = media["audio_languages"]
     if audio_languages:
-        track_list = ", ".join(f"{i}:{lang or 'und'}" for i, lang in enumerate(audio_languages))
+        track_list = ", ".join(_audio_label(i, audio_languages, media)
+                               for i in range(len(audio_languages)))
         logging.info(f"AUDIO TRACKS FOUND ({len(audio_languages)}): {track_list}: {src}")
     else:
         logging.info(f"AUDIO TRACKS FOUND: none: {src}")
@@ -1633,15 +1662,23 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
     elif audio_languages:
         primary_lang = audio_languages[0]
         if primary_lang in ("eng", "en"):
-            keep_audio_indices = [i for i, lang in enumerate(audio_languages) if lang in ("eng", "en")]
+            # English tracks are kept, and so are commentaries with no language tag:
+            # an untagged commentary on an English disc is almost always English, and
+            # dropping it is irreversible. Commentaries tagged with another language
+            # are still removed, like any other non-English track.
+            audio_commentary = media["audio_commentary"]
+            keep_audio_indices = [i for i, lang in enumerate(audio_languages)
+                                  if lang in ("eng", "en")
+                                  or (lang is None and audio_commentary[i])]
             if not keep_audio_indices:
                 keep_audio_indices = [0]  # safety net; shouldn't happen since primary is English
         else:
             keep_audio_indices = list(range(len(audio_languages)))
 
-        kept_str = ", ".join(f"{i}:{audio_languages[i] or 'und'}" for i in keep_audio_indices)
+        kept_str = ", ".join(_audio_label(i, audio_languages, media) for i in keep_audio_indices)
         dropped = [i for i in range(len(audio_languages)) if i not in keep_audio_indices]
-        dropped_str = ", ".join(f"{i}:{audio_languages[i] or 'und'}" for i in dropped) if dropped else "none"
+        dropped_str = (", ".join(_audio_label(i, audio_languages, media) for i in dropped)
+                       if dropped else "none")
         reason = (f"main track is English" if primary_lang in ("eng", "en")
                   else f"main track is not English (tagged '{primary_lang}')" if primary_lang
                   else "main track is untagged/unknown language")
