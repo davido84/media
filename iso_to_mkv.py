@@ -244,10 +244,19 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        can trail the writer closing a file, in which case the output is
        merely late, not missing, and nothing needs redoing); only if nothing
        ever arrives is the title extracted again from scratch, up to
-       --title-retries times with --retry-delay-sec between attempts. A
-       non-zero exit and a stall are deliberately NOT retried here: those are
-       makemkvcon reporting a real failure or hanging, which is a different
-       problem from it quietly producing nothing.
+       --title-retries times with --retry-delay-sec between attempts.
+     - A non-zero makemkvcon exit is also retried, on its own smaller
+       budget (--error-retries, default 1, after --error-retry-delay-sec).
+       Some of those failures are transient - a momentary read error, or
+       makemkvcon crashing outright, which surfaces as a non-zero Windows
+       status rather than a clean error code - so one more attempt is worth
+       the short delay, while a genuinely unreadable disc just fails again.
+       The two budgets are counted separately so a disc that errors can't
+       consume the allowance meant for the silent-no-output case.
+     - A STALL is still never retried: makemkvcon hanging is a different
+       problem from it failing or producing nothing, and re-reading a disc
+       that already wedged once mostly costs hours. That path stays
+       non-fatal - the ISO is abandoned and the batch moves on.
      - A pre-flight check confirms makemkvcon64.exe (the 64-bit MakeMKV
        CLI, required deliberately over the memory-limited 32-bit build)
        can be found on PATH before any files are touched.
@@ -566,6 +575,14 @@ OUTPUT_RECHECK_DELAY_SEC: float = 5.0
 # scratch (see --title-retries / --retry-delay-sec).
 TITLE_RETRIES_DEFAULT: int = 2
 TITLE_RETRY_DELAY_SEC_DEFAULT: float = 30.0
+
+# A non-zero makemkvcon exit is a different failure from "exit 0 but nothing
+# written", so it gets its own, smaller budget: one more attempt after a short
+# pause catches the transient cases (a momentary read error, or a crash, which
+# also surfaces as a non-zero status) without spending long re-reading a disc
+# that is simply unreadable.
+ERROR_RETRIES_DEFAULT: int = 1
+ERROR_RETRY_DELAY_SEC_DEFAULT: float = 15.0
 
 # Per-output-folder manifest written on a successful conversion, used by
 # resume support (workflow enhancement 4) instead of a plain .mkv file
@@ -2608,20 +2625,26 @@ def process_iso(
         # find_qualifying_output(): an output that is merely slow to appear in
         # the directory listing is waited for, and only one that genuinely
         # never arrives costs a full re-extraction.
+        # The two recoverable failures get SEPARATE budgets, because they're
+        # different problems: makemkvcon exiting non-zero (it tried and
+        # reported a failure) and makemkvcon exiting 0 having written nothing
+        # usable. Sharing one counter would let a disc that errors twice eat
+        # the allowance meant for the silent-no-output case, or vice versa.
         attempt_outcome = "failed"          # "ok" | "stalled" | "failed"
         qualifying_new_mkvs: list[str] = []
         after_snapshot: dict[str, int] = {}
         mkv_output = ""
-        max_attempts = max(1, args.title_retries + 1)
+        error_retries_left = max(0, args.error_retries)
+        nooutput_retries_left = max(0, args.title_retries)
+        attempt = 0
 
-        for attempt in range(1, max_attempts + 1):
+        while True:
+            attempt += 1
             before_snapshot = snapshot_output_dir(out_dir)
             before_bytes = sum(before_snapshot.values())
             extract_start = time.monotonic()
             if attempt > 1:
-                logger.info(
-                    f"Title {tid}: extraction attempt {attempt} of {max_attempts}", iso_path
-                )
+                logger.info(f"Title {tid}: extraction attempt {attempt}", iso_path)
             logger.file_only("CMD", format_cmd_for_log(cmd), iso_path)
             rc, mkv_output, stalled = run_cmd_with_progress(cmd, stall_timeout_sec=stall_timeout_sec)
 
@@ -2660,14 +2683,30 @@ def process_iso(
                 break
 
             if rc != 0:
-                # A non-zero exit is makemkvcon telling us it failed, which is
-                # not the transient case this retry loop exists for.
+                # makemkvcon tried and reported a failure. Some of these are
+                # genuinely transient - a momentary read error, or makemkvcon
+                # crashing outright (a crash surfaces here as a non-zero
+                # Windows status, not as a clean error code) - so it's worth
+                # one more go after a pause before writing the disc off. A
+                # persistently unreadable disc just fails twice and costs
+                # only the delay.
+                logger.append_raw_to_file(mkv_output)
+                if error_retries_left > 0:
+                    error_retries_left -= 1
+                    logger.warning(
+                        f"Title {tid}: makemkvcon failed ({describe_exit_code(rc)})"
+                        f"{crash_advice(rc, mkv_output)} Retrying in "
+                        f"{args.error_retry_delay_sec:g}s",
+                        iso_path,
+                    )
+                    stats.warnings += 1
+                    time.sleep(args.error_retry_delay_sec)
+                    continue
                 logger.error(
                     f"makemkvcon failed for title {tid} ({describe_exit_code(rc)})"
                     f"{crash_advice(rc, mkv_output)}",
                     iso_path,
                 )
-                logger.append_raw_to_file(mkv_output)
                 stats.conversions_error += 1
                 all_ok = False
                 attempt_outcome = "failed"
@@ -2686,12 +2725,12 @@ def process_iso(
                 break
 
             logger.append_raw_to_file(mkv_output)
-            if attempt < max_attempts:
+            if nooutput_retries_left > 0:
+                nooutput_retries_left -= 1
                 logger.warning(
                     f"Title {tid}: makemkvcon reported success but produced no .mkv file of "
                     f"meaningful size in {out_dir}. This is usually transient, so the title "
-                    f"will be extracted again in {args.retry_delay_sec:g}s "
-                    f"(attempt {attempt + 1} of {max_attempts})",
+                    f"will be extracted again in {args.retry_delay_sec:g}s",
                     iso_path,
                 )
                 stats.warnings += 1
@@ -2700,7 +2739,7 @@ def process_iso(
 
             logger.error(
                 f"makemkvcon reported success for title {tid} but no new/updated .mkv file of "
-                f"meaningful size was found in {out_dir}, across {max_attempts} attempt(s) - "
+                f"meaningful size was found in {out_dir}, across {attempt} attempt(s) - "
                 f"treating as a failure. Raise --title-retries if this disc just needs more "
                 f"patience",
                 iso_path,
@@ -3068,6 +3107,21 @@ def parse_args() -> argparse.Namespace:
         "--retry-delay-sec", type=float, default=TITLE_RETRY_DELAY_SEC_DEFAULT, metavar="SECONDS",
         help="How long to wait before re-extracting a title after a transient no-output failure "
              f"(see --title-retries). Default {TITLE_RETRY_DELAY_SEC_DEFAULT:g}",
+    )
+    p.add_argument(
+        "--error-retries", type=int, default=ERROR_RETRIES_DEFAULT, metavar="N",
+        help="How many extra times to re-extract a title when makemkvcon exits with a non-zero "
+             "status. Some of those are transient (a momentary read error, or makemkvcon crashing "
+             "outright), so one more attempt after a short pause is often all it takes; a disc "
+             "that is genuinely unreadable simply fails again and costs only the delay. Counted "
+             f"separately from --title-retries. Default {ERROR_RETRIES_DEFAULT}; 0 fails on the "
+             f"first non-zero exit",
+    )
+    p.add_argument(
+        "--error-retry-delay-sec", type=float, default=ERROR_RETRY_DELAY_SEC_DEFAULT,
+        metavar="SECONDS",
+        help="How long to wait before re-extracting a title after a non-zero makemkvcon exit "
+             f"(see --error-retries). Default {ERROR_RETRY_DELAY_SEC_DEFAULT:g}",
     )
     p.add_argument(
         "--free-space-margin-pct", type=float, default=10.0, metavar="PCT",
