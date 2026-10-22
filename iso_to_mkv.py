@@ -235,6 +235,19 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        actually appeared/changed in the output directory - a 0-exit-code
        from makemkvcon is treated as necessary but not sufficient. See
        MIN_OUTPUT_FILE_BYTES.
+     - Transient "success but no output" is retried rather than fatal.
+       makemkvcon occasionally exits 0 having written nothing usable, and
+       re-running the same disc then works - so losing a multi-hour batch to
+       it was the wrong trade. Two remedies apply in order of cost: first the
+       output directory is simply re-listed a few times a few seconds apart
+       (a pooled or networked volume - StableBit DrivePool, a network share -
+       can trail the writer closing a file, in which case the output is
+       merely late, not missing, and nothing needs redoing); only if nothing
+       ever arrives is the title extracted again from scratch, up to
+       --title-retries times with --retry-delay-sec between attempts. A
+       non-zero exit and a stall are deliberately NOT retried here: those are
+       makemkvcon reporting a real failure or hanging, which is a different
+       problem from it quietly producing nothing.
      - A pre-flight check confirms makemkvcon64.exe (the 64-bit MakeMKV
        CLI, required deliberately over the memory-limited 32-bit build)
        can be found on PATH before any files are touched.
@@ -539,6 +552,21 @@ STALL_CHECK_INTERVAL_SEC: float = 15.0
 # produce something far larger than this.
 MIN_OUTPUT_FILE_BYTES: int = 1_000_000  # 1 MB
 
+# When makemkvcon exits 0 but the finished .mkv isn't visible in the output
+# directory yet, the usual cause is the filesystem not having surfaced it to
+# us rather than makemkvcon having produced nothing - a pooled/virtual volume
+# (StableBit DrivePool, a network share) can lag a moment between the writer
+# closing a file and a fresh directory listing reflecting it. So before
+# treating that as a failure, re-list the directory a few times with a short
+# pause. This costs seconds and saves re-extracting a whole title.
+OUTPUT_RECHECK_ATTEMPTS: int = 6
+OUTPUT_RECHECK_DELAY_SEC: float = 5.0
+
+# If the output still never appears, the title is extracted again from
+# scratch (see --title-retries / --retry-delay-sec).
+TITLE_RETRIES_DEFAULT: int = 2
+TITLE_RETRY_DELAY_SEC_DEFAULT: float = 30.0
+
 # Per-output-folder manifest written on a successful conversion, used by
 # resume support (workflow enhancement 4) instead of a plain .mkv file
 # *count* comparison - see selection_fingerprint()/manifest_mismatch_reason()
@@ -686,6 +714,55 @@ def snapshot_output_dir(out_dir: Path) -> dict[str, int]:
     if not out_dir.is_dir():
         return {}
     return {p.name: p.stat().st_size for p in out_dir.iterdir() if p.is_file()}
+
+
+def find_qualifying_output(
+    out_dir: Path,
+    before_snapshot: dict[str, int],
+    logger: "DualLogger",
+    iso_path: Path,
+    tid: int,
+) -> tuple[list[str], dict[str, int]]:
+    """Find the .mkv file(s) a title extraction just produced, tolerating a
+    filesystem that hasn't surfaced the new file yet.
+
+    Compares a fresh listing of out_dir against before_snapshot and keeps the
+    new-or-grown .mkv files of meaningful size, largest first. A 0 exit from
+    makemkvcon means it believes it wrote the title, so when nothing shows up
+    the first cause to rule out is listing lag, not a failed extraction: on a
+    pooled or networked volume the directory entry can trail the writer
+    closing the file by a moment. Hence up to OUTPUT_RECHECK_ATTEMPTS re-lists
+    spaced OUTPUT_RECHECK_DELAY_SEC apart before concluding nothing arrived -
+    cheap insurance against re-extracting a 25 GB title for nothing.
+
+    Returns (qualifying_names_largest_first, latest_snapshot); an empty list
+    means the output genuinely never appeared."""
+    after_snapshot: dict[str, int] = {}
+    for attempt in range(OUTPUT_RECHECK_ATTEMPTS + 1):
+        after_snapshot = snapshot_output_dir(out_dir)
+        qualifying = sorted(
+            (
+                name for name, size in after_snapshot.items()
+                if before_snapshot.get(name) != size
+                and name.lower().endswith(".mkv")
+                and size >= MIN_OUTPUT_FILE_BYTES
+            ),
+            key=lambda name: after_snapshot[name],
+            reverse=True,
+        )
+        if qualifying:
+            if attempt > 0:
+                waited = attempt * OUTPUT_RECHECK_DELAY_SEC
+                logger.warning(
+                    f"Title {tid}: output only became visible {waited:g}s after makemkvcon "
+                    f"finished - the output volume is reporting new files late, which is "
+                    f"worth knowing but was handled",
+                    iso_path,
+                )
+            return qualifying, after_snapshot
+        if attempt < OUTPUT_RECHECK_ATTEMPTS:
+            time.sleep(OUTPUT_RECHECK_DELAY_SEC)
+    return [], after_snapshot
 
 
 def clear_previous_outputs(out_dir: Path, logger: "DualLogger", stats: "Stats") -> None:
@@ -2483,77 +2560,122 @@ def process_iso(
             all_ok = False
             break  # further titles for this ISO won't fare any better
 
-        before_snapshot = snapshot_output_dir(out_dir)
-        before_bytes = sum(before_snapshot.values())
-        extract_start = time.monotonic()
-        logger.file_only("CMD", format_cmd_for_log(cmd), iso_path)
-        rc, mkv_output, stalled = run_cmd_with_progress(cmd, stall_timeout_sec=stall_timeout_sec)
+        # --- Extract the title, confirm real output landed, and retry a
+        #     transient "exit 0 but nothing produced" ---
+        # makemkvcon occasionally exits 0 having written nothing usable. That
+        # used to kill the whole run on first occurrence, even though simply
+        # running the disc again succeeds - so the title is re-extracted after
+        # a pause instead. The cheaper remedy is tried first, inside
+        # find_qualifying_output(): an output that is merely slow to appear in
+        # the directory listing is waited for, and only one that genuinely
+        # never arrives costs a full re-extraction.
+        attempt_outcome = "failed"          # "ok" | "stalled" | "failed"
+        qualifying_new_mkvs: list[str] = []
+        after_snapshot: dict[str, int] = {}
+        mkv_output = ""
+        max_attempts = max(1, args.title_retries + 1)
 
-        if stalled:
-            # makemkvcon moved no bytes (and its progress didn't advance) for the
-            # stall-timeout window, so it was terminated as hung. Unlike most
-            # errors here this does NOT abort the run: a single hung or
-            # unreadable disc shouldn't cost the rest of a multi-TB batch. We
-            # log it at ERROR level (so it stands out and the run still exits
-            # nonzero), abandon THIS ISO - stop extracting its remaining titles
-            # and leave its source file in place - and let the batch move on to
-            # the next ISO. The elapsed time and bytes-written figures make a
-            # genuine stall ("wrote 12 GB then stopped") easy to tell from a
-            # spurious one at a glance.
-            elapsed = time.monotonic() - extract_start
-            written = max(0, sum(snapshot_output_dir(out_dir).values()) - before_bytes)
+        for attempt in range(1, max_attempts + 1):
+            before_snapshot = snapshot_output_dir(out_dir)
+            before_bytes = sum(before_snapshot.values())
+            extract_start = time.monotonic()
+            if attempt > 1:
+                logger.info(
+                    f"Title {tid}: extraction attempt {attempt} of {max_attempts}", iso_path
+                )
+            logger.file_only("CMD", format_cmd_for_log(cmd), iso_path)
+            rc, mkv_output, stalled = run_cmd_with_progress(cmd, stall_timeout_sec=stall_timeout_sec)
+
+            if stalled:
+                # makemkvcon moved no bytes (and its progress didn't advance) for the
+                # stall-timeout window, so it was terminated as hung. Unlike most
+                # errors here this does NOT abort the run: a single hung or
+                # unreadable disc shouldn't cost the rest of a multi-TB batch. We
+                # log it at ERROR level (so it stands out and the run still exits
+                # nonzero), abandon THIS ISO - stop extracting its remaining titles
+                # and leave its source file in place - and let the batch move on to
+                # the next ISO. The elapsed time and bytes-written figures make a
+                # genuine stall ("wrote 12 GB then stopped") easy to tell from a
+                # spurious one at a glance. Not retried: a hung makemkvcon is a
+                # different animal from one that merely produced nothing.
+                elapsed = time.monotonic() - extract_start
+                written = max(0, sum(snapshot_output_dir(out_dir).values()) - before_bytes)
+                logger.append_raw_to_file(mkv_output)
+                logger.error_continue(
+                    f"Title {tid} extraction stalled - makemkvcon moved no data for "
+                    f"{args.stall_timeout_min:g} minute(s) (wrote {human_bytes(written)} in "
+                    f"{format_duration(elapsed)} before stalling), so it was terminated. The disc may "
+                    f"have bad sectors or makemkvcon may be hung; investigate this title. Raise or "
+                    f"disable the limit with --stall-timeout-min if it was just genuinely slow. "
+                    f"Skipping the rest of this ISO and continuing with the next one.",
+                    iso_path,
+                )
+                stats.conversions_error += 1
+                stats.isos_stalled += 1
+                all_ok = False
+                stalled_out = True
+                stop_reason = (
+                    f"title {tid} extraction stalled (no data for {args.stall_timeout_min:g} minute(s))"
+                )
+                attempt_outcome = "stalled"
+                break
+
+            if rc != 0:
+                # A non-zero exit is makemkvcon telling us it failed, which is
+                # not the transient case this retry loop exists for.
+                logger.error(
+                    f"makemkvcon failed for title {tid} ({describe_exit_code(rc)})"
+                    f"{crash_advice(rc, mkv_output)}",
+                    iso_path,
+                )
+                logger.append_raw_to_file(mkv_output)
+                stats.conversions_error += 1
+                all_ok = False
+                attempt_outcome = "failed"
+                break
+
+            # --- Verify output actually exists before trusting "success"
+            #     (safety enhancement 1) --- a 0 exit is necessary but not
+            #     sufficient. find_qualifying_output() also absorbs a merely
+            #     late-appearing file, so reaching the retry below means
+            #     nothing arrived at all.
+            qualifying_new_mkvs, after_snapshot = find_qualifying_output(
+                out_dir, before_snapshot, logger, iso_path, tid
+            )
+            if qualifying_new_mkvs:
+                attempt_outcome = "ok"
+                break
+
             logger.append_raw_to_file(mkv_output)
-            logger.error_continue(
-                f"Title {tid} extraction stalled - makemkvcon moved no data for "
-                f"{args.stall_timeout_min:g} minute(s) (wrote {human_bytes(written)} in "
-                f"{format_duration(elapsed)} before stalling), so it was terminated. The disc may "
-                f"have bad sectors or makemkvcon may be hung; investigate this title. Raise or "
-                f"disable the limit with --stall-timeout-min if it was just genuinely slow. "
-                f"Skipping the rest of this ISO and continuing with the next one.",
+            if attempt < max_attempts:
+                logger.warning(
+                    f"Title {tid}: makemkvcon reported success but produced no .mkv file of "
+                    f"meaningful size in {out_dir}. This is usually transient, so the title "
+                    f"will be extracted again in {args.retry_delay_sec:g}s "
+                    f"(attempt {attempt + 1} of {max_attempts})",
+                    iso_path,
+                )
+                stats.warnings += 1
+                time.sleep(args.retry_delay_sec)
+                continue
+
+            logger.error(
+                f"makemkvcon reported success for title {tid} but no new/updated .mkv file of "
+                f"meaningful size was found in {out_dir}, across {max_attempts} attempt(s) - "
+                f"treating as a failure. Raise --title-retries if this disc just needs more "
+                f"patience",
                 iso_path,
             )
             stats.conversions_error += 1
-            stats.isos_stalled += 1
             all_ok = False
-            stalled_out = True
-            stop_reason = (
-                f"title {tid} extraction stalled (no data for {args.stall_timeout_min:g} minute(s))"
-            )
+            attempt_outcome = "failed"
             break
 
-        if rc != 0:
-            logger.error(
-                f"makemkvcon failed for title {tid} ({describe_exit_code(rc)})"
-                f"{crash_advice(rc, mkv_output)}",
-                iso_path,
-            )
-            logger.append_raw_to_file(mkv_output)
-            stats.conversions_error += 1
-            all_ok = False
-            continue
+        if attempt_outcome == "stalled":
+            break      # abandon this ISO; the batch continues with the next one
+        if attempt_outcome != "ok":
+            continue   # this title failed; move on to the ISO's remaining titles
 
-        # --- Verify output actually exists before trusting "success" (safety enhancement 1) ---
-        after_snapshot = snapshot_output_dir(out_dir)
-        new_or_changed = [
-            name for name, size in after_snapshot.items()
-            if before_snapshot.get(name) != size
-        ]
-        qualifying_new_mkvs = sorted(
-            (name for name in new_or_changed
-             if name.lower().endswith(".mkv") and after_snapshot[name] >= MIN_OUTPUT_FILE_BYTES),
-            key=lambda name: after_snapshot[name],
-            reverse=True,
-        )
-        if not qualifying_new_mkvs:
-            logger.error(
-                f"makemkvcon reported success for title {tid} but no new/updated .mkv file "
-                f"of meaningful size was found in {out_dir} - treating as a failure",
-                iso_path,
-            )
-            logger.append_raw_to_file(mkv_output)
-            stats.conversions_error += 1
-            all_ok = False
-            continue
         if len(qualifying_new_mkvs) > 1:
             logger.warning(
                 f"Title {tid}: expected one output .mkv file but found {len(qualifying_new_mkvs)} - "
@@ -2893,6 +3015,20 @@ def parse_args() -> argparse.Namespace:
              "makemkvcon 2.0.0 crashes outright (access violation) on some discs with a cache "
              "that small, and a tiny cache also forces far more seeking on spinning disks. "
              "Set 0 to omit --cache entirely and let makemkvcon use its own default",
+    )
+    p.add_argument(
+        "--title-retries", type=int, default=TITLE_RETRIES_DEFAULT, metavar="N",
+        help="How many extra times to re-extract a title when makemkvcon exits successfully but "
+             "leaves no .mkv file of meaningful size behind - an occasional transient failure that "
+             "a plain re-run of the same disc gets past. Before any re-extraction the output "
+             "directory is simply re-checked a few times (a pooled or networked volume can be slow "
+             f"to list a just-written file), so a retry only happens when nothing arrived at all. "
+             f"Default {TITLE_RETRIES_DEFAULT}; 0 disables retrying and fails on the first occurrence",
+    )
+    p.add_argument(
+        "--retry-delay-sec", type=float, default=TITLE_RETRY_DELAY_SEC_DEFAULT, metavar="SECONDS",
+        help="How long to wait before re-extracting a title after a transient no-output failure "
+             f"(see --title-retries). Default {TITLE_RETRY_DELAY_SEC_DEFAULT:g}",
     )
     p.add_argument(
         "--free-space-margin-pct", type=float, default=10.0, metavar="PCT",
