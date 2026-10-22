@@ -1949,6 +1949,31 @@ def dedupe_duplicate_titles(
     return kept, dropped
 
 
+def safe_output_component(name: str) -> str:
+    """Make a source-derived string safe to use as a Windows folder name.
+
+    Windows silently strips trailing spaces and dots when it CREATES a path
+    component, but a program handed the un-stripped string may resolve it
+    differently - so the directory we make and the directory we name on
+    makemkvcon's command line stop being the same place, and the extraction
+    goes nowhere while still exiting 0.
+
+    This bites because an output folder is named after the ISO's stem, and
+    taking ".iso" off a file called "Mulholland Drive (2001) .iso" exposes a
+    trailing space that the filename itself didn't have. Leading whitespace
+    goes too (nothing good comes of a folder that starts with a space), and a
+    name that is nothing BUT spaces and dots falls back to a placeholder
+    rather than collapsing to the output root itself.
+
+    Only the name is cleaned - the SOURCE path is always passed through
+    untouched, since the space in "Mulholland Drive (2001) .iso" is a real
+    part of a real filename."""
+    cleaned = name.strip()
+    while cleaned and cleaned[-1] in " .":
+        cleaned = cleaned[:-1]
+    return cleaned or "untitled"
+
+
 def unique_output_dir(output_root: Path, relative_dir: Path, stem: str, used: set[str]) -> Path:
     """Mirrors the ISO's directory structure relative to --input under
     output_root, so e.g. <input>/Show/S1E1/s1e1.iso produces
@@ -2190,7 +2215,25 @@ def process_iso(
     # titles (predicting makemkvcon's own output filenames well enough to
     # do that safely is fragile); it will just fully redo that one ISO,
     # which is the safe default over a false "looks done" skip.
-    natural_out_dir = output_root / relative_dir / iso_path.stem
+    # The output folder is named after the ISO's stem, which can expose a
+    # trailing space or dot that the filename itself didn't have (taking
+    # ".iso" off "Mulholland Drive (2001) .iso" leaves one). Windows strips
+    # those when creating a directory but not necessarily when another
+    # program resolves the same string, so makemkvcon would be told to write
+    # somewhere subtly different from the folder we made - and would report
+    # success having saved nothing. Computed ONCE here and reused for both
+    # the resume check and the real output dir, so the two can't disagree.
+    out_name = safe_output_component(iso_path.stem)
+    if out_name != iso_path.stem:
+        # file_only: worth recording, not worth a console line every run.
+        logger.file_only(
+            "INFO",
+            f"Output folder named {out_name!r} rather than {iso_path.stem!r} - trailing "
+            f"spaces/dots removed so the path stays valid on Windows",
+            iso_path,
+        )
+
+    natural_out_dir = output_root / relative_dir / out_name
     previous_manifest = None if args.force else read_manifest(natural_out_dir)
 
     disc_type_override = None if args.disc_type == "auto" else args.disc_type
@@ -2548,7 +2591,7 @@ def process_iso(
         )
         stats.warnings += 1
 
-    out_dir = unique_output_dir(output_root, relative_dir, iso_path.stem, used_output_names)
+    out_dir = unique_output_dir(output_root, relative_dir, out_name, used_output_names)
     if not args.dry_run:
         out_dir.mkdir(parents=True, exist_ok=True)
         # Reaching here means we've committed to (re)extracting this ISO
@@ -3165,9 +3208,17 @@ def parse_args() -> argparse.Namespace:
     # separation rule below forbids anyway.
     if args.input is None and args.output is None:
         p.error("at least one of -i/--input or -o/--output must be provided")
-    if args.input is None:
+    # Trim stray whitespace around the folder arguments. A trailing space is
+    # easy to pick up from a copy/paste or a drag-and-drop and Windows can't
+    # hold a directory whose name ends in one anyway, so keeping it only
+    # risks every derived path being subtly wrong.
+    if args.input is not None:
+        args.input = args.input.strip()
+    if args.output is not None:
+        args.output = args.output.strip()
+    if not args.input:
         args.input = "."
-    if args.output is None:
+    if not args.output:
         args.output = "."
 
     # The input and output folders must be separate trees: not the same
