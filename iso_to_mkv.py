@@ -468,7 +468,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -626,6 +626,45 @@ def format_duration(seconds: float) -> str:
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def format_eta(seconds: float) -> str:
+    """Render a remaining-time estimate the way a person would say it.
+
+    format_duration()'s HH:MM:SS is right for a title's runtime, but a batch
+    ETA is often tens or hundreds of hours, where "142:37:19" forces the
+    reader to do division to learn it means about six days. This instead
+    gives the largest two units that matter - "5 days 22 hours", "3 hours 12
+    minutes", "45 minutes" - which is what you actually want to know when
+    deciding whether to leave a run going overnight."""
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return "less than a minute"
+
+    def plural(n: int, unit: str) -> str:
+        return f"{n} {unit}" if n == 1 else f"{n} {unit}s"
+
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return plural(minutes, "minute")
+    hours, mins = divmod(minutes, 60)
+    if hours < 24:
+        return f"{plural(hours, 'hour')} {plural(mins, 'minute')}" if mins else plural(hours, "hour")
+    days, hrs = divmod(hours, 24)
+    return f"{plural(days, 'day')} {plural(hrs, 'hour')}" if hrs else plural(days, "day")
+
+
+def format_finish_time(seconds: float, now: datetime | None = None) -> str:
+    """Wall-clock time a run with `seconds` left is projected to finish.
+
+    For a long batch this is the genuinely useful number - "finishes Tue
+    Oct 27, 09:14" answers "will it be done before I need the machine?"
+    directly, where a duration still has to be added to the current time in
+    your head. The date is included only when the finish lands on another
+    day, keeping the common case short."""
+    now = now or datetime.now()
+    finish = now + timedelta(seconds=max(0.0, seconds))
+    return finish.strftime("%H:%M") if finish.date() == now.date() else finish.strftime("%a %b %d, %H:%M")
 
 
 def parse_mkv_duration(value: str) -> float:
@@ -3253,15 +3292,22 @@ def main() -> int:
             if bytes_time_processed > 0:
                 rate = elapsed / bytes_time_processed  # seconds per byte
                 remaining_bytes = max(total_bytes_all - bytes_time_processed, 0)
-                eta_str = format_duration(rate * remaining_bytes)
+                remaining_sec = rate * remaining_bytes
+                # "about" is a useful hedge on a real figure but reads badly in
+                # front of one that's already vague ("about less than a minute").
+                eta_str = (
+                    "less than a minute left" if remaining_sec < 60
+                    else f"about {format_eta(remaining_sec)} left"
+                )
+                # The projected finish time earns its place only once there's
+                # real waiting to do; below an hour the duration alone says it.
+                if remaining_sec >= 3600:
+                    eta_str += f" (finishes {format_finish_time(remaining_sec)})"
             else:
-                eta_str = "calculating..."
+                eta_str = "calculating time remaining..."
 
             iso_size = iso_path.stat().st_size
-            print(
-                f"[{idx}/{total_count}] {iso_path.name} ({human_bytes(iso_size)}) "
-                f"- estimated time remaining: {eta_str}"
-            )
+            print(f"[{idx}/{total_count}] {iso_path.name} ({human_bytes(iso_size)}) - {eta_str}")
 
             # A crash while processing one ISO (a malformed robot-mode
             # line, an unexpected filesystem error, etc.) is caught here so
