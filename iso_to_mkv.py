@@ -235,6 +235,18 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        actually appeared/changed in the output directory - a 0-exit-code
        from makemkvcon is treated as necessary but not sufficient. See
        MIN_OUTPUT_FILE_BYTES.
+     - Fast resume: an already-converted ISO is skipped without opening it
+       at all. The full resume check needs the disc's title list, which
+       means a makemkvcon info scan per ISO - seconds each, and close to an
+       hour of dead time when restarting a 1000-disc batch that's already
+       800 done. Since every other condition (source size + mtime,
+       selection settings, and every recorded output file still present at
+       a sane size) is just a few stat() calls, a match on those is taken
+       as proof the disc is done. What's given up is confirming the disc
+       STILL selects the same titles: that's deterministic given identical
+       input and identical settings, so the realistic risk is a MakeMKV
+       upgrade changing its own selection. --no-fast-resume restores the
+       scan-and-compare behaviour for exactly that case.
      - Transient "success but no output" is retried rather than fatal.
        makemkvcon occasionally exits 0 having written nothing usable, and
        re-running the same disc then works - so losing a multi-hour batch to
@@ -1029,6 +1041,7 @@ def manifest_mismatch_reason(
     candidate_tids: list[int],
     out_dir: Path,
     args: argparse.Namespace,
+    check_titles: bool = True,
 ) -> str | None:
     """Decide whether a previous run's manifest lets us safely resume-skip
     this ISO. Returns None when it's a clean match (skip is safe); otherwise
@@ -1044,7 +1057,14 @@ def manifest_mismatch_reason(
     recorded is still present and still looks like real output. This is
     deliberately identity-by-metadata (size + mtime), never a content hash:
     hashing a multi-GB ISO on every run would be ruinously slow and
-    disk-bound, defeating the point of a fast resume check."""
+    disk-bound, defeating the point of a fast resume check.
+
+    check_titles=False drops only the candidate-title comparison, which is
+    the one check that needs a makemkvcon info scan to have happened. Every
+    other check costs a few stat() calls, so that flag is what lets the
+    caller decide an ISO is already done WITHOUT scanning it at all - see the
+    fast-resume path in process_iso(). candidate_tids is ignored then, and
+    may be empty."""
     if manifest is None:
         return "no manifest from a previous run"
     try:
@@ -1064,7 +1084,7 @@ def manifest_mismatch_reason(
     if abs(float(recorded_mtime) - stat.st_mtime) > MTIME_MATCH_TOLERANCE_SEC:
         return "source ISO modification time changed since conversion (the file looks replaced/re-authored)"
 
-    if manifest.get("candidate_title_ids") != sorted(candidate_tids):
+    if check_titles and manifest.get("candidate_title_ids") != sorted(candidate_tids):
         return (
             "the set of selected titles differs from last time (e.g. --min-length or --disc-type "
             "changed, or the disc now scans to a different title set)"
@@ -2236,6 +2256,42 @@ def process_iso(
     natural_out_dir = output_root / relative_dir / out_name
     previous_manifest = None if args.force else read_manifest(natural_out_dir)
 
+    # --- Fast resume (skip without scanning the disc) ---
+    # The full resume check below can't run until after get_disc_titles(),
+    # because it compares the freshly-scanned candidate titles against the
+    # manifest - and that scan is a whole makemkvcon run (seconds per ISO,
+    # which is an hour of dead time when restarting a 1000-disc batch with
+    # 800 already done). Every OTHER condition in that check is a handful of
+    # stat() calls, so when they all pass we can declare the ISO done without
+    # ever opening it.
+    #
+    # The trade: we stop verifying that the disc STILL scans to the same
+    # title set. That's a safe bet rather than a guess - candidate selection
+    # is a deterministic function of the disc's contents and the run's
+    # settings, and we've already confirmed the ISO is byte-identical (size +
+    # mtime) and the selection settings are unchanged. What it can't catch is
+    # MakeMKV itself changing its mind between runs, i.e. a version upgrade
+    # that selects titles differently; --no-fast-resume restores the thorough
+    # check for that case. Output files are still verified present and
+    # sanely-sized either way, so a deleted or truncated output is caught.
+    if args.fast_resume and previous_manifest is not None:
+        fast_mismatch = manifest_mismatch_reason(
+            previous_manifest, iso_path, [], natural_out_dir, args, check_titles=False
+        )
+        if fast_mismatch is None:
+            logger.info("already has a matching completed conversion.", iso_path)
+            logger.file_only(
+                "INFO", "Resume decided without a title scan (fast resume)", iso_path
+            )
+            # Still repair output file dates, exactly as the full path does.
+            if not args.dry_run:
+                stamp_outputs_with_source_date(
+                    iso_path, natural_out_dir,
+                    previous_manifest.get("output_filenames", []), logger, stats,
+                )
+            stats.already_converted_skipped += 1
+            return ProcessResult(skipped_already_done=True)
+
     disc_type_override = None if args.disc_type == "auto" else args.disc_type
     disc_type = classify_disc(iso_path, args.dvd_max_size_gb * 1_000_000_000, disc_type_override)
     # file_only: useful when diagnosing a disc-type misclassification after the
@@ -3121,6 +3177,16 @@ def parse_args() -> argparse.Namespace:
              "similar duration/size, so distinct TV episodes that share a runtime and size are "
              "never merged; titles without a reported segment map are always kept. Disable this to "
              "extract every qualifying title regardless. Ignored under --main-playlist. On by default",
+    )
+    p.add_argument(
+        "--no-fast-resume", dest="fast_resume", action="store_false", default=True,
+        help="Disable fast resume. By default an ISO whose manifest matches on source identity "
+             "(size + mtime), selection settings, and the presence/size of every recorded output "
+             "file is skipped WITHOUT running a makemkvcon title scan - which otherwise costs a "
+             "few seconds per already-done disc, i.e. close to an hour when restarting a "
+             "1000-disc batch that is 800 done. Pass this to also re-scan each disc and confirm "
+             "it still selects the same titles; worth doing after a MakeMKV upgrade, since that "
+             "is the one thing fast resume cannot notice. On by default",
     )
     p.add_argument(
         "-f", "--force", action="store_true",
