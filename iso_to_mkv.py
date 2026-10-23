@@ -265,6 +265,18 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        the short delay, while a genuinely unreadable disc just fails again.
        The two budgets are counted separately so a disc that errors can't
        consume the allowance meant for the silent-no-output case.
+     - Hang detection uses TWO watchdogs, because there are two hangs.
+       --stall-timeout-min (default 15) fires when makemkvcon moves no bytes
+       of any kind: wedged solid. --no-output-timeout-min (default 30) fires
+       when it is still doing I/O but has WRITTEN nothing - the damaged-disc
+       case, where makemkvcon retries unreadable sectors indefinitely so its
+       READ count keeps climbing and the first watchdog never fires, while no
+       MKV data is ever produced. Watching the kernel's per-process WRITE
+       counter specifically is what makes that visible; a healthy extraction
+       writes continuously once saving begins, and any genuine progress
+       advance resets both clocks, so the window only has to outlast the
+       analysis phase. Either way the ISO is abandoned non-fatally and the
+       batch continues. Set either to 0 to disable it.
      - A STALL is still never retried: makemkvcon hanging is a different
        problem from it failing or producing nothing, and re-reading a disc
        that already wedged once mostly costs hours. That path stays
@@ -593,6 +605,14 @@ TITLE_RETRY_DELAY_SEC_DEFAULT: float = 30.0
 # pause catches the transient cases (a momentary read error, or a crash, which
 # also surfaces as a non-zero status) without spending long re-reading a disc
 # that is simply unreadable.
+# Separate, deliberately generous window for "the process is doing I/O but
+# has written nothing". A genuinely healthy extraction writes continuously
+# once it starts saving, so a long dry spell means makemkvcon is retrying
+# unreadable sectors on a damaged disc and will never finish. Kept well above
+# the all-I/O stall window because this one has to outlast any legitimate
+# analysis or slow-but-recovering read phase.
+NO_OUTPUT_TIMEOUT_MIN_DEFAULT: float = 30.0
+
 ERROR_RETRIES_DEFAULT: int = 1
 ERROR_RETRY_DELAY_SEC_DEFAULT: float = 15.0
 
@@ -1486,10 +1506,15 @@ class _IO_COUNTERS(ctypes.Structure):
 _get_process_io_counters: "object | None" = None
 
 
-def _process_io_bytes(proc: "subprocess.Popen[str]") -> int:
-    """Total bytes this process has transferred so far (read + write + other),
-    via Windows GetProcessIoCounters - the kernel's own per-process I/O
-    accounting. This is the stall watchdog's ground-truth "is makemkvcon
+def _process_io_bytes(proc: "subprocess.Popen[str]") -> tuple[int, int]:
+    """(total_bytes, written_bytes) this process has transferred so far, via
+    Windows GetProcessIoCounters - the kernel's own per-process I/O
+    accounting. Written bytes are reported separately because the two answer
+    different questions: the total says whether the process is alive at all,
+    while the write count says whether it is actually producing anything. A
+    makemkvcon wedged on a corrupt disc keeps reading - retrying bad sectors
+    forever - so its TOTAL keeps climbing while it writes nothing, which is
+    exactly the hang that a total-only check cannot see. This is the stall watchdog's ground-truth "is makemkvcon
     actually doing work" signal: it updates in real time as makemkvcon reads
     the ISO and writes the MKV, independently of (a) makemkvcon's stdout
     buffering and (b) whatever filesystem the output lands on - so it behaves
@@ -1498,7 +1523,7 @@ def _process_io_bytes(proc: "subprocess.Popen[str]") -> int:
 
     Note: counts only the makemkvcon process we launched, not any child
     processes it might spawn; makemkvcon64.exe does its own I/O, so this holds
-    in practice."""
+    in practice. Returns (-1, -1) if the counters can't be read."""
     global _get_process_io_counters
     if _get_process_io_counters is None:
         try:
@@ -1509,28 +1534,40 @@ def _process_io_bytes(proc: "subprocess.Popen[str]") -> int:
         except Exception:
             _get_process_io_counters = False
     if not _get_process_io_counters:
-        return -1
+        return (-1, -1)
     try:
         handle = int(proc._handle)  # Popen's process handle (Windows)
     except Exception:
-        return -1
+        return (-1, -1)
     counters = _IO_COUNTERS()
     if not _get_process_io_counters(ctypes.c_void_p(handle), ctypes.byref(counters)):
-        return -1
-    return int(
+        return (-1, -1)
+    total = int(
         counters.ReadTransferCount + counters.WriteTransferCount + counters.OtherTransferCount
     )
+    return (total, int(counters.WriteTransferCount))
 
 
 def run_cmd_with_progress(
     cmd: list[str],
     stall_timeout_sec: float | None = None,
-) -> tuple[int, str, bool]:
+    no_output_timeout_sec: float | None = None,
+) -> tuple[int, str, str]:
     """Like run_cmd, but streams output while a long title extraction runs and
     drives a stall watchdog, so a genuinely hung makemkvcon is aborted instead
-    of blocking the batch forever. Returns (returncode, output, stalled);
-    stalled is True when the watchdog killed the child (returncode will be
-    nonzero from the kill).
+    of blocking the batch forever. Returns (returncode, output, stall_reason);
+    stall_reason is empty unless a watchdog killed the child, in which case it
+    describes WHICH hang was detected (the returncode will be nonzero from the
+    kill).
+
+    TWO detectors, because there are two different hangs:
+      - stall_timeout_sec: the process moved no bytes of ANY kind - wedged
+        solid, never going to finish.
+      - no_output_timeout_sec: the process is still doing I/O but has WRITTEN
+        nothing. This is the damaged-disc hang: makemkvcon retries unreadable
+        sectors indefinitely, so its READ count keeps climbing and a
+        total-I/O check never fires, while not one byte of MKV is produced.
+        Watching writes specifically is what makes that visible.
 
     IMPORTANT - what "progress" means here. The stall clock is reset by the
     makemkvcon PROCESS'S I/O BYTE COUNTERS advancing (the kernel's own
@@ -1549,8 +1586,9 @@ def run_cmd_with_progress(
     makemkvcon actually moves bytes to/from disk, in real time, regardless of
     output filesystem. Received PRGV advances still count as a secondary "still
     alive" reset (harmless - it can only prevent a false kill, never cause
-    one). A stall - and a kill - happens only when NEITHER the process moved
-    any bytes NOR progress advanced for stall_timeout_sec.
+    one), and resets both clocks since it is genuine forward motion. A stall -
+    and a kill - happens only when NEITHER the process moved any bytes NOR
+    progress advanced for the relevant window.
 
     We still drain stdout (so makemkvcon never blocks on a full pipe) and keep
     the full captured output for post-hoc error diagnostics, same as run_cmd.
@@ -1563,25 +1601,53 @@ def run_cmd_with_progress(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
         )
     except FileNotFoundError as e:
-        return 127, f"Could not execute command {cmd!r}: {e}", False
+        return 127, f"Could not execute command {cmd!r}: {e}", ""
 
     lines: list[str] = []
-    last_activity = [time.monotonic()]  # reset on process I/O advance OR progress advance
+    last_activity = [time.monotonic()]  # reset on ANY process I/O or progress advance
+    last_output = [time.monotonic()]    # reset only when bytes are actually WRITTEN
     highest_pct = [-1.0]
-    stalled = threading.Event()
+    stall_reason: list[str] = [""]      # set by the watchdog; empty means no stall
     stop_watchdog = threading.Event()
 
     watchdog: threading.Thread | None = None
-    if stall_timeout_sec is not None and stall_timeout_sec > 0:
+    watch_stall = stall_timeout_sec is not None and stall_timeout_sec > 0
+    watch_output = no_output_timeout_sec is not None and no_output_timeout_sec > 0
+    if watch_stall or watch_output:
         def _watch() -> None:
-            last_io = _process_io_bytes(proc)
+            last_total, last_written = _process_io_bytes(proc)
             while not stop_watchdog.wait(STALL_CHECK_INTERVAL_SEC):
-                io = _process_io_bytes(proc)
-                if io >= 0 and io > last_io:  # process moved real bytes since last check
-                    last_io = io
-                    last_activity[0] = time.monotonic()
-                if time.monotonic() - last_activity[0] > stall_timeout_sec:
-                    stalled.set()
+                total, written = _process_io_bytes(proc)
+                now = time.monotonic()
+                if total >= 0 and total > last_total:   # moved bytes of any kind
+                    last_total = total
+                    last_activity[0] = now
+                if written >= 0 and written > last_written:   # actually produced output
+                    last_written = written
+                    last_output[0] = now
+
+                # Detector 1: nothing at all. The process is wedged solid -
+                # not even reading - so it will never finish.
+                if watch_stall and now - last_activity[0] > stall_timeout_sec:
+                    stall_reason[0] = (
+                        f"moved no data at all for {stall_timeout_sec / 60:g} minute(s)"
+                    )
+                    _terminate_proc(proc)
+                    return
+
+                # Detector 2: busy but producing nothing. This is the corrupt
+                # -disc hang: makemkvcon retries unreadable sectors forever,
+                # so its read count climbs (keeping detector 1 happy) while
+                # not a single byte of MKV is written. Given a healthy
+                # extraction writes continuously once it starts saving, a long
+                # window with zero bytes written means it is never finishing.
+                if watch_output and now - last_output[0] > no_output_timeout_sec:
+                    read_mb = max(0, last_total - last_written) / 1_000_000.0
+                    stall_reason[0] = (
+                        f"wrote nothing for {no_output_timeout_sec / 60:g} minute(s) while still "
+                        f"reading ({read_mb:,.0f} MB read by the process overall) - the hallmark "
+                        f"of makemkvcon retrying unreadable sectors on a damaged disc"
+                    )
                     _terminate_proc(proc)
                     return
         watchdog = threading.Thread(target=_watch, daemon=True)
@@ -1610,8 +1676,12 @@ def run_cmd_with_progress(
                     if maxv > 0:
                         pct = min(100.0, max(0.0, (total / maxv) * 100.0))
                         if pct > highest_pct[0]:
+                            # Real forward progress, so neither detector should
+                            # fire - resetting both keeps a legitimately slow
+                            # analysis phase from being mistaken for a hang.
                             highest_pct[0] = pct
                             last_activity[0] = time.monotonic()
+                            last_output[0] = last_activity[0]
     except KeyboardInterrupt:
         stop_watchdog.set()
         _terminate_proc(proc)
@@ -1625,7 +1695,7 @@ def run_cmd_with_progress(
         if watchdog is not None:
             watchdog.join(timeout=5)
 
-    return proc.returncode, "\n".join(lines), stalled.is_set()
+    return proc.returncode, "\n".join(lines), stall_reason[0]
 
 
 @dataclass
@@ -2681,6 +2751,11 @@ def process_iso(
         if args.stall_timeout_min and args.stall_timeout_min > 0
         else None
     )
+    no_output_timeout_sec = (
+        args.no_output_timeout_min * 60.0
+        if args.no_output_timeout_min and args.no_output_timeout_min > 0
+        else None
+    )
     for tid in sorted(candidates):
         title = titles[tid]
         logger.info(
@@ -2745,7 +2820,11 @@ def process_iso(
             if attempt > 1:
                 logger.info(f"Title {tid}: extraction attempt {attempt}", iso_path)
             logger.file_only("CMD", format_cmd_for_log(cmd), iso_path)
-            rc, mkv_output, stalled = run_cmd_with_progress(cmd, stall_timeout_sec=stall_timeout_sec)
+            rc, mkv_output, stalled = run_cmd_with_progress(
+                cmd,
+                stall_timeout_sec=stall_timeout_sec,
+                no_output_timeout_sec=no_output_timeout_sec,
+            )
 
             if stalled:
                 # makemkvcon moved no bytes (and its progress didn't advance) for the
@@ -2763,21 +2842,19 @@ def process_iso(
                 written = max(0, sum(snapshot_output_dir(out_dir).values()) - before_bytes)
                 logger.append_raw_to_file(mkv_output)
                 logger.error_continue(
-                    f"Title {tid} extraction stalled - makemkvcon moved no data for "
-                    f"{args.stall_timeout_min:g} minute(s) (wrote {human_bytes(written)} in "
-                    f"{format_duration(elapsed)} before stalling), so it was terminated. The disc may "
-                    f"have bad sectors or makemkvcon may be hung; investigate this title. Raise or "
-                    f"disable the limit with --stall-timeout-min if it was just genuinely slow. "
-                    f"Skipping the rest of this ISO and continuing with the next one.",
+                    f"Title {tid} extraction hung - makemkvcon {stalled}, so it was terminated "
+                    f"(it wrote {human_bytes(written)} in {format_duration(elapsed)} before "
+                    f"hanging). The disc is likely damaged, or makemkvcon is stuck; investigate "
+                    f"this title. Tune --stall-timeout-min / --no-output-timeout-min if it was "
+                    f"just genuinely slow. Skipping the rest of this ISO and continuing with the "
+                    f"next one.",
                     iso_path,
                 )
                 stats.conversions_error += 1
                 stats.isos_stalled += 1
                 all_ok = False
                 stalled_out = True
-                stop_reason = (
-                    f"title {tid} extraction stalled (no data for {args.stall_timeout_min:g} minute(s))"
-                )
+                stop_reason = f"title {tid} extraction hung ({stalled})"
                 attempt_outcome = "stalled"
                 break
 
@@ -3244,6 +3321,16 @@ def parse_args() -> argparse.Namespace:
              "disc it can't read past. This is a STALL timeout, not a wall-clock limit: a slow but "
              "steadily-progressing large title is left alone, only a genuinely stuck one is killed. "
              f"Default {STALL_TIMEOUT_MIN_DEFAULT:g}; set 0 to disable",
+    )
+    p.add_argument(
+        "--no-output-timeout-min", type=float, default=NO_OUTPUT_TIMEOUT_MIN_DEFAULT,
+        metavar="MINUTES",
+        help="Abort a title when makemkvcon has WRITTEN nothing for this many minutes even though "
+             "it is still doing I/O. This catches the damaged-disc hang that --stall-timeout-min "
+             "cannot: makemkvcon retries unreadable sectors forever, so its read count keeps "
+             "climbing (which looks like activity) while no MKV data is ever produced. A healthy "
+             "extraction writes continuously once saving starts, so the window only has to outlast "
+             f"the analysis phase. Default {NO_OUTPUT_TIMEOUT_MIN_DEFAULT:g}; 0 disables it",
     )
     p.add_argument(
         "--runaway-output-margin-pct", type=float, default=RUNAWAY_OUTPUT_MARGIN_PCT_DEFAULT, metavar="PCT",
