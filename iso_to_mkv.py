@@ -491,6 +491,7 @@ script. See organize_media.py's own docstring for details.
 """
 
 import argparse
+import atexit
 import ctypes
 import json
 import os
@@ -1476,14 +1477,73 @@ def run_cmd(cmd: list[str]) -> tuple[int, str]:
         return 127, f"Could not execute command {cmd!r}: {e}"
 
 
-def _terminate_proc(proc: "subprocess.Popen[str]") -> None:
-    """Terminate a child process, escalating to kill if it doesn't stop."""
-    proc.terminate()
+# The makemkvcon we currently have running, so a Ctrl+C (or any other exit)
+# can reach it from outside run_cmd_with_progress - including from the atexit
+# hook below, which covers an interrupt that lands somewhere we aren't
+# guarding. A list because it's rebound from more than one scope.
+_ACTIVE_CHILD: list["subprocess.Popen[str] | None"] = [None]
+
+
+def _kill_process_tree(proc: "subprocess.Popen[str]") -> None:
+    """Kill a child process AND everything it spawned, without ever blocking
+    indefinitely.
+
+    Two reasons this can't just be proc.kill():
+
+    1. makemkvcon spawns helpers of its own (mmgplsrv.exe, MakeMKV's GPL
+       server used for AACS/BD+ work). Killing only the process we launched
+       orphans those, and an orphan holding the source ISO open is exactly
+       what you don't want after Ctrl+C-ing out of a hung rip. taskkill /T
+       walks the whole tree; /F is required because a wedged process will not
+       exit on request.
+    2. On Windows, Popen.terminate() and Popen.kill() are the same call
+       (TerminateProcess), so "terminate, then escalate to kill" was never a
+       real escalation - if the first didn't work, neither would the second.
+
+    Every wait here is bounded. The whole point of this path is escaping a
+    hang, so it must not be able to hang itself."""
+    if proc.poll() is not None:
+        return
     try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20,
+        )
+    except Exception:
+        pass  # taskkill missing, timed out, or the pid already went away
+    if proc.poll() is None:
+        # Fallback: at least kill the process we own a handle to.
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+
+
+def _terminate_proc(proc: "subprocess.Popen[str]") -> None:
+    """Stop a child process and its descendants (see _kill_process_tree)."""
+    _kill_process_tree(proc)
+
+
+def _kill_active_child_at_exit() -> None:
+    """Last-resort cleanup: never leave a makemkvcon running after we exit.
+
+    The explicit KeyboardInterrupt handlers cover an interrupt that arrives
+    while we're reading makemkvcon's output, which is where it almost always
+    lands. This covers everywhere else - an interrupt during the resume check
+    or between titles, an unhandled exception, sys.exit() from the fail-fast
+    logger - so there is no path out of this script that leaves an orphaned
+    rip holding the disc open."""
+    proc = _ACTIVE_CHILD[0]
+    if proc is not None and proc.poll() is None:
+        _kill_process_tree(proc)
+    _ACTIVE_CHILD[0] = None
+
+
+atexit.register(_kill_active_child_at_exit)
 
 
 class _IO_COUNTERS(ctypes.Structure):
@@ -1602,6 +1662,7 @@ def run_cmd_with_progress(
         )
     except FileNotFoundError as e:
         return 127, f"Could not execute command {cmd!r}: {e}", ""
+    _ACTIVE_CHILD[0] = proc  # reachable by the atexit safety net from here on
 
     lines: list[str] = []
     last_activity = [time.monotonic()]  # reset on ANY process I/O or progress advance
@@ -1683,17 +1744,31 @@ def run_cmd_with_progress(
                             last_activity[0] = time.monotonic()
                             last_output[0] = last_activity[0]
     except KeyboardInterrupt:
+        # Ctrl+C: kill makemkvcon and its whole process tree before letting
+        # the interrupt propagate. A second Ctrl+C mid-cleanup is swallowed
+        # so it can't abandon the kill halfway; the atexit hook would catch
+        # it anyway, but finishing here keeps the order of events clean.
         stop_watchdog.set()
-        _terminate_proc(proc)
-        if watchdog is not None:
-            watchdog.join(timeout=5)
+        try:
+            _kill_process_tree(proc)
+        except KeyboardInterrupt:
+            _kill_process_tree(proc)
         raise
     finally:
         stop_watchdog.set()
         if proc.poll() is None:
-            proc.wait()
+            # Normally makemkvcon has exited by the time its output closes.
+            # If it somehow hasn't, give it a bounded grace period and then
+            # kill it - the old unbounded wait() here could hang forever on
+            # exactly the wedged process this whole path exists to escape.
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                _kill_process_tree(proc)
         if watchdog is not None:
             watchdog.join(timeout=5)
+        if _ACTIVE_CHILD[0] is proc:
+            _ACTIVE_CHILD[0] = None
 
     return proc.returncode, "\n".join(lines), stall_reason[0]
 
@@ -3629,8 +3704,12 @@ def main() -> int:
 
     except KeyboardInterrupt:
         interrupted = True
+        # Usually already done inside run_cmd_with_progress, but an interrupt
+        # that lands between titles or during a resume check would otherwise
+        # reach here with makemkvcon still running.
+        _kill_active_child_at_exit()
         print()  # in case a live progress line was mid-write
-        logger.warning("Interrupted by user (Ctrl+C) - stopping and printing the summary so far")
+        logger.warning("Interrupted by user (Ctrl+C) - stopped makemkvcon; printing the summary so far")
 
     if args.dry_run:
         def _rel(p: Path) -> str:
