@@ -474,6 +474,33 @@ def build_parser() -> argparse.ArgumentParser:
                               "answer for. Detection adds a second or two per file and "
                               "only runs on files being re-encoded, never on copies. "
                               "Default: off (video passed through exactly as before)")
+    parser.add_argument("--crop", choices=["off", "auto"], default="off",
+                         help="Remove black bars recorded into the picture. Mainly for "
+                              "non-anamorphic DVDs, where a widescreen film is letterboxed "
+                              "inside a 4:3 frame and ends up boxed in the middle of a 16:9 "
+                              "TV with black on all four sides; cropping lets it fill the "
+                              "screen width. 'auto' samples six points through each file "
+                              "and crops only to the largest picture area seen in any of "
+                              "them, so a dark scene can't cause picture to be cut, and "
+                              f"only when at least {CROP_MIN_FRACTION:.0%} of the width or "
+                              "height is black, so small edge borders are left alone. The "
+                              "picture's shape is preserved. Each decision is logged as "
+                              "CROP:, and detection also runs under --dry-run, so you can "
+                              "review what it would do first. Only applies to files being "
+                              "re-encoded. Default: off")
+    parser.add_argument("--square-pixels", action="store_true",
+                         help="Resize the picture so its pixels are square. DVD video is "
+                              "always stored 720 wide with non-square pixels that the "
+                              "player stretches to 4:3 or 16:9; some players call that "
+                              "'anamorphic' and won't play it, notably the Jellyfin Roku "
+                              "app, which makes the Jellyfin server re-encode the file on "
+                              "every playback. This bakes the shape into the frame instead "
+                              "(e.g. 720x480 -> 640x480 for 4:3, 854x480 for 16:9). The "
+                              "height and the displayed shape are unchanged. Applied after "
+                              "--crop. Files whose pixels are already square, such as "
+                              "Blu-rays, are left alone, so it's safe on a mixed folder. "
+                              "Logged per file as PIXELS:. Only applies to files being "
+                              "re-encoded. Default: off")
     parser.add_argument("-I", "--include", type=str, default=None, metavar="REGEX",
                          help="Only process files whose path, taken relative to the "
                               "input folder and written with forward slashes, matches "
@@ -552,6 +579,18 @@ def setup_logging(output_folder: Path, name_suffix: str = "") -> Path:
 COVER_ART_CODECS = {"mjpeg", "png", "bmp", "gif"}
 
 
+def _parse_sar(sar_str: str | None) -> tuple[int, int] | None:
+    """Parse ffprobe's sample_aspect_ratio ('8:9') into (8, 9), or None when it's
+    missing, malformed or the '0:1' ffprobe uses for 'not recorded'."""
+    if not sar_str or ":" not in sar_str:
+        return None
+    try:
+        num, den = (int(v) for v in sar_str.split(":", 1))
+    except ValueError:
+        return None
+    return (num, den) if num > 0 and den > 0 else None
+
+
 def _parse_frame_rate(rate_str: str | None) -> float | None:
     """Parse ffprobe's r_frame_rate, which is a rational string like '30000/1001',
     into a float. Returns None for a missing, malformed or zero-denominator value
@@ -609,7 +648,8 @@ def probe_media(path: Path, timeout_seconds: float) -> dict[str, Any]:
         # listing "disposition" inside stream= is silently ignored by ffprobe, which
         # previously left both the cover-art (attached_pic) and commentary checks
         # without any flags to read.
-        "stream=codec_name,codec_type,width,height,r_frame_rate,field_order:"
+        "stream=codec_name,codec_type,width,height,r_frame_rate,field_order,"
+        "sample_aspect_ratio:"
         "stream_disposition=attached_pic,comment:"
         "stream_tags=language,title:format=duration",
         "-of", "json",
@@ -655,6 +695,9 @@ def probe_media(path: Path, timeout_seconds: float) -> dict[str, Any]:
                 # separates an NTSC 29.97 source (where 3:2 telecine is possible) from
                 # a PAL 25 source (where it isn't).
                 "frame_rate": _parse_frame_rate(s.get("r_frame_rate")),
+                # Pixel shape as (num, den), e.g. (8, 9) for an NTSC 4:3 DVD; None when
+                # the file doesn't record one (ffprobe reports 0:1 or nothing).
+                "sar": _parse_sar(s.get("sample_aspect_ratio")),
                 "field_order": s.get("field_order"),
             }
             if fallback_video_info is None:
@@ -1083,6 +1126,158 @@ def resolve_deinterlace_filter(src: Path, video_info: dict[str, Any], mode: str
     return (None, f"auto -> progressive, no filtering ({reason})")
 
 
+# --- Black-bar cropping ------------------------------------------------------------
+# Some discs record black bars into the picture itself: most often a widescreen film
+# letterboxed inside a 4:3 frame (a "non-anamorphic" DVD). On a 16:9 TV that frame is
+# then pillarboxed as well, leaving the film boxed in the middle of the screen with
+# black on all four sides. Cropping the recorded bars away lets the TV scale the film
+# up to the full screen width. The crop keeps the source's pixel aspect ratio, so the
+# picture's shape is unchanged — only black is removed (verified: a 1.85:1 film
+# letterboxed in 720x480 4:3 came out 720x346 at exactly 1.85:1).
+#
+# A wrong crop permanently cuts off picture, so detection is deliberately cautious:
+#   * it samples several points spread through the file, and crops only to the
+#     LARGEST picture area seen in any of them. A dark scene can make black bars look
+#     bigger than they are, but it can never shrink the result below what a brighter
+#     sample showed; one full-frame sample anywhere means no crop at all.
+#   * it ignores small borders. Many discs have a few pixels of black or noise at the
+#     edges; trimming those gains nothing on screen, so a crop must remove at least
+#     CROP_MIN_FRACTION of the width or height to be applied.
+
+# Points through the file to sample, as fractions of its duration. Skips the very
+# start and end, where logos and credits tend to be on black backgrounds.
+CROP_SAMPLE_POSITIONS: tuple[float, ...] = (0.10, 0.25, 0.40, 0.55, 0.70, 0.85)
+
+# Frames analysed at each sample point (about two seconds of video).
+CROP_SAMPLE_FRAMES: int = 48
+
+# A sample whose detected picture is smaller than this fraction of the frame in either
+# dimension is treated as a black or near-black scene and ignored, rather than being
+# allowed to vote for a crop.
+CROP_MIN_PICTURE_FRACTION: float = 0.30
+
+# At least this many usable samples are needed before any crop is applied.
+CROP_MIN_VALID_SAMPLES: int = 3
+
+# The crop must remove at least this fraction of the width or of the height.
+CROP_MIN_FRACTION: float = 0.10
+
+# Pixels of black deliberately kept beyond the detected picture edge on each side, so
+# dark rows at the edge of the picture are never cut off. See detect_crop.
+CROP_SAFETY_MARGIN: int = 6
+
+
+def detect_crop(src: Path, video_info: dict[str, Any]) -> tuple[str | None, str]:
+    """Decide whether src has black bars recorded into the picture, returning
+    (crop_filter_or_None, reason). The filter is an ffmpeg 'crop=w:h:x:y' string; reason
+    is a short explanation for the log. Never raises: on any failure it returns no
+    crop, since leaving the frame alone is always the safe choice."""
+    width, height = video_info.get("width") or 0, video_info.get("height") or 0
+    duration = video_info.get("duration")
+    if not (width and height):
+        return (None, "frame size unknown")
+
+    boxes: list[tuple[int, int, int, int]] = []  # (left, top, right, bottom), exclusive
+    has_duration = isinstance(duration, (int, float)) and duration > 0
+    positions = CROP_SAMPLE_POSITIONS if has_duration else (0.0,)
+    for pos in positions:
+        start = float(duration) * pos if has_duration else 0.0
+        cmd: list[str] = ["ffmpeg", "-hide_banner", "-nostdin"]
+        if start > 0:
+            cmd += ["-ss", f"{start:.3f}"]
+        # limit=24: anything darker than 24/255 counts as black (video black is 16).
+        # round=2 keeps the detected size even. reset=0 makes the reported box grow to
+        # cover every frame in the sample, so the last line is the sample's maximum.
+        cmd += ["-i", str(src), "-map", "0:v:0", "-vf", "cropdetect=limit=24:round=2:reset=0",
+                "-frames:v", str(CROP_SAMPLE_FRAMES), "-an", "-sn", "-f", "null", "-"]
+        result = run_ffmpeg_with_watchdog(add_progress_flags(cmd))
+        if result.stalled or result.returncode != 0:
+            continue
+        found = re.findall(r"crop=(-?\d+):(-?\d+):(-?\d+):(-?\d+)", result.stderr)
+        if not found:
+            continue
+        w, h, x, y = (int(v) for v in found[-1])
+        if (w < width * CROP_MIN_PICTURE_FRACTION or h < height * CROP_MIN_PICTURE_FRACTION
+                or x < 0 or y < 0):
+            continue  # black or near-black scene: no useful information
+        boxes.append((x, y, min(x + w, width), min(y + h, height)))
+
+    if len(boxes) < CROP_MIN_VALID_SAMPLES:
+        return (None, f"only {len(boxes)} usable sample(s) of {len(positions)}, need "
+                      f"{CROP_MIN_VALID_SAMPLES} - leaving the frame alone")
+
+    # Largest picture area seen across all samples.
+    left = min(b[0] for b in boxes)
+    top = min(b[1] for b in boxes)
+    right = max(b[2] for b in boxes)
+    bottom = max(b[3] for b in boxes)
+    # Widen the box by a small margin on every side. Rows next to the bars are often
+    # dark picture (a shadow, a night sky) that the black threshold misreads as bar,
+    # and cropdetect's own rounding centres its box rather than growing it, so the raw
+    # edge can sit a few rows inside the real picture (measured: up to 5 rows on a test
+    # pattern). A few lines of retained black are invisible on a TV; cut picture isn't.
+    left = max(0, left - CROP_SAFETY_MARGIN)
+    top = max(0, top - CROP_SAFETY_MARGIN)
+    right = min(width, right + CROP_SAFETY_MARGIN)
+    bottom = min(height, bottom + CROP_SAFETY_MARGIN)
+    # Even offsets and sizes: 4:2:0 video stores colour at half resolution, and an odd
+    # vertical offset would also swap the fields of interlaced video. Rounding outward
+    # (offsets down, far edges up) can only keep a pixel of black, never lose picture.
+    left -= left % 2
+    top -= top % 2
+    right = min(right + right % 2, width)
+    bottom = min(bottom + bottom % 2, height)
+    crop_w, crop_h = right - left, bottom - top
+
+    removed_w = 1 - crop_w / width
+    removed_h = 1 - crop_h / height
+    if removed_w < CROP_MIN_FRACTION and removed_h < CROP_MIN_FRACTION:
+        return (None, f"black borders too small to matter (largest picture "
+                      f"{crop_w}x{crop_h} of {width}x{height} across {len(boxes)} samples)")
+    return (f"crop={crop_w}:{crop_h}:{left}:{top}",
+            f"{width}x{height} -> {crop_w}x{crop_h} at offset {left},{top} "
+            f"(largest picture across {len(boxes)} samples)")
+
+
+def resolve_square_pixels(video_info: dict[str, Any], crop_filter: str | None
+                           ) -> tuple[str | None, str]:
+    """For --square-pixels: a filter that resizes the frame so its pixels are square,
+    returning (filter_or_None, reason).
+
+    DVD video always uses non-square pixels: every frame is stored 720 wide and the
+    player stretches or squeezes it to 4:3 or 16:9 using the file's pixel aspect ratio
+    (SAR). Some players treat any non-square SAR as "anamorphic" and refuse it: the
+    Jellyfin Roku app does, so Jellyfin re-encodes the whole file on the fly every time
+    it's played. Resizing to square pixels bakes the shape into the frame itself:
+    the height is kept, so no vertical detail is lost, and the width becomes what the
+    player would have stretched it to (720x480 at 8:9 -> 640x480 for 4:3; at 32:27 ->
+    854x480 for 16:9). The displayed shape is unchanged.
+
+    It works on the frame AFTER any black-bar crop, since the crop runs first in the
+    filter chain. Files that already have square pixels, or record no pixel shape at
+    all, are left alone."""
+    sar = video_info.get("sar")
+    width, height = video_info.get("width") or 0, video_info.get("height") or 0
+    if crop_filter:
+        crop_match = re.match(r"crop=(\d+):(\d+):", crop_filter)
+        if crop_match:
+            width, height = int(crop_match.group(1)), int(crop_match.group(2))
+    if not (width and height):
+        return (None, "frame size unknown")
+    if sar is None:
+        return (None, "no pixel shape recorded, so nothing to correct")
+    num, den = sar
+    if num == den:
+        return (None, "pixels are already square")
+    # Nearest even width: 4:2:0 video needs even dimensions.
+    new_width = max(2, round(width * num / den / 2) * 2)
+    # setsar=1 makes the result exactly square; without it, ffmpeg would carry over a
+    # tiny residual ratio from the rounding, which can itself be flagged anamorphic.
+    return (f"scale={new_width}:{height}:flags=lanczos,setsar=1",
+            f"{width}x{height} at pixel shape {num}:{den} -> {new_width}x{height} square "
+            f"(displays as {width * num / den / height:.3f}:1 either way)")
+
+
 def measure_subtitle_bytes(path: Path) -> tuple[int, int] | None:
     """Total size in bytes of all subtitle-stream packets in path, with the number of
     subtitle tracks, or None if it couldn't be measured. Informational only — nothing
@@ -1336,7 +1531,8 @@ def diagnose_encode_one(src: Path, dst: Path, preset: str | None, read_seconds: 
             args.dry_run, args.encoding,
             args.normalize_audio, args.loudnorm_target, args.downscale,
             args.strip_no_english_audio, preset,
-            deinterlace=args.deinterlace, audio_codec=args.audio_codec)
+            deinterlace=args.deinterlace, audio_codec=args.audio_codec, crop=args.crop,
+            square_pixels=args.square_pixels)
     except ConversionError as e:
         logging.error(f"CONVERSION FAILED (preset {preset}): {e.file.resolve()}\n{e.reason}")
         return None
@@ -1422,7 +1618,9 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
                       measured_loudness: dict[str, Any] | None = None,
                       preset: str | None = None,
                       deinterlace_filter: str | None = None,
-                      audio_codec: str = DEFAULT_AUDIO_CODEC) -> list[str]:
+                      audio_codec: str = DEFAULT_AUDIO_CODEC,
+                      crop_filter: str | None = None,
+                      square_filter: str | None = None) -> list[str]:
     cmd: list[str] = ["ffmpeg", "-y", "-i", str(src)]
 
     if duration != -1:
@@ -1447,10 +1645,18 @@ def build_ffmpeg_cmd(src: Path, dst: Path, crf: int, duration: float, needs_down
     # Video filters are one -vf chain, applied in order. Deinterlacing/inverse
     # telecine must come FIRST: both work on field structure, which only survives at
     # the source resolution — scaling first blends the two fields' scanlines together
-    # and destroys the very comb pattern the filters need to see.
+    # and destroys the very comb pattern the filters need to see. Black-bar cropping
+    # comes next, so any downscale works on the picture alone rather than spending
+    # resolution on the bars.
     video_filters: list[str] = []
     if deinterlace_filter:
         video_filters.append(deinterlace_filter)
+    if crop_filter:
+        video_filters.append(crop_filter)
+    # Square pixels after the crop (it resizes the picture that's left) and before any
+    # downscale (which then works on correctly shaped pixels).
+    if square_filter:
+        video_filters.append(square_filter)
     if needs_downscale:
         # Scale down so neither dimension exceeds 1080p, preserving aspect ratio.
         # force_original_aspect_ratio=decrease only shrinks, never upscales.
@@ -1549,7 +1755,9 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                   preset: str | None = None,
                   processed_bytes_so_far: int = 0,
                   deinterlace: str = "off",
-                  audio_codec: str = DEFAULT_AUDIO_CODEC) -> ProcessResult | None:
+                  audio_codec: str = DEFAULT_AUDIO_CODEC,
+                  crop: str = "off",
+                  square_pixels: bool = False) -> ProcessResult | None:
     """Returns (original_size, new_size, video_duration_seconds, action, downscaled,
     grew_larger, retried) on success or dry-run preview, or None only when the caller
     already decided to skip the file entirely before calling this (not used internally
@@ -1711,13 +1919,27 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                 f"re-run this file with --deinterlace auto to check the picture "
                 f"itself: {src}")
 
+    # Black-bar cropping. Like scan-type detection it decodes samples, so it only runs
+    # for files being re-encoded; copy-through files keep their frame untouched.
+    crop_filter: str | None = None
+    if crop == "auto":
+        crop_filter, crop_note = detect_crop(src, video_info)
+        logging.info(f"CROP: {crop_note}: {src}")
+
+    square_filter: str | None = None
+    if square_pixels:
+        square_filter, square_note = resolve_square_pixels(video_info, crop_filter)
+        logging.info(f"PIXELS: {square_note}: {src}")
+
     log_action = "[DRY RUN] WOULD ENCODE" if dry_run else "ENCODING"
     scan_part = ""
     if deinterlace_filter:
         scan_part = (", scan=inverse-telecine" if deinterlace_filter == DETELECINE_FILTER
                      else ", scan=deinterlace")
     logging.info(f"{log_action}: {src} -> {dst} (codec={codec}, {width}x{height}, "
-                 f"downscale={'yes' if needs_downscale else 'no'}{scan_part}, crf={crf}, "
+                 f"downscale={'yes' if needs_downscale else 'no'}{scan_part}, "
+                 f"crop={crop_filter.split('=', 1)[1] if crop_filter else 'no'}, "
+                 f"square_pixels={'yes' if square_filter else 'no'}, crf={crf}, "
                  f"encoding={encoding}, "
                  f"audio={audio_codec} {AUDIO_CODEC_SETTINGS[audio_codec][1]}, "
                  f"normalize_audio={'yes (' + str(loudnorm_target) + ' LUFS)' if normalize_audio else 'no'}, "
@@ -1732,7 +1954,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                                 normalize_audio, loudnorm_target, keep_audio_indices,
                                 video_info["stream_index"],
                                 preset=preset, deinterlace_filter=deinterlace_filter,
-                                audio_codec=audio_codec)
+                                audio_codec=audio_codec, crop_filter=crop_filter,
+                                square_filter=square_filter)
         log_ffmpeg_command(cmd, "[DRY RUN] ")
         if normalize_audio and keep_audio_indices:
             logging.info(f"[DRY RUN] Note: audio will be normalized in two passes "
@@ -1768,7 +1991,8 @@ def process_file(src: Path, dst: Path, crf: int, duration: float, min_size_mb: f
                             video_info["stream_index"],
                             measured_loudness, preset=preset,
                             deinterlace_filter=deinterlace_filter,
-                            audio_codec=audio_codec)
+                            audio_codec=audio_codec, crop_filter=crop_filter,
+                            square_filter=square_filter)
     cmd = add_progress_flags(cmd)
     log_ffmpeg_command(cmd)
     max_attempts = HARDWARE_ENCODE_MAX_ATTEMPTS if encoding == "hardware" else 1
@@ -1884,7 +2108,9 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list[int], du
                         encoding: str, downscale: bool,
                         preset: str | None = None,
                         deinterlace: str = "off",
-                        audio_codec: str = DEFAULT_AUDIO_CODEC) -> tuple[int, list[CrfRow]]:
+                        audio_codec: str = DEFAULT_AUDIO_CODEC,
+                        crop: str = "off",
+                        square_pixels: bool = False) -> tuple[int, list[CrfRow]]:
     """Comparison mode for a single source file: test-encodes src once per CRF value in
     crf_values, all other settings held fixed (audio normalization off, all audio/
     subtitle tracks kept), and prints/logs a size + encode-time table so the effect
@@ -1969,6 +2195,17 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list[int], du
     if deinterlace != "off":
         logging.info(f"SCAN TYPE: {deinterlace_note}: {src}")
         print(f"  Scan type: {deinterlace_note}")
+    # Same for cropping: detected once, applied to every CRF variant alike.
+    crop_filter: str | None = None
+    if crop == "auto":
+        crop_filter, crop_note = detect_crop(src, video_info)
+        logging.info(f"CROP: {crop_note}: {src}")
+        print(f"  Crop: {crop_note}")
+    square_filter: str | None = None
+    if square_pixels:
+        square_filter, square_note = resolve_square_pixels(video_info, crop_filter)
+        logging.info(f"PIXELS: {square_note}: {src}")
+        print(f"  Pixels: {square_note}")
 
     rows: list[CrfRow] = []  # (crf, size_bytes_or_None, elapsed_seconds, error_or_None, skipped)
     for crf in crf_values:
@@ -1984,7 +2221,8 @@ def run_crf_comparison(src: Path, output_folder: Path, crf_values: list[int], du
                                 False, -16, keep_audio_indices,
                                 video_info["stream_index"], None, preset=preset,
                                 deinterlace_filter=deinterlace_filter,
-                                audio_codec=audio_codec)
+                                audio_codec=audio_codec, crop_filter=crop_filter,
+                                square_filter=square_filter)
         cmd = add_progress_flags(cmd)
         log_ffmpeg_command(cmd)
 
@@ -2328,7 +2566,8 @@ def main() -> None:
                 src_size, rows = run_crf_comparison(src, args.output_folder, crf_values,
                                                      args.duration, args.encoding,
                                                      args.downscale, args.preset,
-                                                     args.deinterlace, args.audio_codec)
+                                                     args.deinterlace, args.audio_codec,
+                                                     args.crop, args.square_pixels)
             except ConversionError as e:
                 # As in the main batch loop, a timeout is logged distinctly but skips
                 # the file rather than ending the run.
@@ -2377,6 +2616,8 @@ def main() -> None:
                  f"Strip non-English audio: {'yes' if args.strip_no_english_audio else 'no'} "
                  f"Source: {args.source} "
                  f"Deinterlace: {args.deinterlace} "
+                 f"Crop: {args.crop} "
+                 f"Square pixels: {'yes' if args.square_pixels else 'no'} "
                  f"Audio: {args.audio_codec} {AUDIO_CODEC_SETTINGS[args.audio_codec][1]} stereo")
 
     if args.include is not None or args.exclude is not None:
@@ -2545,7 +2786,8 @@ def main() -> None:
                                    args.dry_run, args.encoding,
                                    args.normalize_audio, args.loudnorm_target, args.downscale,
                                    args.strip_no_english_audio, args.preset,
-                                   processed_bytes, args.deinterlace, args.audio_codec)
+                                   processed_bytes, args.deinterlace, args.audio_codec,
+                                   args.crop, args.square_pixels)
         except ConversionError as e:
             # Timeouts are called out separately in the log (they point at a stuck
             # process rather than a bad encode) but are handled identically: skip the
