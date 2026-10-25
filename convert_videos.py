@@ -482,7 +482,7 @@ def build_parser() -> argparse.ArgumentParser:
                               "screen width. 'auto' samples six points through each file "
                               "and crops only to the largest picture area seen in any of "
                               "them, so a dark scene can't cause picture to be cut, and "
-                              f"only when at least {CROP_MIN_FRACTION:.0%} of the width or "
+                              f"only when at least {CROP_MIN_FRACTION * 100:.0f}%% of the width or "
                               "height is black, so small edge borders are left alone. The "
                               "picture's shape is preserved. Each decision is logged as "
                               "CROP:, and detection also runs under --dry-run, so you can "
