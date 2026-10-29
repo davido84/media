@@ -198,8 +198,18 @@ loose, and consider trying it on a copy of a known ScreenPass disc (e.g.
 John Wick) to confirm the obfuscation heuristic behaves the way you want.
 
 7. Safety/workflow additions on top of the above:
-     - Source files are NEVER deleted or modified: the input tree is only
-       ever read. Everything this script writes goes under --output.
+     - Source files are never modified, and are only deleted when
+       --delete-source is given. Everything this script writes goes under
+       --output. With --delete-source, a source is removed only after it was
+       handled successfully IN THIS RUN: an ISO once every selected title is
+       extracted, verified on disk, and its manifest written; an .mkv/.mp4
+       once its copy is complete and size-verified. A failed, partial or
+       stalled conversion never deletes anything, nor does one whose output
+       the track/duration cross-check flagged as possibly truncated (the ISO
+       may be the only good copy). Discs skipped as already converted are
+       left alone, and folders are never removed even if left empty. A
+       deletion that fails is a warning, not an abort - the output is
+       already safe.
      - Pass-through copies of already-ripped files: a library folder often
        holds a mix of ISOs still to be ripped and video files ripped on
        some earlier occasion. Those files (.mkv and .mp4 - see
@@ -2174,6 +2184,8 @@ class Stats:
     bytes_converted: int = 0
     already_converted_skipped: int = 0
     isos_stalled: int = 0  # abandoned mid-extraction by the stall timeout (non-fatal; batch continued)
+    sources_deleted: int = 0      # --delete-source: source files removed after success
+    bytes_freed: int = 0          # ...and their total size
     files_copied: int = 0      # already-ripped files in the input tree copied through to the output unchanged
     copies_skipped: int = 0    # ...and ones already present in the output, so nothing was copied
     bytes_copied: int = 0      # total bytes of those pass-through copies
@@ -2200,12 +2212,48 @@ class ProcessResult:
     unexpected_error: bool = False    # an unhandled exception was caught around this ISO
     stalled: bool = False             # abandoned because a title extraction stalled (non-fatal; batch continues)
     copied: bool = False              # an already-ripped input file was copied through to the output unchanged
+    would_delete_source: bool = False  # dry-run: --delete-source would remove this source
     # --- dry-run planning fields (populated on every path, consumed only by the dry-run report) ---
     titles_selected: int = 0          # how many titles would be / were extracted
     estimated_output_bytes: int = 0   # sum of selected titles' MakeMKV-reported sizes (output-size estimate)
     needs_attention: bool = False     # a skip the user should resolve before a real run (vs a benign resume skip)
     attention_reason: str | None = None  # short label for the needs-attention report
     jre_missing: bool = False         # this disc needed a JRE that MakeMKV couldn't find (a fixable root cause)
+
+
+def delete_source_file(
+    src_path: Path, args: argparse.Namespace, logger: "DualLogger", stats: "Stats"
+) -> bool:
+    """Remove a source file after it has been successfully converted or
+    copied (--delete-source). Callers only reach this once the output is in
+    place and checked, so this function's job is just to do the deletion
+    safely and visibly.
+
+    In a dry run nothing is touched; the intent is logged instead. A failed
+    deletion is a WARNING, not a fail-fast error: the output is already good,
+    so a source that couldn't be removed (locked by another program, read-only,
+    a permissions problem) costs disk space, not data, and is no reason to
+    abandon the rest of a long batch. Only the file itself is removed - its
+    folder is left alone, even if it ends up empty. Returns True if the file
+    was (or in a dry run, would be) deleted."""
+    if args.dry_run:
+        logger.info("[DRY RUN] Would delete source file (--delete-source)", src_path)
+        return True
+    try:
+        size = src_path.stat().st_size
+        src_path.unlink()
+    except OSError as e:
+        logger.warning(
+            f"Converted successfully, but could not delete the source file: {e}. "
+            f"It has been left in place.",
+            src_path,
+        )
+        stats.warnings += 1
+        return False
+    logger.info(f"Deleted source file ({human_bytes(size)} freed)", src_path)
+    stats.sources_deleted += 1
+    stats.bytes_freed += size
+    return True
 
 
 def copy_passthrough_file(
@@ -2264,7 +2312,11 @@ def copy_passthrough_file(
 
     if args.dry_run:
         logger.info(f"[DRY RUN] Would copy as-is -> {dest} ({human_bytes(src_size)})", src_path)
-        return ProcessResult(copied=True, estimated_output_bytes=src_size)
+        if args.delete_source:
+            delete_source_file(src_path, args, logger, stats)  # dry run: logs only
+        return ProcessResult(
+            copied=True, estimated_output_bytes=src_size, would_delete_source=args.delete_source
+        )
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     space_error = check_free_space(dest.parent, output_root, src_size, args.free_space_margin_pct)
@@ -2293,6 +2345,10 @@ def copy_passthrough_file(
 
     stats.files_copied += 1
     stats.bytes_copied += src_size
+    # The copy is complete and its size verified against the source (above),
+    # so the source can go if --delete-source asked for it.
+    if args.delete_source:
+        delete_source_file(src_path, args, logger, stats)
     return ProcessResult(copied=True, estimated_output_bytes=src_size)
 
 
@@ -2805,6 +2861,7 @@ def process_iso(
     all_ok = True
     stop_reason: str | None = None  # set when all_ok is False for a reason other than a title outright failing
     stalled_out: bool = False  # a stall timeout abandoned this ISO - non-fatal, the batch continues
+    crosscheck_flagged: bool = False  # a title's output looked truncated/odd - never delete the source then
     output_filenames: list[str] = []  # populated on success, written into the manifest below
     iso_size_bytes = iso_path.stat().st_size
     total_extracted_bytes = 0  # running total across titles - see size failsafe below
@@ -3122,6 +3179,7 @@ def process_iso(
                         iso_path,
                     )
                     stats.warnings += 1
+                    crosscheck_flagged = True
 
         # --- Runaway-output failsafe ---
         # The combined size of everything extracted from this ISO shouldn't
@@ -3179,13 +3237,34 @@ def process_iso(
         write_manifest(out_dir, iso_path, candidates, output_filenames, args, logger, stats)
 
         # Stamp each output .mkv with the source ISO's file date, over the
-        # final, named output files - not the manifest.
+        # final, named output files - not the manifest. Done before any
+        # source deletion below, since it reads the source's timestamps.
         stamp_outputs_with_source_date(iso_path, out_dir, output_filenames, logger, stats)
+
+    # --- Optional source deletion ---
+    # Reaching here means every selected title was extracted, its output was
+    # confirmed on disk at a real size, and the manifest is written. The one
+    # extra condition: if the track/duration cross-check flagged a title as
+    # possibly truncated, the ISO may be the only good copy of that content,
+    # so it stays regardless of --delete-source.
+    would_delete = False
+    if args.delete_source:
+        if crosscheck_flagged:
+            logger.warning(
+                "Not deleting the source ISO despite --delete-source: the post-extraction "
+                "cross-check flagged an output as possibly truncated (see above). Check it, "
+                "then delete the ISO manually if the output is fine.",
+                iso_path,
+            )
+            stats.warnings += 1
+        else:
+            would_delete = delete_source_file(iso_path, args, logger, stats)
 
     return ProcessResult(
         converted=True,
         titles_selected=len(candidates),
         estimated_output_bytes=sum(titles[t].size_bytes for t in candidates),
+        would_delete_source=would_delete and args.dry_run,
     )
 
 
@@ -3329,6 +3408,16 @@ def parse_args() -> argparse.Namespace:
              "similar duration/size, so distinct TV episodes that share a runtime and size are "
              "never merged; titles without a reported segment map are always kept. Disable this to "
              "extract every qualifying title regardless. Ignored under --main-playlist. On by default",
+    )
+    p.add_argument(
+        "--delete-source", action="store_true",
+        help="Delete each source file once it has been handled successfully: an ISO after every "
+             "selected title has been extracted and verified (and its resume manifest written), "
+             "an .mkv/.mp4 after it has been copied and its size verified. Never deletes a source "
+             "whose conversion failed, stalled or was only partly done, nor one whose output the "
+             "track/duration cross-check flagged as possibly truncated. Only files converted or "
+             "copied in THIS run are deleted; ones skipped as already done are left alone. Off by "
+             "default; in --dry-run it only reports what it would delete",
     )
     p.add_argument(
         "--no-fast-resume", dest="fast_resume", action="store_false", default=True,
@@ -3610,6 +3699,8 @@ def main() -> int:
     dry_output_bytes: int = 0
     dry_convert_input_bytes: int = 0
     dry_resume_skips: int = 0
+    dry_delete_count: int = 0
+    dry_delete_bytes: int = 0
     dry_attention: list[tuple[Path, str, bool]] = []  # (iso_path, reason, jre_missing)
 
     try:
@@ -3690,6 +3781,9 @@ def main() -> int:
             # Gather the dry-run pre-flight plan as we go (see the plan
             # printed after the loop). Cheap, and only reported in dry-run.
             if args.dry_run:
+                if result.would_delete_source:
+                    dry_delete_count += 1
+                    dry_delete_bytes += iso_size
                 if result.converted:
                     dry_convert_count += 1
                     dry_titles_total += result.titles_selected
@@ -3754,6 +3848,13 @@ def main() -> int:
                     f"  ({jre_n} of these needed a JRE MakeMKV couldn't find - install a JRE or "
                     f"set app_Java in MakeMKV's settings.conf)"
                 )
+        if args.delete_source:
+            summary_lines.append("")
+            summary_lines.append("-- Source deletion (--delete-source) --")
+            summary_lines.append(
+                f"  Would delete {dry_delete_count} source file(s), freeing "
+                f"~{human_bytes(dry_delete_bytes)}, once each converts/copies successfully"
+            )
         summary_lines.append("")
         summary_lines.append("Nothing was changed (dry run).")
         summary_lines.append("======================================================")
@@ -3770,8 +3871,13 @@ def main() -> int:
             f"Files copied as-is           : {stats.files_copied} "
             f"({human_bytes(stats.bytes_copied)}), {stats.copies_skipped} already present",
             f"Total ISO bytes converted    : {human_bytes(stats.bytes_converted)}",
-            "==================================================",
         ]
+        if args.delete_source:
+            summary_lines.append(
+                f"Source files deleted         : {stats.sources_deleted} "
+                f"({human_bytes(stats.bytes_freed)} freed)"
+            )
+        summary_lines.append("==================================================")
     for line in summary_lines:
         print(line)
         logger.append_raw_to_file(line)
