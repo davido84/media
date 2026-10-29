@@ -64,7 +64,7 @@ IMPORTANT ASSUMPTIONS / CAVEATS (please read before relying on this in prod)
         signature of ScreenPass/UOPs discs presenting many decoy
         playlists. Rather than exact round-to-second bucketing, titles are
         clustered with a sliding tolerance window
-        (--obfuscation-tolerance-sec, default 2s), because decoys are
+        (OBFUSCATION_TOLERANCE_SEC, default 2s), because decoys are
         frequently only *similar* in length, not frame-identical, and
         exact rounding would split one logical cluster across adjacent
         buckets and undercount it. The threshold defaults to 30 titles
@@ -87,7 +87,7 @@ IMPORTANT ASSUMPTIONS / CAVEATS (please read before relying on this in prod)
         finalized (post play-all removal and duplicate dedup) and applied to
         every automatic path (not just the duration-cluster one). If the
         selected titles' combined estimated size exceeds the source ISO's
-        own size by more than a large factor (--obfuscation-max-size-ratio,
+        own size by more than a large factor (OBFUSCATION_MAX_SIZE_RATIO,
         default 3x), that many distinct titles physically cannot fit on the
         disc, so they must be decoy playlists over the same content. This is
         what catches discs (e.g. "You're Next") that deliberately spread
@@ -142,9 +142,9 @@ IMPORTANT ASSUMPTIONS / CAVEATS (please read before relying on this in prod)
    8.5 GB (decimal). Any real Blu-ray rip is essentially always well
    above that (BD25 = 25 GB, BD50 = 50 GB, UHD BD66/100 larger still), so
    "ISO size > threshold" is a cheap and normally very reliable stand-in
-   for "this is a Blu-ray". Tune with --dvd-max-size-gb (default 8.5,
-   decimal GB i.e. size * 10**9 bytes, matching how disc capacities are
-   marketed) if your library has unusual outliers, or force it with
+   for "this is a Blu-ray". The threshold is DVD_MAX_SIZE_GB (8.5
+   decimal GB, i.e. size * 10**9 bytes, matching how disc capacities are
+   marketed); for unusual outliers, force the type with
    --disc-type={dvd,bluray} to skip the heuristic entirely for a run.
    Known edge case: a manually re-authored/trimmed "backup" ISO that's
    smaller than a full Blu-ray but still a Blu-ray filesystem would be
@@ -181,11 +181,11 @@ IMPORTANT ASSUMPTIONS / CAVEATS (please read before relying on this in prod)
    play-all hypothesis (a real play-all title is, by construction, longer
    than any individual episode, so only one hypothesis needs testing).
    The OTHER candidates are first clustered by similarity to their own
-   median duration (--playall-cluster-tolerance-pct, default 30%), so a
+   median duration (PLAYALL_CLUSTER_TOLERANCE_PCT, default 30%), so a
    bonus featurette or trailer that also clears --min-length doesn't
    throw off the comparison - only the similarly-sized "episode" cluster
    is summed. If that sum is within tolerance of the longest title's
-   duration (--playall-tolerance-sec, default 30s, plus 2s/episode extra
+   duration (PLAYALL_TOLERANCE_SEC, default 30s, plus 2s/episode extra
    slack for rounding), the longest title is treated as Play All and
    discarded; everything else - the episodes AND any bonus content
    outside the cluster - is kept for extraction as normal. This is always
@@ -226,15 +226,14 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        already exists at the same size is skipped, so re-runs are cheap.
        Copied bytes draw on the --limit budget like converted ones, and
        --include/--exclude filter them exactly as they filter ISOs.
-     - makemkvcon read cache: --cache-mb (default 1024, matching MakeMKV's
+     - makemkvcon read cache: MAKEMKV_CACHE_MB (default 1024, matching MakeMKV's
        own Blu-ray recommendation) sets the --cache size handed to
        makemkvcon. This script used to hardcode --cache=1 - a ONE megabyte
        cache, three orders of magnitude under the recommended value and
        almost certainly a misreading of the option as a boolean. That
        survived on makemkvcon 1.18.4 but crashes 2.0.0 outright with an
        access violation on some discs, and it also forced needless seeking
-       when reading ISOs from spinning disks. Pass --cache-mb 0 to omit
-       the option entirely.
+       when reading ISOs from spinning disks.
      - A makemkvcon crash is reported as such: Windows signals a crashed
        process through an unhandled-exception exit code (e.g. 3221225477 =
        0xC0000005, an access violation) rather than a small error code, so
@@ -266,9 +265,9 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        can trail the writer closing a file, in which case the output is
        merely late, not missing, and nothing needs redoing); only if nothing
        ever arrives is the title extracted again from scratch, up to
-       --title-retries times with --retry-delay-sec between attempts.
+       TITLE_RETRIES times with TITLE_RETRY_DELAY_SEC between attempts.
      - A non-zero makemkvcon exit is also retried, on its own smaller
-       budget (--error-retries, default 1, after --error-retry-delay-sec).
+       budget (ERROR_RETRIES, default 1, after ERROR_RETRY_DELAY_SEC).
        Some of those failures are transient - a momentary read error, or
        makemkvcon crashing outright, which surfaces as a non-zero Windows
        status rather than a clean error code - so one more attempt is worth
@@ -276,8 +275,8 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        The two budgets are counted separately so a disc that errors can't
        consume the allowance meant for the silent-no-output case.
      - Hang detection uses TWO watchdogs, because there are two hangs.
-       --stall-timeout-min (default 15) fires when makemkvcon moves no bytes
-       of any kind: wedged solid. --no-output-timeout-min (default 30) fires
+       STALL_TIMEOUT_MIN (default 15) fires when makemkvcon moves no bytes
+       of any kind: wedged solid. NO_OUTPUT_TIMEOUT_MIN (default 30) fires
        when it is still doing I/O but has WRITTEN nothing - the damaged-disc
        case, where makemkvcon retries unreadable sectors indefinitely so its
        READ count keeps climbing and the first watchdog never fires, while no
@@ -286,7 +285,7 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        writes continuously once saving begins, and any genuine progress
        advance resets both clocks, so the window only has to outlast the
        analysis phase. Either way the ISO is abandoned non-fatally and the
-       batch continues. Set either to 0 to disable it.
+       batch continues.
      - A STALL is still never retried: makemkvcon hanging is a different
        problem from it failing or producing nothing, and re-reading a disc
        that already wedged once mostly costs hours. That path stays
@@ -308,7 +307,7 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        run still exits nonzero.
      - Free space on the output volume is checked before each title
        extraction (using MakeMKV's own reported title size plus
-       --free-space-margin-pct headroom), so a nearly-full output drive
+       FREE_SPACE_MARGIN_PCT headroom), so a nearly-full output drive
        fails fast on one title instead of partway through a multi-hour
        extraction.
      - Resume support: after a fully successful conversion, a small
@@ -388,7 +387,7 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        extracted from an ISO so far is checked after each title. If it
        grossly exceeds the expected size - the larger of the summed
        per-title MakeMKV estimates and the ISO's own size, plus a margin
-       (--runaway-output-margin-pct, default 20%) - extraction of that ISO
+       (RUNAWAY_OUTPUT_MARGIN_PCT, default 20%) - extraction of that ISO
        stops immediately and a warning is logged. The margin matters:
        honest MKV output runs a
        little larger than the raw stream bytes (container overhead plus
@@ -413,7 +412,7 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        etc.), so the output legitimately holds a subset of the disc's
        streams - only an output with MORE tracks than the disc reports,
        or with ZERO audio when the disc had audio, is flagged. Tune the
-       duration slack with --duration-tolerance-sec (default 15s);
+       duration slack with DURATION_TOLERANCE_SEC (default 15s);
        disable the whole cross-check with --no-verify-tracks.
      - Non-zero process exit status: the script exits 1 the moment any
        real error is logged (see "Fail-fast" above - a title that failed
@@ -442,9 +441,9 @@ John Wick) to confirm the obfuscation heuristic behaves the way you want.
        kernel's byte counters tick up in real time as makemkvcon actually
        moves data, regardless of output filesystem. If the process moves no
        bytes AND makemkvcon's percentage doesn't advance for
-       --stall-timeout-min minutes (default 15), makemkvcon is terminated
+       STALL_TIMEOUT_MIN minutes (default 15), makemkvcon is terminated
        (reporting how much was written and how long it ran, to tell a real
-       stall from a slow disc). Set 0 to disable. It's a stall detector,
+       stall from a slow disc). It's a stall detector,
        not a wall-clock limit, so a slow-but-progressing large title is
        never killed.
        A stall is the one ERROR that does NOT abort the run: a single hung
@@ -547,7 +546,7 @@ FPL_SUBSTRING: str = "FPL_MainFeature"
 # that never needed Java in the first place.
 JRE_MISSING_MARKER: str = "This disc requires Java runtime (JRE), but none was found"
 
-DVD_MAX_SIZE_GB_DEFAULT: float = 8.5  # decimal GB (10**9 bytes), matching how DVD-9 capacity is marketed
+DVD_MAX_SIZE_GB: float = 8.5  # decimal GB (10**9 bytes), matching how DVD-9 capacity is marketed
 DISC_TYPE_DVD: str = "DVD"
 DISC_TYPE_BLURAY: str = "BLURAY"
 
@@ -559,7 +558,7 @@ DISC_TYPE_BLURAY: str = "BLURAY"
 # failsafe only wants to catch GROSS overruns (a looping/duplicate
 # extraction, typically tens of percent to multiples over), so it allows this
 # much headroom above the expected size before tripping.
-RUNAWAY_OUTPUT_MARGIN_PCT_DEFAULT: float = 20.0
+RUNAWAY_OUTPUT_MARGIN_PCT: float = 20.0
 
 # Size-based playlist-obfuscation signal (see detect_size_obfuscation). A
 # small disc that reports many large titles whose estimated sizes sum to far
@@ -574,14 +573,14 @@ RUNAWAY_OUTPUT_MARGIN_PCT_DEFAULT: float = 20.0
 # many times the ISO size (distinct real titles - movie+extras, TV episodes,
 # even multi-angle - sum to about the disc size, i.e. a ratio near 1).
 OBFUSCATION_SIZE_MIN_TITLES: int = 8
-OBFUSCATION_MAX_SIZE_RATIO_DEFAULT: float = 3.0
+OBFUSCATION_MAX_SIZE_RATIO: float = 3.0
 
 # Default stall timeout: if a title extraction makes no forward progress
 # (makemkvcon's overall percentage doesn't advance) for this many minutes,
 # it's treated as hung and aborted. A *stall* rather than a wall-clock limit
 # so a legitimately large, slow-but-progressing title isn't killed - only a
-# genuinely stuck one. 0 disables it (see --stall-timeout-min).
-STALL_TIMEOUT_MIN_DEFAULT: float = 15.0
+# genuinely stuck one.
+STALL_TIMEOUT_MIN: float = 15.0
 
 # How often the stall watchdog wakes to sample makemkvcon's process I/O
 # counters. Small relative to the (minutes-long) stall timeout so a stall is
@@ -607,9 +606,9 @@ OUTPUT_RECHECK_ATTEMPTS: int = 6
 OUTPUT_RECHECK_DELAY_SEC: float = 5.0
 
 # If the output still never appears, the title is extracted again from
-# scratch (see --title-retries / --retry-delay-sec).
-TITLE_RETRIES_DEFAULT: int = 2
-TITLE_RETRY_DELAY_SEC_DEFAULT: float = 30.0
+# scratch (see TITLE_RETRIES / TITLE_RETRY_DELAY_SEC).
+TITLE_RETRIES: int = 2
+TITLE_RETRY_DELAY_SEC: float = 30.0
 
 # A non-zero makemkvcon exit is a different failure from "exit 0 but nothing
 # written", so it gets its own, smaller budget: one more attempt after a short
@@ -622,10 +621,10 @@ TITLE_RETRY_DELAY_SEC_DEFAULT: float = 30.0
 # unreadable sectors on a damaged disc and will never finish. Kept well above
 # the all-I/O stall window because this one has to outlast any legitimate
 # analysis or slow-but-recovering read phase.
-NO_OUTPUT_TIMEOUT_MIN_DEFAULT: float = 30.0
+NO_OUTPUT_TIMEOUT_MIN: float = 30.0
 
-ERROR_RETRIES_DEFAULT: int = 1
-ERROR_RETRY_DELAY_SEC_DEFAULT: float = 15.0
+ERROR_RETRIES: int = 1
+ERROR_RETRY_DELAY_SEC: float = 15.0
 
 # Per-output-folder manifest written on a successful conversion, used by
 # resume support (workflow enhancement 4) instead of a plain .mkv file
@@ -633,6 +632,16 @@ ERROR_RETRY_DELAY_SEC_DEFAULT: float = 15.0
 # for why a count alone can't tell "same titles, already done" apart from "a
 # different run left a coincidentally-equal number of files here".
 MANIFEST_FILENAME: str = ".iso_to_mkv_manifest.json"
+
+# Fixed tuning values (formerly command-line options, kept at their old
+# defaults). Several of these also feed selection_fingerprint(), so changing
+# one here invalidates every existing resume manifest and re-converts the
+# library - change them deliberately, if ever.
+OBFUSCATION_TOLERANCE_SEC: float = 2.0      # duration window for grouping decoy playlists
+PLAYALL_TOLERANCE_SEC: float = 30.0         # longest title vs summed episodes, for "Play All"
+PLAYALL_CLUSTER_TOLERANCE_PCT: float = 30.0  # how far an episode may sit from the median length
+FREE_SPACE_MARGIN_PCT: float = 10.0         # headroom required above a title's estimated size
+DURATION_TOLERANCE_SEC: float = 15.0        # how much shorter than expected an output may be
 
 # Already-ripped video files that may be sitting in the input tree alongside
 # the ISOs. There's nothing to extract from these, so they're copied through
@@ -650,8 +659,7 @@ PASSTHROUGH_SUFFIXES: frozenset[str] = frozenset({".mkv", ".mp4"})
 # worked by luck on makemkvcon 1.18.4 but crashes 2.0.0 with an access
 # violation (exit code 0xC0000005) on some discs, and a 1 MB read cache also
 # forces far more seeking than necessary when reading ISOs off spinning disks.
-# Override with --cache-mb; 0 omits the option and uses makemkvcon's default.
-MAKEMKV_CACHE_MB_DEFAULT: int = 1024
+MAKEMKV_CACHE_MB: int = 1024
 
 # Tolerance (seconds) for comparing a stored source-ISO mtime against a
 # freshly stat'd one during the resume check. Exact float equality is too
@@ -928,13 +936,13 @@ def selection_fingerprint(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "min_length": args.min_length,
         "obfuscation_threshold": args.obfuscation_threshold,
-        "obfuscation_tolerance_sec": args.obfuscation_tolerance_sec,
+        "obfuscation_tolerance_sec": OBFUSCATION_TOLERANCE_SEC,
         "main_playlist": args.main_playlist,
-        "dvd_max_size_gb": args.dvd_max_size_gb,
+        "dvd_max_size_gb": DVD_MAX_SIZE_GB,
         "disc_type": args.disc_type,
         "detect_playall": args.detect_playall,
-        "playall_tolerance_sec": args.playall_tolerance_sec,
-        "playall_cluster_tolerance_pct": args.playall_cluster_tolerance_pct,
+        "playall_tolerance_sec": PLAYALL_TOLERANCE_SEC,
+        "playall_cluster_tolerance_pct": PLAYALL_CLUSTER_TOLERANCE_PCT,
         "dedupe_duplicate_titles": args.dedupe_duplicate_titles,
     }
 
@@ -1469,12 +1477,10 @@ def makemkvcon_cmd(args: argparse.Namespace, *tail: str) -> list[str]:
     """Build a makemkvcon64.exe command line with the run's shared options.
 
     Centralizes the executable, robot mode (-r) and the read-cache size so the
-    info scan and the per-title extraction can't drift apart. --cache is
-    omitted entirely when --cache-mb is 0, letting makemkvcon pick its own
-    default (see MAKEMKV_CACHE_MB_DEFAULT for why the size matters)."""
+    info scan and the per-title extraction can't drift apart (see
+    MAKEMKV_CACHE_MB for why the cache size matters)."""
     cmd = ["makemkvcon64.exe", "-r"]
-    if args.cache_mb and args.cache_mb > 0:
-        cmd.append(f"--cache={args.cache_mb}")
+    cmd.append(f"--cache={MAKEMKV_CACHE_MB}")
     cmd.extend(tail)
     return cmd
 
@@ -2003,7 +2009,7 @@ def detect_playall_title(
     --min-length sitting alongside the episodes - a very normal thing to
     find on a real TV season disc), the other candidates are first
     clustered by similarity to their own median duration
-    (--playall-cluster-tolerance-pct). Only that similarly-sized cluster
+    (PLAYALL_CLUSTER_TOLERANCE_PCT). Only that similarly-sized cluster
     (the presumed episodes) is summed and compared to the play-all
     candidate; anything outside the cluster (bonus content) is left alone
     and stays a normal extraction candidate either way.
@@ -2033,7 +2039,7 @@ def detect_playall_title(
 
     cluster_sum = sum(titles[tid].duration_sec for tid in cluster)
     # Allow a little extra slack per episode for frame/GOP rounding, on top
-    # of the flat --playall-tolerance-sec floor.
+    # of the flat PLAYALL_TOLERANCE_SEC floor.
     effective_tolerance = max(tolerance_sec, 2.0 * len(cluster))
 
     if abs(longest_duration - cluster_sum) <= effective_tolerance:
@@ -2286,7 +2292,7 @@ def copy_passthrough_file(
         renamed into place once it's complete and its size matches the source,
         so an interrupted run can't leave a half file that later looks done.
       - The source file's timestamps are preserved (shutil.copy2).
-      - Free space is checked first, with the same --free-space-margin-pct.
+      - Free space is checked first, with the same FREE_SPACE_MARGIN_PCT.
       - The source is only ever read, never modified or removed.
     """
     rel = src_path.relative_to(input_root)
@@ -2319,7 +2325,7 @@ def copy_passthrough_file(
         )
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    space_error = check_free_space(dest.parent, output_root, src_size, args.free_space_margin_pct)
+    space_error = check_free_space(dest.parent, output_root, src_size, FREE_SPACE_MARGIN_PCT)
     if space_error:
         logger.error(f"Cannot copy this {src_path.suffix} file: {space_error}", src_path)  # fail-fast
 
@@ -2494,7 +2500,7 @@ def process_iso(
             return ProcessResult(skipped_already_done=True)
 
     disc_type_override = None if args.disc_type == "auto" else args.disc_type
-    disc_type = classify_disc(iso_path, args.dvd_max_size_gb * 1_000_000_000, disc_type_override)
+    disc_type = classify_disc(iso_path, DVD_MAX_SIZE_GB * 1_000_000_000, disc_type_override)
     # file_only: useful when diagnosing a disc-type misclassification after the
     # fact, but not worth a console line for every ISO in a long batch.
     logger.file_only(
@@ -2576,7 +2582,7 @@ def process_iso(
             tid for tid, t in titles.items()
             if tid != main_tid
             and t.duration_sec >= min_length_sec
-            and (main_duration - t.duration_sec) > args.obfuscation_tolerance_sec
+            and (main_duration - t.duration_sec) > OBFUSCATION_TOLERANCE_SEC
         )
         candidates = [main_tid] + extras
         fpl_identified_main_tid = main_tid  # human-verified pick -> named main_title.mkv
@@ -2607,7 +2613,7 @@ def process_iso(
             stats.warnings += 1
 
         suspected, dup_duration, dup_count = detect_obfuscation(
-            titles, args.obfuscation_threshold, args.obfuscation_tolerance_sec
+            titles, args.obfuscation_threshold, OBFUSCATION_TOLERANCE_SEC
         )
 
         # --- Signal 1 (preferred): MakeMKV's own JRE/BD-Java main-feature marker ---
@@ -2710,7 +2716,7 @@ def process_iso(
     # discard the very title the user selected.
     if args.detect_playall and not args.main_playlist:
         result = detect_playall_title(
-            candidates, titles, args.playall_tolerance_sec, args.playall_cluster_tolerance_pct
+            candidates, titles, PLAYALL_TOLERANCE_SEC, PLAYALL_CLUSTER_TOLERANCE_PCT
         )
         if result is not None:
             playall_tid, episode_ids = result
@@ -2793,7 +2799,7 @@ def process_iso(
     if not args.main_playlist:
         size_obfuscated, est_total, ratio = detect_size_obfuscation(
             candidates, titles, iso_path.stat().st_size,
-            OBFUSCATION_SIZE_MIN_TITLES, args.obfuscation_max_size_ratio,
+            OBFUSCATION_SIZE_MIN_TITLES, OBFUSCATION_MAX_SIZE_RATIO,
         )
         if size_obfuscated:
             return obfuscation_stop(
@@ -2875,19 +2881,11 @@ def process_iso(
     # ISO-size bound and can never make the check stricter.
     estimated_total_bytes = sum(titles[t].size_bytes for t in candidates)
     runaway_output_limit = max(iso_size_bytes, estimated_total_bytes) * (
-        1 + args.runaway_output_margin_pct / 100.0
+        1 + RUNAWAY_OUTPUT_MARGIN_PCT / 100.0
     )
     # Convert the stall timeout to seconds once; None disables the watchdog.
-    stall_timeout_sec = (
-        args.stall_timeout_min * 60.0
-        if args.stall_timeout_min and args.stall_timeout_min > 0
-        else None
-    )
-    no_output_timeout_sec = (
-        args.no_output_timeout_min * 60.0
-        if args.no_output_timeout_min and args.no_output_timeout_min > 0
-        else None
-    )
+    stall_timeout_sec = STALL_TIMEOUT_MIN * 60.0
+    no_output_timeout_sec = NO_OUTPUT_TIMEOUT_MIN * 60.0
     for tid in sorted(candidates):
         title = titles[tid]
         logger.info(
@@ -2915,7 +2913,7 @@ def process_iso(
         # own reported size for that title) is used as the required-space
         # estimate.
         required_bytes = title.size_bytes if title.size_bytes > 0 else iso_path.stat().st_size
-        space_error = check_free_space(out_dir, output_root, required_bytes, args.free_space_margin_pct)
+        space_error = check_free_space(out_dir, output_root, required_bytes, FREE_SPACE_MARGIN_PCT)
         if space_error:
             logger.error(f"Title {tid}: {space_error} - stopping this ISO", iso_path)
             stats.conversions_error += 1
@@ -2940,8 +2938,8 @@ def process_iso(
         qualifying_new_mkvs: list[str] = []
         after_snapshot: dict[str, int] = {}
         mkv_output = ""
-        error_retries_left = max(0, args.error_retries)
-        nooutput_retries_left = max(0, args.title_retries)
+        error_retries_left = ERROR_RETRIES
+        nooutput_retries_left = TITLE_RETRIES
         attempt = 0
 
         while True:
@@ -2977,9 +2975,7 @@ def process_iso(
                     f"Title {tid} extraction hung - makemkvcon {stalled}, so it was terminated "
                     f"(it wrote {human_bytes(written)} in {format_duration(elapsed)} before "
                     f"hanging). The disc is likely damaged, or makemkvcon is stuck; investigate "
-                    f"this title. Tune --stall-timeout-min / --no-output-timeout-min if it was "
-                    f"just genuinely slow. Skipping the rest of this ISO and continuing with the "
-                    f"next one.",
+                    f"this title. Skipping the rest of this ISO and continuing with the next one.",
                     iso_path,
                 )
                 stats.conversions_error += 1
@@ -3004,11 +3000,11 @@ def process_iso(
                     logger.warning(
                         f"Title {tid}: makemkvcon failed ({describe_exit_code(rc)})"
                         f"{crash_advice(rc, mkv_output)} Retrying in "
-                        f"{args.error_retry_delay_sec:g}s",
+                        f"{ERROR_RETRY_DELAY_SEC:g}s",
                         iso_path,
                     )
                     stats.warnings += 1
-                    time.sleep(args.error_retry_delay_sec)
+                    time.sleep(ERROR_RETRY_DELAY_SEC)
                     continue
                 logger.error(
                     f"makemkvcon failed for title {tid} ({describe_exit_code(rc)})"
@@ -3038,18 +3034,17 @@ def process_iso(
                 logger.warning(
                     f"Title {tid}: makemkvcon reported success but produced no .mkv file of "
                     f"meaningful size in {out_dir}. This is usually transient, so the title "
-                    f"will be extracted again in {args.retry_delay_sec:g}s",
+                    f"will be extracted again in {TITLE_RETRY_DELAY_SEC:g}s",
                     iso_path,
                 )
                 stats.warnings += 1
-                time.sleep(args.retry_delay_sec)
+                time.sleep(TITLE_RETRY_DELAY_SEC)
                 continue
 
             logger.error(
                 f"makemkvcon reported success for title {tid} but no new/updated .mkv file of "
                 f"meaningful size was found in {out_dir}, across {attempt} attempt(s) - "
-                f"treating as a failure. Raise --title-retries if this disc just needs more "
-                f"patience",
+                f"treating as a failure",
                 iso_path,
             )
             stats.conversions_error += 1
@@ -3165,7 +3160,7 @@ def process_iso(
                 # (e.g. TV episode playlists routinely ~10s longer) without
                 # ever indicating missing content.
                 shortfall = title.duration_sec - out_duration
-                if shortfall > args.duration_tolerance_sec:
+                if shortfall > DURATION_TOLERANCE_SEC:
                     mismatches.append(
                         f"duration: expected {format_duration(title.duration_sec)}, "
                         f"found {format_duration(out_duration)} "
@@ -3185,7 +3180,7 @@ def process_iso(
         # The combined size of everything extracted from this ISO shouldn't
         # grossly exceed what these titles are expected to produce. "Expected"
         # is max(sum of MakeMKV's per-title estimates, the ISO's own size),
-        # plus a margin (--runaway-output-margin-pct) for the container
+        # plus a margin (RUNAWAY_OUTPUT_MARGIN_PCT) for the container
         # overhead and estimate slack that make honest MKV output run a little
         # larger than the raw stream bytes - without that headroom, a disc
         # whose titles nearly fill it can tip a fraction of a percent over and
@@ -3203,7 +3198,7 @@ def process_iso(
             stop_reason = (
                 f"extracted output so far ({human_bytes(total_extracted_bytes)}) exceeds the "
                 f"expected size ({human_bytes(expected_base)}) by more than the "
-                f"{args.runaway_output_margin_pct:g}% runaway margin "
+                f"{RUNAWAY_OUTPUT_MARGIN_PCT:g}% runaway margin "
                 f"(limit {human_bytes(runaway_output_limit)})"
             )
             logger.warning(
@@ -3347,24 +3342,6 @@ def parse_args() -> argparse.Namespace:
              "dozens-scale obfuscation",
     )
     p.add_argument(
-        "--obfuscation-tolerance-sec", type=float, default=2.0, metavar="SECONDS",
-        help="Width of the duration window within which titles are treated as sharing a duration "
-             "for obfuscation detection. Decoy playlists are often only *similar* in length, not "
-             "frame-identical; this groups them instead of splitting near-equal durations across "
-             "buckets. 0 requires (near-)exact duration matches",
-    )
-    p.add_argument(
-        "--obfuscation-max-size-ratio", type=float, default=OBFUSCATION_MAX_SIZE_RATIO_DEFAULT, metavar="X",
-        help=f"Second, size-based obfuscation signal (catches decoys whose durations are spread out "
-             f"to dodge the duration-cluster check). If the selected titles' combined estimated size "
-             f"exceeds the source ISO's size by more than this factor - impossible for that many "
-             f"distinct titles, so a sign of decoy playlists over the same content - the disc is "
-             f"flagged as obfuscated and not converted (errors out in a real run, noted in dry-run). "
-             f"Only applies once there are at least {OBFUSCATION_SIZE_MIN_TITLES} candidate titles, "
-             f"so a few genuinely overlapping alternate cuts won't trip it. Default "
-             f"{OBFUSCATION_MAX_SIZE_RATIO_DEFAULT:g}",
-    )
-    p.add_argument(
         "--main-playlist", default=None, metavar="MPLS",
         help="Manually force the main title by its source playlist filename (e.g. '00610.mpls' "
              "or just '00610'), for a one-off conversion of a disc whose obfuscation MakeMKV "
@@ -3377,10 +3354,6 @@ def parse_args() -> argparse.Namespace:
              "otherwise the script aborts before processing anything",
     )
     p.add_argument(
-        "--dvd-max-size-gb", type=float, default=DVD_MAX_SIZE_GB_DEFAULT, metavar="GB",
-        help="ISOs at or below this size (decimal GB) are classified as DVD; larger ones as Blu-ray",
-    )
-    p.add_argument(
         "-t", "--disc-type", choices=["auto", "dvd", "bluray"], default="auto",
         help="Force disc-type classification for this run instead of using the size heuristic",
     )
@@ -3388,16 +3361,6 @@ def parse_args() -> argparse.Namespace:
         "--no-detect-playall", dest="detect_playall", action="store_false", default=True,
         help="Disable detection of a 'Play All' concatenation title (common on TV-show DVDs); "
              "on by default",
-    )
-    p.add_argument(
-        "--playall-tolerance-sec", type=float, default=30.0, metavar="SECONDS",
-        help="Base tolerance (in seconds) between the longest title's duration and the summed "
-             "duration of the episode-like cluster of other titles, to call it a 'Play All' title",
-    )
-    p.add_argument(
-        "--playall-cluster-tolerance-pct", type=float, default=30.0, metavar="PCT",
-        help="How far (as a %% of the median) another title's duration may be from its peers "
-             "to still be grouped into the 'episode' cluster for Play All detection",
     )
     p.add_argument(
         "--no-dedupe-duplicate-titles", dest="dedupe_duplicate_titles", action="store_false", default=True,
@@ -3435,88 +3398,10 @@ def parse_args() -> argparse.Namespace:
              "(default: skip it)",
     )
     p.add_argument(
-        "--cache-mb", type=int, default=MAKEMKV_CACHE_MB_DEFAULT, metavar="MB",
-        help="Read-cache size (megabytes) passed to makemkvcon as --cache. MakeMKV's own "
-             "documentation recommends ~128 for streaming/backup, 512 for DVD and 1024 for "
-             f"Blu-ray, so the default is {MAKEMKV_CACHE_MB_DEFAULT}. This script previously "
-             "hardcoded --cache=1 (a 1 MB cache), which is far below every recommended value; "
-             "makemkvcon 2.0.0 crashes outright (access violation) on some discs with a cache "
-             "that small, and a tiny cache also forces far more seeking on spinning disks. "
-             "Set 0 to omit --cache entirely and let makemkvcon use its own default",
-    )
-    p.add_argument(
-        "--title-retries", type=int, default=TITLE_RETRIES_DEFAULT, metavar="N",
-        help="How many extra times to re-extract a title when makemkvcon exits successfully but "
-             "leaves no .mkv file of meaningful size behind - an occasional transient failure that "
-             "a plain re-run of the same disc gets past. Before any re-extraction the output "
-             "directory is simply re-checked a few times (a pooled or networked volume can be slow "
-             f"to list a just-written file), so a retry only happens when nothing arrived at all. "
-             f"Default {TITLE_RETRIES_DEFAULT}; 0 disables retrying and fails on the first occurrence",
-    )
-    p.add_argument(
-        "--retry-delay-sec", type=float, default=TITLE_RETRY_DELAY_SEC_DEFAULT, metavar="SECONDS",
-        help="How long to wait before re-extracting a title after a transient no-output failure "
-             f"(see --title-retries). Default {TITLE_RETRY_DELAY_SEC_DEFAULT:g}",
-    )
-    p.add_argument(
-        "--error-retries", type=int, default=ERROR_RETRIES_DEFAULT, metavar="N",
-        help="How many extra times to re-extract a title when makemkvcon exits with a non-zero "
-             "status. Some of those are transient (a momentary read error, or makemkvcon crashing "
-             "outright), so one more attempt after a short pause is often all it takes; a disc "
-             "that is genuinely unreadable simply fails again and costs only the delay. Counted "
-             f"separately from --title-retries. Default {ERROR_RETRIES_DEFAULT}; 0 fails on the "
-             f"first non-zero exit",
-    )
-    p.add_argument(
-        "--error-retry-delay-sec", type=float, default=ERROR_RETRY_DELAY_SEC_DEFAULT,
-        metavar="SECONDS",
-        help="How long to wait before re-extracting a title after a non-zero makemkvcon exit "
-             f"(see --error-retries). Default {ERROR_RETRY_DELAY_SEC_DEFAULT:g}",
-    )
-    p.add_argument(
-        "--free-space-margin-pct", type=float, default=10.0, metavar="PCT",
-        help="Extra safety margin (as %% of a title's estimated size) required as free space "
-             "on the output volume before extracting that title",
-    )
-    p.add_argument(
-        "--stall-timeout-min", type=float, default=STALL_TIMEOUT_MIN_DEFAULT, metavar="MINUTES",
-        help="Abort (fail-fast) if a title extraction makes no forward progress for this many "
-             "minutes - makemkvcon's overall percentage not advancing, i.e. a hung extraction or a "
-             "disc it can't read past. This is a STALL timeout, not a wall-clock limit: a slow but "
-             "steadily-progressing large title is left alone, only a genuinely stuck one is killed. "
-             f"Default {STALL_TIMEOUT_MIN_DEFAULT:g}; set 0 to disable",
-    )
-    p.add_argument(
-        "--no-output-timeout-min", type=float, default=NO_OUTPUT_TIMEOUT_MIN_DEFAULT,
-        metavar="MINUTES",
-        help="Abort a title when makemkvcon has WRITTEN nothing for this many minutes even though "
-             "it is still doing I/O. This catches the damaged-disc hang that --stall-timeout-min "
-             "cannot: makemkvcon retries unreadable sectors forever, so its read count keeps "
-             "climbing (which looks like activity) while no MKV data is ever produced. A healthy "
-             "extraction writes continuously once saving starts, so the window only has to outlast "
-             f"the analysis phase. Default {NO_OUTPUT_TIMEOUT_MIN_DEFAULT:g}; 0 disables it",
-    )
-    p.add_argument(
-        "--runaway-output-margin-pct", type=float, default=RUNAWAY_OUTPUT_MARGIN_PCT_DEFAULT, metavar="PCT",
-        help="How far the combined extracted output may exceed its expected size - the larger of "
-             "the summed per-title estimates and the ISO's own size - before the runaway-output "
-             "failsafe stops the ISO. The headroom absorbs MKV container overhead and estimate "
-             "slack (honest output can run a little over the raw stream bytes); the failsafe is "
-             "only meant to catch gross overruns like a looping/duplicate extraction. Raise it if "
-             "a legitimate disc trips it, lower it to catch smaller overruns",
-    )
-    p.add_argument(
         "--no-verify-tracks", dest="verify_tracks", action="store_false", default=True,
         help="Disable the post-extraction audio/subtitle track-count and duration cross-check "
              "against what MakeMKV reported for the title (requires mkvmerge or ffprobe to be "
              "installed; silently skipped if neither is found). On by default",
-    )
-    p.add_argument(
-        "--duration-tolerance-sec", type=float, default=15.0, metavar="SECONDS",
-        help="How many seconds SHORTER than MakeMKV's reported duration the extracted file may "
-             "be before the cross-check flags it as possibly truncated. The check is one-sided: "
-             "an output longer than reported is a normal measurement discrepancy and is never "
-             "flagged; only a shortfall beyond this many seconds is",
     )
     args = p.parse_args()
 
@@ -3813,7 +3698,7 @@ def main() -> int:
                 return p.name
 
         free = free_bytes_on_volume(output_root)
-        margin = args.free_space_margin_pct
+        margin = FREE_SPACE_MARGIN_PCT
         needed = int(dry_output_bytes * (1 + margin / 100.0))
 
         summary_lines = [
